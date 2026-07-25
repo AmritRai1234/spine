@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"unsafe"
 
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -13,8 +15,7 @@ import (
 // executes route steps, persists to SQLite, and broadcasts state
 // changes over WebSocket.
 type Bus struct {
-	regMu    sync.RWMutex
-	registry *Registry
+	registry unsafe.Pointer // *Registry, swapped atomically
 	db       *sql.DB
 	hub      *Hub
 
@@ -49,13 +50,14 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 		db.Exec(p)
 	}
 
-	return &Bus{
-		registry:   reg,
+	bus := &Bus{
 		db:         db,
 		hub:        hub,
 		knownTable: make(map[string]bool),
 		stmtCache:  make(map[string]*sql.Stmt),
-	}, nil
+	}
+	atomic.StorePointer(&bus.registry, unsafe.Pointer(reg))
+	return bus, nil
 }
 
 // Close shuts down prepared statements and the database connection.
@@ -70,16 +72,12 @@ func (b *Bus) Close() error {
 
 // UpdateRegistry atomically swaps the registry (used for hot-reload).
 func (b *Bus) UpdateRegistry(newReg *Registry) {
-	b.regMu.Lock()
-	defer b.regMu.Unlock()
-	b.registry = newReg
+	atomic.StorePointer(&b.registry, unsafe.Pointer(newReg))
 }
 
-// GetRegistry returns the current registry.
+// GetRegistry returns the current registry. Lock-free.
 func (b *Bus) GetRegistry() *Registry {
-	b.regMu.RLock()
-	defer b.regMu.RUnlock()
-	return b.registry
+	return (*Registry)(atomic.LoadPointer(&b.registry))
 }
 
 // Emit dispatches an event: validates the payload, runs route steps,

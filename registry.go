@@ -4,22 +4,27 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
+	"unsafe"
 )
 
-// Registry holds the parsed schema indexed for fast event→route lookups
-// and payload validation. It is safe for concurrent reads.
-type Registry struct {
-	mu         sync.RWMutex
+// registryData holds the immutable snapshot — swapped atomically.
+type registryData struct {
 	schema     *SpineSchema
 	nodes      map[string]*Node
 	routes     map[string][]*Route
 	eventEmits map[string][]PayloadField
 }
 
+// Registry holds the parsed schema indexed for fast event→route lookups.
+// Uses atomic pointer swap for lock-free reads on the hot path.
+type Registry struct {
+	data unsafe.Pointer // *registryData
+}
+
 // NewRegistry builds a Registry from a parsed schema.
 func NewRegistry(schema *SpineSchema) *Registry {
-	reg := &Registry{
+	d := &registryData{
 		schema:     schema,
 		nodes:      make(map[string]*Node),
 		routes:     make(map[string][]*Route),
@@ -28,29 +33,33 @@ func NewRegistry(schema *SpineSchema) *Registry {
 
 	for i := range schema.Nodes {
 		node := &schema.Nodes[i]
-		reg.nodes[node.Name] = node
+		d.nodes[node.Name] = node
 		for _, e := range node.Emits {
 			if len(e.Fields) > 0 {
-				reg.eventEmits[e.Event] = e.Fields
+				d.eventEmits[e.Event] = e.Fields
 			}
 		}
 	}
 
 	for i := range schema.Routes {
 		r := &schema.Routes[i]
-		reg.routes[r.OnEvent] = append(reg.routes[r.OnEvent], r)
+		d.routes[r.OnEvent] = append(d.routes[r.OnEvent], r)
 	}
 
+	reg := &Registry{}
+	atomic.StorePointer(&reg.data, unsafe.Pointer(d))
 	return reg
 }
 
-// ValidatePayload checks a payload against the schema-defined types for an event.
-// Returns nil if valid or no schema is defined for the event.
-func (r *Registry) ValidatePayload(event string, payload map[string]interface{}) error {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
+func (r *Registry) load() *registryData {
+	return (*registryData)(atomic.LoadPointer(&r.data))
+}
 
-	expectedFields, ok := r.eventEmits[event]
+// ValidatePayload checks a payload against the schema-defined types for an event.
+func (r *Registry) ValidatePayload(event string, payload map[string]interface{}) error {
+	d := r.load()
+
+	expectedFields, ok := d.eventEmits[event]
 	if !ok {
 		return nil
 	}
@@ -88,25 +97,21 @@ func (r *Registry) ValidatePayload(event string, payload map[string]interface{})
 	return nil
 }
 
-// GetRoutes returns routes matching an event name.
+// GetRoutes returns routes matching an event name. Lock-free.
 func (r *Registry) GetRoutes(event string) ([]*Route, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	routes, ok := r.routes[event]
+	d := r.load()
+	routes, ok := d.routes[event]
 	return routes, ok
 }
 
-// GetSchema returns the underlying schema.
+// GetSchema returns the underlying schema. Lock-free.
 func (r *Registry) GetSchema() *SpineSchema {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.schema
+	return r.load().schema
 }
 
-// GetNode returns a node by name.
+// GetNode returns a node by name. Lock-free.
 func (r *Registry) GetNode(name string) (*Node, bool) {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	n, ok := r.nodes[name]
+	d := r.load()
+	n, ok := d.nodes[name]
 	return n, ok
 }

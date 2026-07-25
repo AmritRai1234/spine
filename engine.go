@@ -1,11 +1,14 @@
 package spine
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -13,6 +16,20 @@ import (
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
+// Pools to reduce allocations on the hot path
+var bufPool = sync.Pool{
+	New: func() interface{} { return new(bytes.Buffer) },
+}
+
+type emitRequest struct {
+	Event   string                 `json:"event"`
+	Payload map[string]interface{} `json:"payload"`
+}
+
+var emitReqPool = sync.Pool{
+	New: func() interface{} { return new(emitRequest) },
 }
 
 // Engine is the top-level Spine runtime combining Bus, Hub, and Server.
@@ -90,11 +107,16 @@ func (e *Engine) buildMux() *http.ServeMux {
 			w.Write([]byte(`{"status":"error","error":"method_not_allowed"}`))
 			return
 		}
-		var body struct {
-			Event   string                 `json:"event"`
-			Payload map[string]interface{} `json:"payload"`
-		}
-		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+
+		// Pool the request struct to avoid allocs
+		body := emitReqPool.Get().(*emitRequest)
+		body.Event = ""
+		body.Payload = nil
+		defer emitReqPool.Put(body)
+
+		// Read body once, unmarshal (faster than NewDecoder for small payloads)
+		raw, err := io.ReadAll(r.Body)
+		if err != nil || json.Unmarshal(raw, body) != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(400)
 			w.Write([]byte(`{"status":"error","error":"invalid_json_body"}`))
@@ -109,16 +131,24 @@ func (e *Engine) buildMux() *http.ServeMux {
 		if body.Payload == nil {
 			body.Payload = make(map[string]interface{})
 		}
-		result, err := e.Bus.Emit(body.Event, body.Payload)
+
+		result, emitErr := e.Bus.Emit(body.Event, body.Payload)
+
+		// Pool the response buffer
+		buf := bufPool.Get().(*bytes.Buffer)
+		buf.Reset()
+		defer bufPool.Put(buf)
+
 		w.Header().Set("Content-Type", "application/json")
-		if err != nil {
+		if emitErr != nil {
 			w.WriteHeader(400)
-			json.NewEncoder(w).Encode(map[string]interface{}{
-				"status": "error", "error": err.Error(), "event": body.Event,
+			json.NewEncoder(buf).Encode(map[string]interface{}{
+				"status": "error", "error": emitErr.Error(), "event": body.Event,
 			})
-			return
+		} else {
+			json.NewEncoder(buf).Encode(result)
 		}
-		json.NewEncoder(w).Encode(result)
+		w.Write(buf.Bytes())
 	})
 
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
