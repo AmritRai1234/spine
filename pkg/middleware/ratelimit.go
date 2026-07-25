@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 )
@@ -70,9 +71,18 @@ func (m *RateLimitManager) Allow(ip string) bool {
 // RateLimitMiddleware returns an HTTP handler middleware enforcing IP rate limits.
 func (m *RateLimitManager) Middleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip, _, err := net.SplitHostPort(r.RemoteAddr)
-		if err != nil {
-			ip = r.RemoteAddr
+		ip := ""
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			ip = strings.TrimSpace(parts[0])
+		} else if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			ip = strings.TrimSpace(xri)
+		} else {
+			var err error
+			ip, _, err = net.SplitHostPort(r.RemoteAddr)
+			if err != nil {
+				ip = r.RemoteAddr
+			}
 		}
 
 		if !m.Allow(ip) {
