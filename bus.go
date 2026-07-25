@@ -30,9 +30,8 @@ type Bus struct {
 	db       *sql.DB
 	hub      *Hub
 
-	// Performance: cache known tables + prepared insert statements
-	tableMu    sync.RWMutex
-	knownTable map[string]bool
+	// Performance: lock-free known tables + prepared insert statements
+	knownTable sync.Map
 	stmtMu     sync.RWMutex
 	stmtCache  map[string]*sql.Stmt
 
@@ -87,7 +86,6 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 	bus := &Bus{
 		db:         db,
 		hub:        hub,
-		knownTable: make(map[string]bool),
 		stmtCache:  make(map[string]*sql.Stmt),
 		stateCache: make(map[string]map[string]interface{}),
 		writeChan:  make(chan dbTask, 500000),
@@ -365,11 +363,7 @@ func sanitizeIdent(s string) string {
 
 // ensureTable creates the table and auto-generates column indexes if not seen before.
 func (b *Bus) ensureTable(table string, colDefs []string) error {
-	b.tableMu.RLock()
-	known := b.knownTable[table]
-	b.tableMu.RUnlock()
-
-	if known {
+	if _, ok := b.knownTable.Load(table); ok {
 		return nil
 	}
 
@@ -392,10 +386,7 @@ func (b *Bus) ensureTable(table string, colDefs []string) error {
 		}
 	}
 
-	b.tableMu.Lock()
-	b.knownTable[table] = true
-	b.tableMu.Unlock()
-
+	b.knownTable.Store(table, true)
 	return nil
 }
 

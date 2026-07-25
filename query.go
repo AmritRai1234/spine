@@ -18,14 +18,15 @@ func (b *Bus) GetTables() ([]TableInfo, error) {
 	rows, err := b.db.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
 	if err != nil {
 		// Fallback for non-SQLite / Turso drivers if sqlite_master isn't available
-		b.tableMu.RLock()
-		defer b.tableMu.RUnlock()
 		var res []TableInfo
-		for name := range b.knownTable {
-			var count int64
-			_ = b.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, name)).Scan(&count)
-			res = append(res, TableInfo{Name: name, Rows: count})
-		}
+		b.knownTable.Range(func(key, value interface{}) bool {
+			if name, ok := key.(string); ok {
+				var count int64
+				_ = b.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, name)).Scan(&count)
+				res = append(res, TableInfo{Name: name, Rows: count})
+			}
+			return true
+		})
 		return res, nil
 	}
 	defer rows.Close()
@@ -171,8 +172,6 @@ func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitte
 	select {
 	case b.writeChan <- dbTask{query: insertSQL, params: params}:
 	default:
-		go func() {
-			b.writeChan <- dbTask{query: insertSQL, params: params}
-		}()
+		// Non-blocking drop on high-volume burst saturation
 	}
 }
