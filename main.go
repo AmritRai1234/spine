@@ -1,7 +1,12 @@
-// spine-go/main.go — Spine v1 Runtime (Go)
+// main.go — Spine v1 Runtime Engine (Go)
 //
-// Same architecture as C/Rust:
-//   Parse → Registry → Bus (emit/dispatch) → SQLite → HTTP server
+// Features:
+//   - Manifest Parsing (State Machine)
+//   - Thread-Safe Dynamic Registry & Hot Reloading
+//   - Schema-Based Payload Type Validation
+//   - SQLite WAL Persistence Engine with Auto-Schema
+//   - HTTP API (/emit, /health, /schema) & Real-time WebSockets (/ws)
+//   - State Broadcast Engine over WebSockets
 
 package main
 
@@ -13,58 +18,62 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"sync"
+	"time"
 
+	"github.com/gorilla/websocket"
 	_ "github.com/mattn/go-sqlite3"
 )
 
 // =====================================================================
-//  Schema structs
+//  Schema Structs
 // =====================================================================
 
 type PayloadField struct {
-	Name      string
-	FieldType string
+	Name      string `json:"name"`
+	FieldType string `json:"field_type"`
 }
 
 type Emit struct {
-	Event  string
-	Fields []PayloadField
+	Event  string         `json:"event"`
+	Fields []PayloadField `json:"fields,omitempty"`
 }
 
 type Listen struct {
-	State  string
-	Fields []PayloadField
+	State  string         `json:"state"`
+	Fields []PayloadField `json:"fields,omitempty"`
 }
 
 type Node struct {
-	Name      string
-	OwnsFiles []string
-	Emits     []Emit
-	Listens   []Listen
+	Name      string   `json:"name"`
+	OwnsFiles []string `json:"owns_files,omitempty"`
+	Emits     []Emit   `json:"emits,omitempty"`
+	Listens   []Listen `json:"listens,omitempty"`
 }
 
 type RouteStep struct {
-	Action string
-	Table  string
-	Input  string
+	Action string `json:"action"`
+	Table  string `json:"table,omitempty"`
+	Input  string `json:"input,omitempty"`
 }
 
 type Route struct {
-	OnEvent   string
-	Steps     []RouteStep
-	EmitState string
+	OnEvent   string      `json:"on_event"`
+	Steps     []RouteStep `json:"steps"`
+	EmitState string      `json:"emit_state,omitempty"`
 }
 
 type SpineSchema struct {
-	SpineVersion int
-	DbTables     []string
-	Nodes        []Node
-	Routes       []Route
+	SpineVersion int      `json:"spine_version"`
+	DbTables     []string `json:"db_tables"`
+	Nodes        []Node   `json:"nodes"`
+	Routes       []Route  `json:"routes"`
 }
 
 // =====================================================================
-//  Parser — line-by-line state machine
+//  Parser — Line-by-Line State Machine
 // =====================================================================
 
 type parseState int
@@ -126,10 +135,10 @@ func listKvValue(trimmed, key string) (string, bool) {
 	return kvValue(trimmed[2:], key)
 }
 
-func parseSpine(filepath string) *SpineSchema {
+func parseSpine(filepath string) (*SpineSchema, error) {
 	f, err := os.Open(filepath)
 	if err != nil {
-		log.Fatalf("spine: cannot open '%s': %v", filepath, err)
+		return nil, fmt.Errorf("cannot open manifest '%s': %w", filepath, err)
 	}
 	defer f.Close()
 
@@ -248,8 +257,8 @@ func parseSpine(filepath string) *SpineSchema {
 			if state == sNodeEmitPayload && indent == 5 && curEmit != nil {
 				if idx := strings.Index(trimmed, ":"); idx > 0 {
 					curEmit.Fields = append(curEmit.Fields, PayloadField{
-						Name:      trimmed[:idx],
-						FieldType: strings.TrimSpace(trimmed[idx+1:]),
+						Name:      strings.TrimSpace(trimmed[:idx]),
+						FieldType: unquote(trimmed[idx+1:]),
 					})
 					continue
 				}
@@ -274,8 +283,8 @@ func parseSpine(filepath string) *SpineSchema {
 			if state == sNodeListenPayload && indent == 5 && curListen != nil {
 				if idx := strings.Index(trimmed, ":"); idx > 0 {
 					curListen.Fields = append(curListen.Fields, PayloadField{
-						Name:      trimmed[:idx],
-						FieldType: strings.TrimSpace(trimmed[idx+1:]),
+						Name:      strings.TrimSpace(trimmed[:idx]),
+						FieldType: unquote(trimmed[idx+1:]),
 					})
 					continue
 				}
@@ -383,65 +392,251 @@ func parseSpine(filepath string) *SpineSchema {
 		}
 	}
 
-	return schema
+	if err := scanner.Err(); err != nil {
+		return nil, fmt.Errorf("error reading manifest: %w", err)
+	}
+
+	return schema, nil
 }
 
 // =====================================================================
-//  Registry
+//  Registry & Payload Type Validator
 // =====================================================================
 
 type Registry struct {
-	schema *SpineSchema
-	nodes  map[string]*Node
-	routes map[string][]*Route
+	mu          sync.RWMutex
+	schema      *SpineSchema
+	nodes       map[string]*Node
+	routes      map[string][]*Route
+	eventEmits  map[string][]PayloadField // event -> expected payload fields
 }
 
 func buildRegistry(schema *SpineSchema) *Registry {
 	reg := &Registry{
-		schema: schema,
-		nodes:  make(map[string]*Node),
-		routes: make(map[string][]*Route),
+		schema:     schema,
+		nodes:      make(map[string]*Node),
+		routes:     make(map[string][]*Route),
+		eventEmits: make(map[string][]PayloadField),
 	}
+
 	for i := range schema.Nodes {
-		reg.nodes[schema.Nodes[i].Name] = &schema.Nodes[i]
+		node := &schema.Nodes[i]
+		reg.nodes[node.Name] = node
+		for _, e := range node.Emits {
+			if len(e.Fields) > 0 {
+				reg.eventEmits[e.Event] = e.Fields
+			}
+		}
 	}
+
 	for i := range schema.Routes {
 		r := &schema.Routes[i]
 		reg.routes[r.OnEvent] = append(reg.routes[r.OnEvent], r)
 	}
+
 	return reg
 }
 
+func (r *Registry) ValidatePayload(event string, payload map[string]interface{}) error {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+
+	expectedFields, ok := r.eventEmits[event]
+	if !ok {
+		return nil // No schema constraints declared for this event
+	}
+
+	for _, field := range expectedFields {
+		val, exists := payload[field.Name]
+		if !exists || val == nil {
+			return fmt.Errorf("missing required field '%s' (expected type %s)", field.Name, field.FieldType)
+		}
+
+		// Type validation
+		t := strings.ToLower(field.FieldType)
+		switch t {
+		case "string", "str", "text":
+			if _, ok := val.(string); !ok {
+				return fmt.Errorf("field '%s' must be a string (got %T)", field.Name, val)
+			}
+		case "number", "float", "int", "integer":
+			switch v := val.(type) {
+			case float64, float32, int, int64, int32:
+				// valid numeric types from JSON
+			case string:
+				if _, err := strconv.ParseFloat(v, 64); err != nil {
+					return fmt.Errorf("field '%s' must be a number (got invalid string '%s')", field.Name, v)
+				}
+			default:
+				return fmt.Errorf("field '%s' must be a number (got %T)", field.Name, val)
+			}
+		case "bool", "boolean":
+			if _, ok := val.(bool); !ok {
+				return fmt.Errorf("field '%s' must be a boolean (got %T)", field.Name, val)
+			}
+		}
+	}
+
+	return nil
+}
+
+func (r *Registry) GetRoutes(event string) ([]*Route, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	routes, ok := r.routes[event]
+	return routes, ok
+}
+
+func (r *Registry) GetSchema() *SpineSchema {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.schema
+}
+
 // =====================================================================
-//  Bus
+//  WebSocket Hub (State Broadcasting Engine)
+// =====================================================================
+
+type StateBroadcast struct {
+	Type      string                 `json:"type"`      // "state" or "event_ack"
+	State     string                 `json:"state,omitempty"`
+	Event     string                 `json:"event,omitempty"`
+	Payload   map[string]interface{} `json:"payload,omitempty"`
+	Timestamp int64                  `json:"timestamp"`
+}
+
+type WsClient struct {
+	conn *websocket.Conn
+	send chan []byte
+}
+
+type Hub struct {
+	mu         sync.Mutex
+	clients    map[*WsClient]bool
+	register   chan *WsClient
+	unregister chan *WsClient
+}
+
+func newHub() *Hub {
+	return &Hub{
+		clients:    make(map[*WsClient]bool),
+		register:   make(chan *WsClient),
+		unregister: make(chan *WsClient),
+	}
+}
+
+func (h *Hub) run() {
+	for {
+		select {
+		case client := <-h.register:
+			h.mu.Lock()
+			h.clients[client] = true
+			h.mu.Unlock()
+			log.Printf("[ws] client connected (total: %d)", len(h.clients))
+
+		case client := <-h.unregister:
+			h.mu.Lock()
+			if _, ok := h.clients[client]; ok {
+				delete(h.clients, client)
+				close(client.send)
+				log.Printf("[ws] client disconnected (total: %d)", len(h.clients))
+			}
+			h.mu.Unlock()
+		}
+	}
+}
+
+func (h *Hub) BroadcastState(stateName, eventName string, payload map[string]interface{}) {
+	msg := StateBroadcast{
+		Type:      "state",
+		State:     stateName,
+		Event:     eventName,
+		Payload:   payload,
+		Timestamp: time.Now().UnixMilli(),
+	}
+
+	data, err := json.Marshal(msg)
+	if err != nil {
+		return
+	}
+
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for client := range h.clients {
+		select {
+		case client.send <- data:
+		default:
+			close(client.send)
+			delete(h.clients, client)
+		}
+	}
+}
+
+// =====================================================================
+//  Bus Engine
 // =====================================================================
 
 type Bus struct {
+	regMu    sync.RWMutex
 	registry *Registry
 	db       *sql.DB
+	hub      *Hub
 }
 
-func newBus(reg *Registry, dbPath string) *Bus {
+func newBus(reg *Registry, dbPath string, hub *Hub) *Bus {
 	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL")
 	if err != nil {
-		log.Fatalf("spine-go: cannot open sqlite: %v", err)
+		log.Fatalf("[spine-go] cannot open sqlite: %v", err)
 	}
-	return &Bus{registry: reg, db: db}
+	return &Bus{
+		registry: reg,
+		db:       db,
+		hub:      hub,
+	}
 }
 
-func (b *Bus) emit(event string, payload map[string]interface{}) map[string]interface{} {
-	routes, ok := b.registry.routes[event]
+func (b *Bus) updateRegistry(newReg *Registry) {
+	b.regMu.Lock()
+	defer b.regMu.Unlock()
+	b.registry = newReg
+}
+
+func (b *Bus) getRegistry() *Registry {
+	b.regMu.RLock()
+	defer b.regMu.RUnlock()
+	return b.registry
+}
+
+func (b *Bus) emit(event string, payload map[string]interface{}) (map[string]interface{}, error) {
+	reg := b.getRegistry()
+
+	// 1. Validate payload against manifest schema
+	if err := reg.ValidatePayload(event, payload); err != nil {
+		return nil, fmt.Errorf("validation error: %w", err)
+	}
+
+	// 2. Find matching routes
+	routes, ok := reg.GetRoutes(event)
 	if !ok || len(routes) == 0 {
 		return map[string]interface{}{
 			"status":         "no_route",
 			"event":          event,
 			"routes_matched": 0,
-		}
+		}, nil
 	}
 
+	// 3. Process steps & broadcast emitted states
+	var emittedStates []string
 	for _, route := range routes {
 		for _, step := range route.Steps {
-			b.execStep(&step, payload)
+			if err := b.execStep(&step, payload); err != nil {
+				return nil, fmt.Errorf("step execution failed (action=%s, table=%s): %w", step.Action, step.Table, err)
+			}
+		}
+
+		if route.EmitState != "" {
+			b.hub.BroadcastState(route.EmitState, event, payload)
+			emittedStates = append(emittedStates, route.EmitState)
 		}
 	}
 
@@ -449,23 +644,29 @@ func (b *Bus) emit(event string, payload map[string]interface{}) map[string]inte
 		"status":         "ok",
 		"event":          event,
 		"routes_matched": len(routes),
-	}
+		"emitted_states": emittedStates,
+	}, nil
 }
 
-func (b *Bus) execStep(step *RouteStep, payload map[string]interface{}) {
-	if step.Action == "db.insert" && step.Table != "" {
-		b.dbInsert(step.Table, payload)
-	} else if step.Action == "db.update" && step.Table != "" {
-		b.dbUpdate(step.Table, payload)
+func (b *Bus) execStep(step *RouteStep, payload map[string]interface{}) error {
+	switch step.Action {
+	case "db.insert":
+		if step.Table != "" {
+			return b.dbInsert(step.Table, payload)
+		}
+	case "db.update":
+		if step.Table != "" {
+			return b.dbUpdate(step.Table, payload)
+		}
 	}
+	return nil
 }
 
-func (b *Bus) dbInsert(table string, payload map[string]interface{}) {
+func (b *Bus) dbInsert(table string, payload map[string]interface{}) error {
 	if len(payload) == 0 {
-		return
+		return nil
 	}
 
-	// Ensure table
 	var colDefs []string
 	var colNames []string
 	var placeholders []string
@@ -480,16 +681,22 @@ func (b *Bus) dbInsert(table string, payload map[string]interface{}) {
 
 	createSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (id INTEGER PRIMARY KEY AUTOINCREMENT, %s)`,
 		table, strings.Join(colDefs, ", "))
-	b.db.Exec(createSQL)
+	if _, err := b.db.Exec(createSQL); err != nil {
+		return fmt.Errorf("create table failed: %w", err)
+	}
 
 	insertSQL := fmt.Sprintf(`INSERT INTO "%s" (%s) VALUES (%s)`,
 		table, strings.Join(colNames, ", "), strings.Join(placeholders, ", "))
-	b.db.Exec(insertSQL, values...)
+	if _, err := b.db.Exec(insertSQL, values...); err != nil {
+		return fmt.Errorf("insert failed: %w", err)
+	}
+
+	return nil
 }
 
-func (b *Bus) dbUpdate(table string, payload map[string]interface{}) {
+func (b *Bus) dbUpdate(table string, payload map[string]interface{}) error {
 	if len(payload) < 2 {
-		return
+		return nil
 	}
 
 	var colDefs []string
@@ -504,9 +711,10 @@ func (b *Bus) dbUpdate(table string, payload map[string]interface{}) {
 
 	createSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (id INTEGER PRIMARY KEY AUTOINCREMENT, %s)`,
 		table, strings.Join(colDefs, ", "))
-	b.db.Exec(createSQL)
+	if _, err := b.db.Exec(createSQL); err != nil {
+		return fmt.Errorf("create table failed: %w", err)
+	}
 
-	// First key = WHERE, rest = SET
 	var setClauses []string
 	var params []interface{}
 	for i := 1; i < len(keys); i++ {
@@ -517,26 +725,83 @@ func (b *Bus) dbUpdate(table string, payload map[string]interface{}) {
 
 	updateSQL := fmt.Sprintf(`UPDATE "%s" SET %s WHERE "%s" = ?`,
 		table, strings.Join(setClauses, ", "), keys[0])
-	b.db.Exec(updateSQL, params...)
+	if _, err := b.db.Exec(updateSQL, params...); err != nil {
+		return fmt.Errorf("update failed: %w", err)
+	}
+
+	return nil
 }
 
 // =====================================================================
-//  HTTP Server
+//  Hot Reload Watcher
 // =====================================================================
 
-func startServer(bus *Bus, port string) {
+func startHotReloadWatcher(spineFile string, bus *Bus) {
+	var lastModTime time.Time
+
+	if fi, err := os.Stat(spineFile); err == nil {
+		lastModTime = fi.ModTime()
+	}
+
+	ticker := time.NewTicker(1 * time.Second)
+	go func() {
+		for range ticker.C {
+			fi, err := os.Stat(spineFile)
+			if err != nil {
+				continue
+			}
+
+			if fi.ModTime().After(lastModTime) {
+				lastModTime = fi.ModTime()
+				log.Printf("[spine-go] manifest change detected in '%s', reloading...", spineFile)
+
+				newSchema, err := parseSpine(spineFile)
+				if err != nil {
+					log.Printf("[spine-go] ✗ hot-reload failed: %v", err)
+					continue
+				}
+
+				newReg := buildRegistry(newSchema)
+				bus.updateRegistry(newReg)
+				log.Printf("[spine-go] ✓ hot-reloaded successfully: %d nodes, %d routes, %d tables",
+					len(newSchema.Nodes), len(newSchema.Routes), len(newSchema.DbTables))
+			}
+		}
+	}()
+}
+
+// =====================================================================
+//  HTTP & WebSocket Server
+// =====================================================================
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool {
+		return true // Allow all origins for dev/API usage
+	},
+}
+
+func startServer(bus *Bus, hub *Hub, port string) {
 	mux := http.NewServeMux()
 
+	// GET /health
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ok","engine":"spine-go","version":1}`))
 	})
 
+	// GET /schema -> Live introspection of the manifest
+	mux.HandleFunc("/schema", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		schema := bus.getRegistry().GetSchema()
+		json.NewEncoder(w).Encode(schema)
+	})
+
+	// POST /emit
 	mux.HandleFunc("/emit", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(405)
-			w.Write([]byte(`{"error":"method not allowed"}`))
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			w.Write([]byte(`{"status":"error","error":"method_not_allowed"}`))
 			return
 		}
 
@@ -547,8 +812,15 @@ func startServer(bus *Bus, port string) {
 
 		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(400)
-			w.Write([]byte(`{"error":"invalid JSON"}`))
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"status":"error","error":"invalid_json_body"}`))
+			return
+		}
+
+		if body.Event == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			w.Write([]byte(`{"status":"error","error":"missing_event_name"}`))
 			return
 		}
 
@@ -556,15 +828,100 @@ func startServer(bus *Bus, port string) {
 			body.Payload = make(map[string]interface{})
 		}
 
-		result := bus.emit(body.Event, body.Payload)
+		result, err := bus.emit(body.Event, body.Payload)
 		w.Header().Set("Content-Type", "application/json")
+
+		if err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": "error",
+				"error":  err.Error(),
+				"event":  body.Event,
+			})
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
 		json.NewEncoder(w).Encode(result)
+	})
+
+	// GET /ws -> WebSockets state push & incoming event trigger
+	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		conn, err := upgrader.Upgrade(w, r, nil)
+		if err != nil {
+			log.Printf("[ws] upgrade error: %v", err)
+			return
+		}
+
+		client := &WsClient{
+			conn: conn,
+			send: make(chan []byte, 256),
+		}
+		hub.register <- client
+
+		// Client writer pump
+		go func() {
+			defer func() {
+				conn.Close()
+			}()
+			for message := range client.send {
+				if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
+					break
+				}
+			}
+		}()
+
+		// Client reader pump (allows clients to emit over WS too!)
+		go func() {
+			defer func() {
+				hub.unregister <- client
+				conn.Close()
+			}()
+
+			for {
+				_, message, err := conn.ReadMessage()
+				if err != nil {
+					break
+				}
+
+				var req struct {
+					Action  string                 `json:"action"`
+					Event   string                 `json:"event"`
+					Payload map[string]interface{} `json:"payload"`
+				}
+
+				if err := json.Unmarshal(message, &req); err == nil && req.Event != "" {
+					if req.Payload == nil {
+						req.Payload = make(map[string]interface{})
+					}
+					result, err := bus.emit(req.Event, req.Payload)
+
+					// Send ACK back over websocket
+					ack := map[string]interface{}{
+						"type":  "event_ack",
+						"event": req.Event,
+					}
+					if err != nil {
+						ack["status"] = "error"
+						ack["error"] = err.Error()
+					} else {
+						ack["status"] = "ok"
+						ack["result"] = result
+					}
+
+					ackBytes, _ := json.Marshal(ack)
+					client.send <- ackBytes
+				}
+			}
+		}()
 	})
 
 	fmt.Println()
 	fmt.Println("┌──────────────────────────────────────────┐")
 	fmt.Println("│  SPINE v1 Runtime Server (Go)            │")
-	fmt.Printf("│  Listening: http://0.0.0.0:%-14s │\n", port)
+	fmt.Printf("│  HTTP:  http://0.0.0.0:%-18s │\n", port)
+	fmt.Printf("│  WS:    ws://0.0.0.0:%-20s │\n", port+"/ws")
+	fmt.Printf("│  Schema:http://0.0.0.0:%-18s │\n", port+"/schema")
 	fmt.Println("└──────────────────────────────────────────┘")
 	fmt.Println()
 
@@ -572,7 +929,7 @@ func startServer(bus *Bus, port string) {
 }
 
 // =====================================================================
-//  Main
+//  Main Entry Point
 // =====================================================================
 
 func main() {
@@ -600,14 +957,25 @@ func main() {
 		}
 	}
 
-	fmt.Printf("[spine-go] parsing '%s'...\n", spineFile)
-	schema := parseSpine(spineFile)
+	fmt.Printf("[spine-go] loading manifest '%s'...\n", spineFile)
+	schema, err := parseSpine(spineFile)
+	if err != nil {
+		log.Fatalf("[spine-go] ✗ failed to parse manifest: %v", err)
+	}
+
 	fmt.Printf("[spine-go] loaded: %d nodes, %d routes, %d tables\n",
 		len(schema.Nodes), len(schema.Routes), len(schema.DbTables))
 
 	reg := buildRegistry(schema)
-	bus := newBus(reg, dbPath)
+
+	hub := newHub()
+	go hub.run()
+
+	bus := newBus(reg, dbPath, hub)
 	defer bus.db.Close()
 
-	startServer(bus, port)
+	// Enable hot reloading for app.spine
+	startHotReloadWatcher(spineFile, bus)
+
+	startServer(bus, hub, port)
 }
