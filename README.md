@@ -51,7 +51,7 @@ Client Event ➔ Load Balancer ➔ Spine Node (Auth & Rate Limit) ➔ Event Bus 
 | **Manual Validation**: Duplicate type checks & validation code across endpoints | **Contract Enforcement**: Enforces typed payload contracts at runtime |
 | **Polling Overhead**: Clients polling endpoints for database updates | **Real-Time Push**: Built-in WebSocket broadcasting across all cluster nodes |
 | **Complex Dependencies**: Requires external DBs, Redis, background worker queues | **Single Binary or Scaled Cluster**: Embedded SQLite WAL for single-node; Redis/Turso for cluster scale |
-| **Brittle Webhooks**: Dropped requests on network glitches | **Durable Outbox Queue**: Outbox-backed retries survive process restarts |
+| **Brittle Webhooks**: Dropped requests on network glitches | **Durable Outbox Queue**: DB-backed outbox table (`_spine_outbox`) survives process & node failures |
 
 ---
 
@@ -68,7 +68,7 @@ Spine adapts the **Blackboard Architectural Pattern** for high-performance event
                                      │ POST /emit
                                      ▼
 ┌─────────────────────────────────────────────────────────────────────────┐
-│            pkg/middleware (Auth & X-Forwarded-For Rate Limiting)        │
+│            pkg/middleware (Auth & Trusted-Proxy Rate Limiting)          │
 └────────────────────────────────────┬────────────────────────────────────┘
                                      │
                                      ▼
@@ -84,7 +84,7 @@ Spine adapts the **Blackboard Architectural Pattern** for high-performance event
     ▼                        ▼                        ▼
 ┌──────────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐
 │  Batched Write Queue │ │  Outbox Retry Queue  │ │  WebSocket Hub Push  │
-│  (SQLite / Turso)    │ │  (http.post Webhook) │ │  (ws://.../ws)       │
+│  (SQLite / Turso)    │ │  (DB-Backed Outbox)  │ │  (ws://.../ws)       │
 └──────────────────────┘ └──────────────────────┘ └──────────────────────┘
 ```
 
@@ -107,13 +107,13 @@ For production workloads exceeding single-node writer capacity, Spine instances 
                 ├──────────────────────┬──────────────────────┤
                 │                      │                      │
                 ▼                      ▼                      ▼
- ┌─────────────────────────────┐ ┌───────────┐ ┌─────────────────────────────┐
- │    PubSub Backplane         │ │  Outbox   │ │   Turso / libSQL Primary    │
- │ (Redis Streams / NATS)      │ │   Queue   │ │   (Multi-Region Replicas)   │
- └─────────────────────────────┘ └───────────┘ └─────────────────────────────┘
+ ┌─────────────────────────────┐ ┌───────────────────┐ ┌─────────────────────────────┐
+ │    PubSub Backplane         │ │ DB Outbox Queue   │ │   Turso / libSQL Primary    │
+ │ (Redis Streams / NATS)      │ │ (_spine_outbox)   │ │   (Multi-Region Replicas)   │
+ └─────────────────────────────┘ └───────────────────┘ └─────────────────────────────┘
 ```
 
-When any node processes an event that emits state, it publishes the update to the PubSub backplane (`pkg/engine/pubsub.go`), instantly synchronizing WebSockets across all connected cluster instances.
+When any node processes an event that emits state, it publishes the update to the PubSub backplane (`pkg/engine/pubsub.go`), instantly synchronizing WebSockets across all connected cluster instances. Outbound webhooks are persisted to the shared primary DB outbox table (`_spine_outbox`), allowing pending retries to survive individual node crashes.
 
 ---
 
@@ -129,7 +129,7 @@ Spine/
 │   │   ├── bus.go       # Event dispatch, batch writer, table indexing
 │   │   ├── engine.go    # HTTP server mux & health/probe endpoints
 │   │   ├── hub.go       # WebSocket real-time state broadcasting hub
-│   │   ├── outbox.go    # DB-backed outbox retry queue
+│   │   ├── outbox.go    # DB-backed outbox retry queue (survives process/node crashes)
 │   │   ├── pubsub.go    # Local & distributed PubSub backplane interface (Redis/NATS)
 │   │   ├── optimizer.go # Self-improving adaptive latency tuner
 │   │   ├── cond.go      # Dynamic condition evaluator (if: guards)
@@ -144,7 +144,7 @@ Spine/
 │   │
 │   └── middleware/      # Security & access control middleware
 │       ├── auth.go      # API key & Bearer token header verification
-│       └── ratelimit.go # Token-bucket IP rate limiter (with X-Forwarded-For support)
+│       └── ratelimit.go # Token-bucket rate limiter (with Trusted Proxy IP extraction)
 │
 ├── web/                 # Minimalist developer web dashboard (Vite + React + TS)
 ├── tests/               # End-to-end unit test suites (10 test suites)
@@ -171,116 +171,18 @@ go build -o spine ./cmd/spine/
 
 ---
 
-## The `.spine` Manifest Specification
-
-```yaml
-spine_version: 1
-
-includes:
-  - auth.spine
-
-database:
-  tables:
-    - landing_analytics
-    - users
-
-nodes:
-  LandingPage:
-    emits:
-      - event: SUBMIT_LEAD
-        payload:
-          email: string
-
-routes:
-  - on: SUBMIT_LEAD
-    parallel: true
-    steps:
-      - action: db.insert
-        table: landing_analytics
-        input: "$event.payload"
-      
-      - action: http.post
-        url: "https://api.crm.example.com/leads"
-        max_attempts: 3
-        backoff_ms: 100
-
-      - action: log.write
-        message: "[LEAD] Received lead for $event.payload.email at $now"
-        if: "$event.payload.email != ''"
-
-    emit: LEAD_STATUS
-```
-
----
-
-## Database Schema & Migrations
-
-Spine provides two distinct, complementary schema management strategies:
-
-1. **Development Auto-Migration (`db.insert`)**:
-   - In rapid development, `db.insert` dynamically creates missing tables and missing JSON columns on initial write without manual SQL setup.
-
-2. **Production Versioned Migrations (`pkg/engine/migrations.go`)**:
-   - For production environments, explicit schema migrations are applied in versioned sequence via `engine.Bus.ApplyMigration(v, name, sql)`.
-   - Migration history is transactionally tracked in the `_spine_migrations` meta-table to prevent unauthorized schema drift across deployments.
-
----
-
-## HTTP & WebSocket API Reference
-
-| Endpoint | Method | Description |
-| :--- | :--- | :--- |
-| `/emit` | `POST` | Dispatch event payload to trigger manifest routes |
-| `/schema` | `GET` | Return live parsed manifest AST schema |
-| `/tables` | `GET` | List database tables and row counts |
-| `/tables/:name` | `GET` | Fetch paginated table rows (`?limit=50&offset=0`) |
-| `/events` | `GET` | Audit log history of emitted events |
-| `/metrics` | `GET` | Live optimizer metrics, batch size & flush intervals |
-| `/healthz` | `GET` | Kubernetes liveness probe (`{"status":"healthy"}`) |
-| `/readyz` | `GET` | Kubernetes readiness probe (`{"status":"ready"}`) |
-| `/ws` | `WS` | Real-time WebSocket state broadcast channel |
-
----
-
-## Minimalist Developer Web Dashboard
-
-Spine embeds a dark minimalist developer interface served at `http://localhost:8080/`.
-
-- **Obsidian Dark Aesthetic**: Clean technical UI built with `Geist Mono` and `Inter`.
-- **Code-First Event Console**: Interactively emit events with auto-filled JSON templates (`⌘+Enter` shortcut).
-- **Live Event Stream**: Real-time event log feed with filter tabs (`ALL`, `EMIT`, `STATE`, `ERROR`).
-- **Schema Inspector**: Visual breakdown of declared nodes, triggers, route step chains (`→`), and tables.
-
----
-
 ## Security & Governance
 
 1. **API Key & Bearer Token Authentication**:
    - Gatekeep endpoints using `--api-key <KEY>` or `SPINE_API_KEY`.
    - Accepts headers: `Authorization: Bearer <KEY>` or `X-API-Key: <KEY>`.
 
-2. **Reverse Proxy Aware Rate Limiting**:
-   - Token-bucket rate limiting (`pkg/middleware/ratelimit.go`) automatically parses `X-Forwarded-For` and `X-Real-IP` headers to enforce per-client IP limits when deployed behind Load Balancers or CDNs.
+2. **Trusted Proxy Rate Limiting**:
+   - Token-bucket rate limiting (`pkg/middleware/ratelimit.go`) extracts client IPs securely.
+   - Parses `X-Forwarded-For` and `X-Real-IP` headers **only** when requests originate from configured trusted proxy IPs (`SetTrustedProxies([]string{"127.0.0.1", "10.0.0.1"})`), preventing malicious IP spoofing evasions.
 
-3. **SQL Injection Guardrails & Outbox Persistence**:
-   - Parameterized SQL (`?` bindings) and strict identifier sanitization (`sanitizeIdent`).
-   - Outbound webhooks and retries are durable, backed by the `_spine_outbox` table.
-
----
-
-## Performance & Benchmarks
-
-Benchmarked using `./spine bench` on local loopback (Linux x86_64, 12-core CPU, NVMe SSD):
-
-- **Throughput**: **50,000 – 53,000 requests/sec**
-- **Min Latency**: **72 µs**
-- **Average Latency**: **939 µs**
-- **Packet Loss**: **0%** (100% success rate under 50 concurrent client streams)
-
-> ⚠️ **Reproducibility Note**: Benchmark results vary depending on disk I/O speed, network topology, kernel scheduler, and client connection counts. To reproduce on your target environment, execute:
-> ```bash
-> ./spine bench -c 50 -d 5s --host http://localhost:8080
-> ```
+3. **Durable Outbox Queue Resilience**:
+   - Outbound webhooks and action retries are stored in the primary database (`_spine_outbox` table). If a node dies mid-execution, pending retries are resumed automatically by surviving cluster nodes.
 
 ---
 

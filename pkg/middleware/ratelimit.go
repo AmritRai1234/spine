@@ -16,23 +16,35 @@ type rateLimiter struct {
 	lastRefill time.Time
 }
 
-// RateLimitManager manages IP-based rate limiting buckets.
+// RateLimitManager manages IP-based rate limiting buckets with trusted proxy validation.
 type RateLimitManager struct {
-	mu         sync.Mutex
-	limiters   map[string]*rateLimiter
-	limit      float64
-	burst      float64
-	cleanupTicker *time.Ticker
+	mu             sync.Mutex
+	limiters       map[string]*rateLimiter
+	limit          float64
+	burst          float64
+	trustedProxies map[string]bool
 }
 
 // NewRateLimitManager creates a rate limit manager allowing `rps` requests/sec with `burst` capacity.
 func NewRateLimitManager(rps float64, burst float64) *RateLimitManager {
 	m := &RateLimitManager{
-		limiters:   make(map[string]*rateLimiter),
-		limit:      rps,
-		burst:      burst,
+		limiters:       make(map[string]*rateLimiter),
+		limit:          rps,
+		burst:          burst,
+		trustedProxies: make(map[string]bool),
 	}
 	return m
+}
+
+// SetTrustedProxies configures trusted reverse proxy IPs (e.g., "127.0.0.1", "10.0.0.1").
+// Use "*" to trust all upstream proxies.
+func (m *RateLimitManager) SetTrustedProxies(proxies []string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.trustedProxies = make(map[string]bool)
+	for _, p := range proxies {
+		m.trustedProxies[strings.TrimSpace(p)] = true
+	}
 }
 
 // Allow checks whether a request from the given client IP is permitted.
@@ -68,22 +80,41 @@ func (m *RateLimitManager) Allow(ip string) bool {
 	return false
 }
 
+// ExtractIP extracts the client IP address, validating X-Forwarded-For headers against trusted proxies.
+func (m *RateLimitManager) ExtractIP(r *http.Request) string {
+	remoteIP, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		remoteIP = r.RemoteAddr
+	}
+
+	m.mu.Lock()
+	trustAll := m.trustedProxies["*"]
+	isTrusted := trustAll || m.trustedProxies[remoteIP]
+	m.mu.Unlock()
+
+	// If request comes from a trusted proxy (or trust mode is wildcard), parse proxy headers
+	if isTrusted || len(m.trustedProxies) == 0 {
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			parts := strings.Split(xff, ",")
+			clientIP := strings.TrimSpace(parts[0])
+			if clientIP != "" {
+				return clientIP
+			}
+		} else if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			clientIP := strings.TrimSpace(xri)
+			if clientIP != "" {
+				return clientIP
+			}
+		}
+	}
+
+	return remoteIP
+}
+
 // RateLimitMiddleware returns an HTTP handler middleware enforcing IP rate limits.
 func (m *RateLimitManager) Middleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
-		ip := ""
-		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-			parts := strings.Split(xff, ",")
-			ip = strings.TrimSpace(parts[0])
-		} else if xri := r.Header.Get("X-Real-IP"); xri != "" {
-			ip = strings.TrimSpace(xri)
-		} else {
-			var err error
-			ip, _, err = net.SplitHostPort(r.RemoteAddr)
-			if err != nil {
-				ip = r.RemoteAddr
-			}
-		}
+		ip := m.ExtractIP(r)
 
 		if !m.Allow(ip) {
 			w.Header().Set("Content-Type", "application/json")
