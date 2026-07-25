@@ -256,19 +256,24 @@ Spine implements **Adaptive Load-Based Transaction Batching** (`optimizer.go`):
 - **Lock-Free Registry**: Atomic pointer swaps (`atomic.Pointer`) for zero mutex contention on in-memory event dispatch.
 - **Database Engine Tuning**: SQLite WAL pragmas (`synchronous=NORMAL`, `mmap_size=268435456`, `_busy_timeout=30000`).
 
-## Security & Parameterization
+## Security & Governance
 
-1. **SQL Injection Prevention**:
+1. **Authentication Middleware**:
+   - Gatekeep endpoints using `--api-key <KEY>` or `SPINE_API_KEY` environment variable.
+   - Accepts headers: `Authorization: Bearer <KEY>` or `X-API-Key: <KEY>`.
+
+2. **SQL Parameterization**:
    - All database actions (`db.insert`, `db.update`, `db.delete`) use parameterized SQL statements (`?` bindings) and strict identifier sanitization (`sanitizeIdent`).
-   - Where conditions and payload inputs are never concatenated directly into SQL strings.
 
-2. **Schema Drift & Migrations**:
-   - `db.insert` automatically creates missing tables and adds missing payload columns via non-destructive `ALTER TABLE` statements.
-   - Column types default to non-strict SQLite storage classes to prevent data truncations during field type transitions.
+3. **Durable Outbox Retry Queue**:
+   - Outbound actions and retries are backed by `_spine_outbox` table persistence, ensuring webhooks and retries survive process restarts.
 
-3. **Multi-Node Deployment Boundaries**:
-   - Single-node embedded deployments run directly against local WAL SQLite.
-   - Distributed multi-region edge deployments use native Turso/libSQL replication (`turso.tech/database/tursogo`).
+4. **Production Health & Readiness Probes**:
+   - `/healthz`: Liveness probe (`{"status":"healthy"}`).
+   - `/readyz`: Readiness probe (`{"status":"ready"}`).
+
+5. **Cluster Mode & Multi-Node PubSub**:
+   - Event and WebSocket broadcasts use the `PubSub` interface, supporting local in-memory fanout or distributed backplane pub/sub across multi-instance load balancer clusters.
 
 ## Performance & Benchmark Methodology
 

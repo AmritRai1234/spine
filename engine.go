@@ -38,6 +38,7 @@ type Engine struct {
 	Bus       *Bus
 	Hub       *Hub
 	Schema    *SpineSchema
+	APIKey    string
 	spineFile string
 }
 
@@ -67,6 +68,11 @@ func NewFromFile(spineFile, dbPath string) (*Engine, error) {
 	return eng, nil
 }
 
+// SetAPIKey configures the API key requirement for protected HTTP endpoints.
+func (e *Engine) SetAPIKey(key string) {
+	e.APIKey = key
+}
+
 // Close shuts down the engine.
 func (e *Engine) Close() error {
 	return e.Bus.Close()
@@ -89,6 +95,11 @@ func (e *Engine) ListenAndServe(addr string) error {
 	return srv.ListenAndServe()
 }
 
+// HTTPHandler returns the configured http.Handler for embedding in custom servers.
+func (e *Engine) HTTPHandler() http.Handler {
+	return e.buildMux()
+}
+
 func (e *Engine) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
@@ -97,12 +108,22 @@ func (e *Engine) buildMux() *http.ServeMux {
 		w.Write([]byte(`{"status":"ok","engine":"spine-go","version":1}`))
 	})
 
-	mux.HandleFunc("/schema", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(e.Bus.GetRegistry().GetSchema())
+		w.Write([]byte(`{"status":"healthy"}`))
 	})
 
-	mux.HandleFunc("/emit", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"status":"ready"}`))
+	})
+
+	mux.HandleFunc("/schema", AuthMiddleware(e.APIKey, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(e.Bus.GetRegistry().GetSchema())
+	}))
+
+	mux.HandleFunc("/emit", AuthMiddleware(e.APIKey, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(405)
@@ -151,7 +172,7 @@ func (e *Engine) buildMux() *http.ServeMux {
 			json.NewEncoder(buf).Encode(result)
 		}
 		w.Write(buf.Bytes())
-	})
+	}))
 
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		opt := e.Bus.GetOptimizer()
@@ -164,7 +185,7 @@ func (e *Engine) buildMux() *http.ServeMux {
 		})
 	})
 
-	mux.HandleFunc("/tables", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/tables", AuthMiddleware(e.APIKey, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		tables, err := e.Bus.GetTables()
 		if err != nil {
@@ -176,9 +197,9 @@ func (e *Engine) buildMux() *http.ServeMux {
 			"status": "ok",
 			"tables": tables,
 		})
-	})
+	}))
 
-	mux.HandleFunc("/tables/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/tables/", AuthMiddleware(e.APIKey, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		tableName := strings.TrimPrefix(r.URL.Path, "/tables/")
 		if tableName == "" {
@@ -217,9 +238,9 @@ func (e *Engine) buildMux() *http.ServeMux {
 			"count":  len(rows),
 			"rows":   rows,
 		})
-	})
+	}))
 
-	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/events", AuthMiddleware(e.APIKey, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		eventName := r.URL.Query().Get("event")
 		limit := 50
@@ -246,7 +267,7 @@ func (e *Engine) buildMux() *http.ServeMux {
 			"count":  len(logs),
 			"events": logs,
 		})
-	})
+	}))
 
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
