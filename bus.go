@@ -35,6 +35,10 @@ type Bus struct {
 	stmtMu     sync.RWMutex
 	stmtCache  map[string]*sql.Stmt
 
+	// In-memory RAM State Cache
+	stateMu    sync.RWMutex
+	stateCache map[string]map[string]interface{}
+
 	// High-throughput batch writer
 	writeChan chan dbTask
 	wg        sync.WaitGroup
@@ -48,7 +52,7 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 	}
 
 	// Tune connection pool for concurrent goroutines
-	db.SetMaxOpenConns(1)    // SQLite only supports 1 writer
+	db.SetMaxOpenConns(1) // SQLite only supports 1 writer
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0) // Keep alive forever
 
@@ -69,11 +73,27 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 		hub:        hub,
 		knownTable: make(map[string]bool),
 		stmtCache:  make(map[string]*sql.Stmt),
+		stateCache: make(map[string]map[string]interface{}),
 		writeChan:  make(chan dbTask, 100000),
 	}
 	atomic.StorePointer(&bus.registry, unsafe.Pointer(reg))
 	bus.startBatchWriter()
 	return bus, nil
+}
+
+// GetState retrieves a cached state payload from RAM in sub-microsecond time.
+func (b *Bus) GetState(stateName string) (map[string]interface{}, bool) {
+	b.stateMu.RLock()
+	defer b.stateMu.RUnlock()
+	val, ok := b.stateCache[stateName]
+	return val, ok
+}
+
+// SetState caches the state payload in RAM.
+func (b *Bus) SetState(stateName string, payload map[string]interface{}) {
+	b.stateMu.Lock()
+	b.stateCache[stateName] = payload
+	b.stateMu.Unlock()
 }
 
 func (b *Bus) startBatchWriter() {
@@ -192,6 +212,7 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 		}
 
 		if route.EmitState != "" {
+			b.SetState(route.EmitState, payload)
 			b.hub.BroadcastState(route.EmitState, event, payload)
 			emittedStates = append(emittedStates, route.EmitState)
 
@@ -251,7 +272,7 @@ func sanitizeIdent(s string) string {
 	return b.String()
 }
 
-// ensureTable creates the table only if we haven't seen it before.
+// ensureTable creates the table and auto-generates column indexes if not seen before.
 func (b *Bus) ensureTable(table string, colDefs []string) error {
 	b.tableMu.RLock()
 	known := b.knownTable[table]
@@ -265,6 +286,19 @@ func (b *Bus) ensureTable(table string, colDefs []string) error {
 		table, strings.Join(colDefs, ", "))
 	if _, err := b.db.Exec(createSQL); err != nil {
 		return fmt.Errorf("create table failed: %w", err)
+	}
+
+	// Auto-index key lookup columns (e.g., email, user_id, project_id, status)
+	for _, colDef := range colDefs {
+		parts := strings.Fields(colDef)
+		if len(parts) > 0 {
+			colName := strings.Trim(parts[0], `"`)
+			if strings.HasSuffix(colName, "_id") || colName == "email" || colName == "status" || colName == "state" {
+				idxSQL := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS "idx_%s_%s" ON "%s"("%s")`,
+					table, colName, table, colName)
+				_, _ = b.db.Exec(idxSQL)
+			}
+		}
 	}
 
 	b.tableMu.Lock()
