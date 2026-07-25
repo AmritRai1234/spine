@@ -76,7 +76,15 @@ func (e *Engine) ListenAndServe(addr string) error {
 		e.startHotReload()
 	}
 	mux := e.buildMux()
-	return http.ListenAndServe(addr, mux)
+	srv := &http.Server{
+		Addr:         addr,
+		Handler:      mux,
+		ReadTimeout:  15 * time.Second,
+		WriteTimeout: 15 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
+	srv.SetKeepAlivesEnabled(true)
+	return srv.ListenAndServe()
 }
 
 func (e *Engine) buildMux() *http.ServeMux {

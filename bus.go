@@ -56,7 +56,7 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 	} else if strings.HasSuffix(dbPath, ".turso") {
 		driver = "turso"
 	} else {
-		connStr = dbPath + "?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000&_busy_timeout=5000"
+		connStr = dbPath + "?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000&_busy_timeout=30000"
 	}
 
 	db, err := sql.Open(driver, connStr)
@@ -77,6 +77,7 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 			"PRAGMA cache_size=-64000",
 			"PRAGMA temp_store=MEMORY",
 			"PRAGMA mmap_size=268435456",
+			"PRAGMA wal_autocheckpoint=10000",
 		}
 		for _, p := range pragmas {
 			db.Exec(p)
@@ -89,7 +90,7 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 		knownTable: make(map[string]bool),
 		stmtCache:  make(map[string]*sql.Stmt),
 		stateCache: make(map[string]map[string]interface{}),
-		writeChan:  make(chan dbTask, 100000),
+		writeChan:  make(chan dbTask, 500000),
 		optimizer:  NewAdaptiveOptimizer(),
 	}
 	atomic.StorePointer(&bus.registry, unsafe.Pointer(reg))
@@ -425,9 +426,10 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 	select {
 	case b.writeChan <- dbTask{query: insertSQL, params: values}:
 	default:
-		if _, err := b.db.Exec(insertSQL, values...); err != nil {
-			return fmt.Errorf("insert failed: %w", err)
-		}
+		// Channel buffer backup queue
+		go func(t dbTask) {
+			b.writeChan <- t
+		}(dbTask{query: insertSQL, params: values})
 	}
 
 	return nil
