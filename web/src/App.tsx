@@ -37,7 +37,7 @@ function useSpineWS(onMessage: (data: FeedItem) => void) {
       ws.onopen = () => setConnected(true)
       ws.onclose = () => {
         setConnected(false)
-        if (alive) timer = setTimeout(connect, 3000)  // reconnect silently
+        if (alive) timer = setTimeout(connect, 3000)
       }
       ws.onmessage = (e) => {
         try {
@@ -46,7 +46,7 @@ function useSpineWS(onMessage: (data: FeedItem) => void) {
             onMsgRef.current({
               id: ++idRef.current,
               type: 'state',
-              title: `⚡ ${data.state}`,
+              title: data.state,
               payload: data.payload,
               time: new Date(data.timestamp),
             })
@@ -71,31 +71,20 @@ function useSchema() {
   return schema
 }
 
-/* ===== Components ===== */
-
-function StatCard({ label, value }: { label: string; value: string | number }) {
-  return (
-    <div className="stat-card">
-      <div className="stat-label">{label}</div>
-      <div className="stat-value">{value}</div>
-    </div>
-  )
-}
-
-function EmitPanel({ schema, onEmit }: { schema: Schema | null; onEmit: (item: FeedItem) => void }) {
+/* ===== Component: Emit Console ===== */
+function EmitConsole({ schema, onEmit }: { schema: Schema | null; onEmit: (item: FeedItem) => void }) {
   const events = schema?.nodes.flatMap(n => n.emits?.map(e => e.event) ?? []) ?? []
-  const unique = [...new Set(events)]
+  const uniqueEvents = [...new Set(events)]
 
-  const [event, setEvent] = useState(unique[0] ?? '')
+  const [event, setEvent] = useState(uniqueEvents[0] ?? '')
   const [payload, setPayload] = useState('{\n  "email": "user@example.com"\n}')
   const [sending, setSending] = useState(false)
   const idRef = useRef(1000)
 
   useEffect(() => {
-    if (unique.length > 0 && !event) setEvent(unique[0])
-  }, [unique])
+    if (uniqueEvents.length > 0 && !event) setEvent(uniqueEvents[0])
+  }, [uniqueEvents])
 
-  // Auto-fill payload template when event changes
   useEffect(() => {
     if (!schema) return
     for (const node of schema.nodes) {
@@ -103,7 +92,7 @@ function EmitPanel({ schema, onEmit }: { schema: Schema | null; onEmit: (item: F
       if (emit?.fields?.length) {
         const tpl: Record<string, string> = {}
         for (const f of emit.fields) {
-          tpl[f.name] = f.field_type === 'number' ? '0' as unknown as string : `example_${f.name}`
+          tpl[f.name] = f.field_type === 'number' ? '0' as unknown as string : `sample_${f.name}`
         }
         setPayload(JSON.stringify(tpl, null, 2))
         return
@@ -112,6 +101,7 @@ function EmitPanel({ schema, onEmit }: { schema: Schema | null; onEmit: (item: F
   }, [event, schema])
 
   const handleSubmit = async () => {
+    if (!event || sending) return
     setSending(true)
     try {
       const body = { event, payload: JSON.parse(payload) }
@@ -124,7 +114,7 @@ function EmitPanel({ schema, onEmit }: { schema: Schema | null; onEmit: (item: F
       onEmit({
         id: ++idRef.current,
         type: res.ok ? 'emit' : 'error',
-        title: res.ok ? `→ ${event}` : `✗ ${event}`,
+        title: event,
         payload: data,
         time: new Date(),
       })
@@ -132,7 +122,7 @@ function EmitPanel({ schema, onEmit }: { schema: Schema | null; onEmit: (item: F
       onEmit({
         id: ++idRef.current,
         type: 'error',
-        title: `✗ ${event}`,
+        title: event,
         payload: { error: String(err) },
         time: new Date(),
       })
@@ -140,59 +130,98 @@ function EmitPanel({ schema, onEmit }: { schema: Schema | null; onEmit: (item: F
     setSending(false)
   }
 
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+      e.preventDefault()
+      handleSubmit()
+    }
+  }
+
   return (
-    <div className="card">
-      <div className="card-header">
-        <span className="card-title"><span className="card-title-icon">📡</span> Emit Event</span>
+    <div className="panel">
+      <div className="panel-header">
+        <span className="panel-title">EMIT CONSOLE</span>
+        <span className="panel-tag">POST /emit</span>
       </div>
-      <div className="card-body">
-        <div className="form-group">
-          <label className="form-label">Event</label>
-          <select className="form-select" value={event} onChange={e => setEvent(e.target.value)}>
-            {unique.map(ev => <option key={ev} value={ev}>{ev}</option>)}
+      <div className="panel-body">
+        <div className="field-group">
+          <div className="field-label">Target Event</div>
+          <select className="select-control" value={event} onChange={e => setEvent(e.target.value)}>
+            {uniqueEvents.length === 0 && <option value="">(No events declared)</option>}
+            {uniqueEvents.map(ev => <option key={ev} value={ev}>{ev}</option>)}
           </select>
         </div>
-        <div className="form-group">
-          <label className="form-label">Payload (JSON)</label>
-          <textarea className="form-textarea" value={payload} onChange={e => setPayload(e.target.value)} rows={5} spellCheck={false} />
+        <div className="field-group">
+          <div className="field-label">
+            <span>Payload</span>
+            <span className="field-hint">Press ⌘+Enter to submit</span>
+          </div>
+          <textarea
+            className="code-textarea"
+            value={payload}
+            onChange={e => setPayload(e.target.value)}
+            onKeyDown={handleKeyDown}
+            rows={5}
+            spellCheck={false}
+          />
         </div>
-        <button className="btn-emit" onClick={handleSubmit} disabled={sending}>
-          {sending ? 'Emitting...' : `Emit ${event}`}
+        <button className="btn-primary" onClick={handleSubmit} disabled={sending || !event}>
+          {sending ? 'Emitting...' : `Dispatch ${event}`}
         </button>
       </div>
     </div>
   )
 }
 
-function EventFeed({ items }: { items: FeedItem[] }) {
+/* ===== Component: Event Stream ===== */
+function EventStream({ items, onClear }: { items: FeedItem[]; onClear: () => void }) {
+  const [filter, setFilter] = useState<'all' | 'emit' | 'state' | 'error'>('all')
   const feedRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => {
     if (feedRef.current) feedRef.current.scrollTop = 0
   }, [items.length])
 
+  const filteredItems = items.filter(item => {
+    if (filter === 'all') return true
+    return item.type === filter
+  })
+
   return (
-    <div className="card" style={{ flex: 1 }}>
-      <div className="card-header">
-        <span className="card-title"><span className="card-title-icon">⚡</span> Live Event Feed</span>
-        <span className="card-badge" style={{ background: 'var(--accent-glow)', color: 'var(--accent)' }}>
-          {items.length} events
-        </span>
+    <div className="panel" style={{ flex: 1 }}>
+      <div className="panel-header">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span className="panel-title">LIVE EVENT STREAM</span>
+          <div className="tab-group">
+            {(['all', 'emit', 'state', 'error'] as const).map(tab => (
+              <button
+                key={tab}
+                className={`tab-btn ${filter === tab ? 'active' : ''}`}
+                onClick={() => setFilter(tab)}
+              >
+                {tab.toUpperCase()}
+              </button>
+            ))}
+          </div>
+        </div>
+        <button className="btn-ghost" onClick={onClear}>Clear</button>
       </div>
-      <div className="feed" ref={feedRef}>
-        {items.length === 0 && (
-          <div className="feed-empty">No events yet — emit one from the panel</div>
+      <div className="feed-stream" ref={feedRef}>
+        {filteredItems.length === 0 && (
+          <div className="empty-state">No events recorded in stream</div>
         )}
-        {items.map(item => (
-          <div key={item.id} className="feed-item">
-            <div className={`feed-dot ${item.type}`} />
-            <div className="feed-content">
-              <div className="feed-title">{item.title}</div>
-              <div className="feed-time">{item.time.toLocaleTimeString()}</div>
-              {item.payload && (
-                <div className="feed-payload">{JSON.stringify(item.payload, null, 2)}</div>
-              )}
+        {filteredItems.map(item => (
+          <div key={item.id} className="feed-row">
+            <div className="feed-row-header">
+              <div className="feed-meta">
+                <span className={`badge-tag badge-${item.type}`}>{item.type}</span>
+                <span className="feed-title">{item.title}</span>
+              </div>
+              <span className="feed-timestamp">{item.time.toLocaleTimeString()}</span>
             </div>
+            {item.payload && (
+              <pre className="code-block">{JSON.stringify(item.payload, null, 2)}</pre>
+            )}
           </div>
         ))}
       </div>
@@ -200,52 +229,68 @@ function EventFeed({ items }: { items: FeedItem[] }) {
   )
 }
 
-function SchemaPanel({ schema }: { schema: Schema | null }) {
-  if (!schema) return <div className="card"><div className="card-body feed-empty">Loading schema...</div></div>
+/* ===== Component: Schema Inspector ===== */
+function SchemaInspector({ schema }: { schema: Schema | null }) {
+  if (!schema) {
+    return (
+      <div className="panel">
+        <div className="panel-header"><span className="panel-title">MANIFEST SCHEMA</span></div>
+        <div className="panel-body empty-state">Loading schema...</div>
+      </div>
+    )
+  }
 
   return (
-    <div className="card">
-      <div className="card-header">
-        <span className="card-title"><span className="card-title-icon">🗺️</span> Schema</span>
-        <span className="card-badge" style={{ background: 'var(--cyan-dim)', color: 'var(--cyan)' }}>
-          v{schema.spine_version}
-        </span>
+    <div className="panel">
+      <div className="panel-header">
+        <span className="panel-title">MANIFEST SCHEMA</span>
+        <span className="panel-tag">v{schema.spine_version}</span>
       </div>
-      <div className="card-body">
-        <div className="schema-section">
-          <div className="schema-section-title">Nodes ({schema.nodes.length})</div>
+      <div className="panel-body">
+        <div className="schema-block">
+          <div className="schema-label">NODES ({schema.nodes.length})</div>
           {schema.nodes.map(node => (
-            <div key={node.name} className="node-card">
-              <div className="node-name">◆ {node.name}</div>
-              <div className="node-tags">
-                {node.emits?.map(e => <span key={e.event} className="tag tag-emit">{e.event}</span>)}
-                {node.listens?.map(l => <span key={l.state} className="tag tag-listen">{l.state}</span>)}
-              </div>
-            </div>
-          ))}
-        </div>
-        <div className="schema-section">
-          <div className="schema-section-title">Routes ({schema.routes.length})</div>
-          {schema.routes.map((r, i) => (
-            <div key={i} className="node-card">
-              <div className="node-tags">
-                <span className="tag tag-emit">{r.on_event}</span>
-                <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>→</span>
-                {r.steps.map((s, j) => (
-                  <span key={j} className="tag tag-route">{s.action}{s.table ? `:${s.table}` : ''}</span>
+            <div key={node.name} className="tree-item">
+              <div className="tree-item-title">{node.name}</div>
+              <div className="tree-tags">
+                {node.emits?.map(e => (
+                  <span key={e.event} className="tag-badge" style={{ color: 'var(--blue)' }}>emits:{e.event}</span>
                 ))}
-                {r.emit_state && <>
-                  <span style={{ color: 'var(--text-muted)', fontSize: 11 }}>→</span>
-                  <span className="tag tag-listen">{r.emit_state}</span>
-                </>}
+                {node.listens?.map(l => (
+                  <span key={l.state} className="tag-badge" style={{ color: 'var(--emerald)' }}>listens:{l.state}</span>
+                ))}
               </div>
             </div>
           ))}
         </div>
-        <div className="schema-section">
-          <div className="schema-section-title">Tables ({schema.db_tables?.length ?? 0})</div>
-          <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
-            {schema.db_tables?.map(t => <span key={t} className="tag tag-table">{t}</span>)}
+
+        <div className="schema-block">
+          <div className="schema-label">ROUTES ({schema.routes.length})</div>
+          {schema.routes.map((r, i) => (
+            <div key={i} className="tree-item">
+              <div className="tree-tags">
+                <span className="tag-badge" style={{ color: 'var(--blue)' }}>{r.on_event}</span>
+                <span style={{ color: 'var(--text-dim)' }}>→</span>
+                {r.steps.map((s, j) => (
+                  <span key={j} className="tag-badge">{s.action}{s.table ? `:${s.table}` : ''}</span>
+                ))}
+                {r.emit_state && (
+                  <>
+                    <span style={{ color: 'var(--text-dim)' }}>→</span>
+                    <span className="tag-badge" style={{ color: 'var(--emerald)' }}>{r.emit_state}</span>
+                  </>
+                )}
+              </div>
+            </div>
+          ))}
+        </div>
+
+        <div className="schema-block">
+          <div className="schema-label">TABLES ({schema.db_tables?.length ?? 0})</div>
+          <div className="tree-tags">
+            {schema.db_tables?.map(t => (
+              <span key={t} className="tag-badge">{t}</span>
+            ))}
           </div>
         </div>
       </div>
@@ -253,7 +298,7 @@ function SchemaPanel({ schema }: { schema: Schema | null }) {
   )
 }
 
-/* ===== App ===== */
+/* ===== Main App ===== */
 export default function App() {
   const [feed, setFeed] = useState<FeedItem[]>([])
   const [emitCount, setEmitCount] = useState(0)
@@ -261,7 +306,7 @@ export default function App() {
   const [errorCount, setErrorCount] = useState(0)
 
   const addItem = useCallback((item: FeedItem) => {
-    setFeed(prev => [item, ...prev].slice(0, 200))
+    setFeed(prev => [item, ...prev].slice(0, 300))
     if (item.type === 'state') setStateCount(c => c + 1)
     else if (item.type === 'emit') setEmitCount(c => c + 1)
     else if (item.type === 'error') setErrorCount(c => c + 1)
@@ -273,30 +318,42 @@ export default function App() {
   return (
     <div className="app">
       <header className="header">
-        <div className="header-left">
-          <span className="logo">⚡ SPINE</span>
-          <span className="logo-tag">Dashboard</span>
+        <div className="brand">
+          <span className="logo-text">SPINE // ENGINE</span>
+          <span className="brand-badge">v2.0.0</span>
         </div>
-        <div className="connection-badge">
-          <div className={`connection-dot ${connected ? 'connected' : 'disconnected'}`} />
-          <span>{connected ? 'WebSocket Connected' : 'Disconnected'}</span>
+        <div className="status-pill">
+          <div className={`status-dot ${connected ? 'active' : 'inactive'}`} />
+          <span>{connected ? 'CONNECTED (WS: LIVE)' : 'DISCONNECTED'}</span>
         </div>
       </header>
 
-      <div className="stats-bar">
-        <StatCard label="Events Emitted" value={emitCount} />
-        <StatCard label="States Received" value={stateCount} />
-        <StatCard label="Errors" value={errorCount} />
-        <StatCard label="Nodes" value={schema?.nodes.length ?? '—'} />
+      <div className="metrics-strip">
+        <div className="metric-card">
+          <span className="metric-label">Events Emitted</span>
+          <span className="metric-value">{emitCount}</span>
+        </div>
+        <div className="metric-card">
+          <span className="metric-label">States Broadcast</span>
+          <span className="metric-value">{stateCount}</span>
+        </div>
+        <div className="metric-card">
+          <span className="metric-label">Active Nodes</span>
+          <span className="metric-value">{schema?.nodes.length ?? '0'}</span>
+        </div>
+        <div className="metric-card">
+          <span className="metric-label">Registered Routes</span>
+          <span className="metric-value">{schema?.routes.length ?? '0'}</span>
+        </div>
       </div>
 
-      <div className="grid">
-        <div className="sidebar">
-          <EmitPanel schema={schema} onEmit={addItem} />
-          <SchemaPanel schema={schema} />
+      <div className="grid-layout">
+        <div className="col-sidebar">
+          <EmitConsole schema={schema} onEmit={addItem} />
+          <SchemaInspector schema={schema} />
         </div>
-        <div className="main-content">
-          <EventFeed items={feed} />
+        <div className="col-main">
+          <EventStream items={feed} onClear={() => setFeed([])} />
         </div>
       </div>
     </div>

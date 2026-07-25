@@ -24,3 +24,4 @@ Thumbs.db
 *.swo
 *.resolved
 bin/
+web/dist/
