@@ -9,7 +9,7 @@
   <a href="#performance"><img src="https://img.shields.io/badge/latency-59%CE%BCs-blue?style=flat-square" alt="Latency"></a>
   <a href="#performance"><img src="https://img.shields.io/badge/memory-21MB%20RSS-purple?style=flat-square" alt="Memory"></a>
   <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-library-00ADD8?style=flat-square&logo=go" alt="Go"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPLv3-blue?style=flat-square" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPLv3-blue?style=flat-square" alt="License"></a>
 </p>
 
 ---
@@ -258,12 +258,14 @@ Spine implements **Adaptive Load-Based Transaction Batching** (`optimizer.go`):
 
 ## Security & Governance
 
-1. **Authentication Middleware**:
+1. **Authentication & Rate Limiting Middleware**:
    - Gatekeep endpoints using `--api-key <KEY>` or `SPINE_API_KEY` environment variable.
+   - IP-based token-bucket rate limiting (`engine.SetRateLimit(rps, burst)`).
    - Accepts headers: `Authorization: Bearer <KEY>` or `X-API-Key: <KEY>`.
 
-2. **SQL Parameterization**:
+2. **SQL Parameterization & Versioned Migrations**:
    - All database actions (`db.insert`, `db.update`, `db.delete`) use parameterized SQL statements (`?` bindings) and strict identifier sanitization (`sanitizeIdent`).
+   - Transactional versioned schema migrations tracked in `_spine_migrations` (`engine.Bus.ApplyMigration`).
 
 3. **Durable Outbox Retry Queue**:
    - Outbound actions and retries are backed by `_spine_outbox` table persistence, ensuring webhooks and retries survive process restarts.
@@ -272,8 +274,9 @@ Spine implements **Adaptive Load-Based Transaction Batching** (`optimizer.go`):
    - `/healthz`: Liveness probe (`{"status":"healthy"}`).
    - `/readyz`: Readiness probe (`{"status":"ready"}`).
 
-5. **Cluster Mode & Multi-Node PubSub**:
-   - Event and WebSocket broadcasts use the `PubSub` interface, supporting local in-memory fanout or distributed backplane pub/sub across multi-instance load balancer clusters.
+5. **Cluster Mode & Distributed Backplanes (Redis / NATS)**:
+   - Horizontal multi-instance fanout uses the `PubSub` interface backed by **Redis Streams** or **NATS**.
+   - Multi-node cluster deployments write to **Turso / libSQL** primary databases to overcome local SQLite single-writer boundaries.
 
 ## Performance & Benchmark Methodology
 

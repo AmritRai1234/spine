@@ -38,8 +38,14 @@ type Engine struct {
 	Bus       *Bus
 	Hub       *Hub
 	Schema    *SpineSchema
-	APIKey    string
-	spineFile string
+	APIKey      string
+	rateLimiter *RateLimitManager
+	spineFile   string
+}
+
+// SetRateLimit enables IP-based token bucket rate limiting on public endpoints.
+func (e *Engine) SetRateLimit(rps, burst float64) {
+	e.rateLimiter = NewRateLimitManager(rps, burst)
 }
 
 // New creates a fully wired Engine from a parsed schema.
@@ -100,6 +106,14 @@ func (e *Engine) HTTPHandler() http.Handler {
 	return e.buildMux()
 }
 
+func (e *Engine) wrapMiddleware(handler http.HandlerFunc) http.HandlerFunc {
+	h := AuthMiddleware(e.APIKey, handler)
+	if e.rateLimiter != nil {
+		h = e.rateLimiter.Middleware(h)
+	}
+	return h
+}
+
 func (e *Engine) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
@@ -118,12 +132,12 @@ func (e *Engine) buildMux() *http.ServeMux {
 		w.Write([]byte(`{"status":"ready"}`))
 	})
 
-	mux.HandleFunc("/schema", AuthMiddleware(e.APIKey, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/schema", e.wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(e.Bus.GetRegistry().GetSchema())
 	}))
 
-	mux.HandleFunc("/emit", AuthMiddleware(e.APIKey, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/emit", e.wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(405)
@@ -185,7 +199,7 @@ func (e *Engine) buildMux() *http.ServeMux {
 		})
 	})
 
-	mux.HandleFunc("/tables", AuthMiddleware(e.APIKey, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/tables", e.wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		tables, err := e.Bus.GetTables()
 		if err != nil {
@@ -199,7 +213,7 @@ func (e *Engine) buildMux() *http.ServeMux {
 		})
 	}))
 
-	mux.HandleFunc("/tables/", AuthMiddleware(e.APIKey, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/tables/", e.wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		tableName := strings.TrimPrefix(r.URL.Path, "/tables/")
 		if tableName == "" {
@@ -240,7 +254,7 @@ func (e *Engine) buildMux() *http.ServeMux {
 		})
 	}))
 
-	mux.HandleFunc("/events", AuthMiddleware(e.APIKey, func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/events", e.wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		eventName := r.URL.Query().Get("event")
 		limit := 50
