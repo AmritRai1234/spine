@@ -10,6 +10,7 @@ database:
     - clips
     - transcripts
     - blackboard_events
+    - audit_logs
 
 nodes:
   LandingPage:
@@ -20,6 +21,7 @@ nodes:
       - event: SUBMIT_LEAD
         payload:
           email: string
+          source: string
     listens:
       - state: LEAD_STATUS
         payload:
@@ -32,13 +34,14 @@ nodes:
       - event: UPDATE_PROFILE
         payload:
           name: string
-          avatar: string
+          role: string
+          email: string
     listens:
       - state: USER_PROFILE
         payload:
           name: string
-          avatar: string
           role: string
+          email: string
 
   Dashboard:
     owns_files:
@@ -54,90 +57,46 @@ nodes:
           project_id: string
           status: string
 
-  ProjectView:
-    owns_files:
-      - frontend/src/pages/ProjectView.tsx
-    emits:
-      - event: START_PIPELINE
-        payload:
-          project_id: string
-    listens:
-      - state: PIPELINE_PROGRESS
-        payload:
-          project_id: string
-          stage: string
-          progress: number
-          message: string
-
-  ClipEditor:
-    owns_files:
-      - frontend/src/pages/ClipEditor.tsx
-    emits:
-      - event: UPDATE_CLIP_STYLE
-        payload:
-          clip_id: string
-          font_family: string
-          font_color: string
-    listens:
-      - state: CLIP_UPDATED
-        payload:
-          clip_id: string
-          status: string
-
-  BlackboardPipeline:
-    owns_files:
-      - backend/pipeline/blackboard.py
-      - backend/pipeline/orchestrator.py
-    emits:
-      - event: PIPELINE_PROGRESS
-        payload:
-          project_id: string
-          stage: string
-          progress: number
-          message: string
-    listens:
-      - state: START_PIPELINE
-        payload:
-          project_id: string
-
 routes:
-  - "on": SUBMIT_LEAD
+  # Submit Lead Route (with parallel execution & HTTP webhook retries)
+  - on: SUBMIT_LEAD
+    parallel: true
     steps:
       - action: db.insert
         table: landing_analytics
         input: "$event.payload"
+
       - action: log.write
         message: "[LEAD] Received lead for $event.payload.email at $now"
+
+      - action: http.post
+        url: "https://hooks.slack.com/services/test/lead"
+        max_attempts: 3
+        backoff_ms: 100
+        if: "$event.payload.email contains '@'"
+
     emit: LEAD_STATUS
 
-  - "on": LEAD_STATUS
+  - on: LEAD_STATUS
     steps:
       - action: log.write
         message: "[AUDIT] Lead status processed successfully"
 
-  - "on": UPDATE_PROFILE
+  # Admin Update Profile Route (with conditional route guard)
+  - on: UPDATE_PROFILE
+    if: "$event.payload.role == 'admin'"
     steps:
       - action: db.update
         table: users
         input: "$event.payload"
+      - action: log.write
+        message: "[SECURITY] Admin profile updated for $event.payload.name"
     emit: USER_PROFILE
 
-  - "on": CREATE_PROJECT
+  # Create Project Route
+  - on: CREATE_PROJECT
     steps:
       - action: db.insert
         table: projects
         input: "$event.payload"
     emit: PROJECT_CREATED
-
-  - "on": START_PIPELINE
-    steps:
-      - action: pipeline.dispatch_blackboard
-        input: "$event.payload"
-    emit: PIPELINE_PROGRESS
-
-  - "on": UPDATE_CLIP_STYLE
-    steps:
-      - action: db.update
-        table: clips
-        input: "$event.payload"
-    emit: CLIP_UPDATED
