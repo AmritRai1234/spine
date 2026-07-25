@@ -38,6 +38,7 @@ type PayloadField struct {
 type Route struct {
 	OnEvent     string      `json:"on_event"`
 	IfCondition string      `json:"if_condition,omitempty"`
+	Parallel    bool        `json:"parallel,omitempty"`
 	Steps       []RouteStep `json:"steps"`
 	EmitState   string      `json:"emit_state,omitempty"`
 }
@@ -51,4 +52,6 @@ type RouteStep struct {
 	URL         string `json:"url,omitempty"`
 	Message     string `json:"message,omitempty"`
 	Where       string `json:"where,omitempty"`
+	MaxAttempts int    `json:"max_attempts,omitempty"`
+	BackoffMs   int    `json:"backoff_ms,omitempty"`
 }

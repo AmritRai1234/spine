@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 )
 
@@ -297,6 +298,11 @@ func ParseManifest(filepath string) (*SpineSchema, error) {
 					state = sRouteBody
 					continue
 				}
+				if v, ok := kvValue(trimmed, "parallel"); ok {
+					curRoute.Parallel = unquote(v) == "true"
+					state = sRouteBody
+					continue
+				}
 				if v, ok := kvValue(trimmed, "emit"); ok {
 					curRoute.EmitState = unquote(v)
 					state = sRouteBody
@@ -316,6 +322,18 @@ func ParseManifest(filepath string) (*SpineSchema, error) {
 			if state == sRouteStepBody && indent == 4 && curStep != nil {
 				if v, ok := kvValue(trimmed, "if"); ok {
 					curStep.IfCondition = unquote(v)
+					continue
+				}
+				if v, ok := kvValue(trimmed, "max_attempts"); ok {
+					if attempts, err := strconv.Atoi(unquote(v)); err == nil {
+						curStep.MaxAttempts = attempts
+					}
+					continue
+				}
+				if v, ok := kvValue(trimmed, "backoff_ms"); ok {
+					if backoff, err := strconv.Atoi(unquote(v)); err == nil {
+						curStep.BackoffMs = backoff
+					}
 					continue
 				}
 				if v, ok := kvValue(trimmed, "table"); ok {

@@ -223,9 +223,32 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 			continue
 		}
 
-		for _, step := range route.Steps {
-			if err := b.execStep(&step, event, payload); err != nil {
-				return nil, fmt.Errorf("step execution failed (action=%s, table=%s): %w", step.Action, step.Table, err)
+		if route.Parallel {
+			var wg sync.WaitGroup
+			var errMu sync.Mutex
+			var stepErr error
+			for i := range route.Steps {
+				wg.Add(1)
+				go func(s *RouteStep) {
+					defer wg.Done()
+					if err := b.execStep(s, event, payload); err != nil {
+						errMu.Lock()
+						if stepErr == nil {
+							stepErr = err
+						}
+						errMu.Unlock()
+					}
+				}(&route.Steps[i])
+			}
+			wg.Wait()
+			if stepErr != nil {
+				return nil, fmt.Errorf("parallel step execution failed: %w", stepErr)
+			}
+		} else {
+			for _, step := range route.Steps {
+				if err := b.execStep(&step, event, payload); err != nil {
+					return nil, fmt.Errorf("step execution failed (action=%s, table=%s): %w", step.Action, step.Table, err)
+				}
 			}
 		}
 
@@ -260,6 +283,25 @@ func (b *Bus) execStep(step *RouteStep, eventName string, payload map[string]int
 		return nil
 	}
 
+	attempts := step.MaxAttempts
+	if attempts <= 0 {
+		attempts = 1
+	}
+
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		lastErr = b.dispatchAction(step, eventName, payload)
+		if lastErr == nil {
+			return nil
+		}
+		if attempt < attempts && step.BackoffMs > 0 {
+			time.Sleep(time.Duration(step.BackoffMs) * time.Millisecond)
+		}
+	}
+	return fmt.Errorf("action %s failed after %d attempts: %w", step.Action, attempts, lastErr)
+}
+
+func (b *Bus) dispatchAction(step *RouteStep, eventName string, payload map[string]interface{}) error {
 	switch step.Action {
 	case "db.insert":
 		if step.Table != "" {
