@@ -351,7 +351,7 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 		if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
 			values = append(values, ResolveVariables(strVal, eventName, payload))
 		} else {
-			values = append(values, fmt.Sprintf("%v", v))
+			values = append(values, v)
 		}
 	}
 
@@ -402,11 +402,11 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 			if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
 				params = append(params, ResolveVariables(strVal, eventName, payload))
 			} else {
-				params = append(params, fmt.Sprintf("%v", v))
+				params = append(params, v)
 			}
 		}
 	}
-	params = append(params, fmt.Sprintf("%v", payload[whereKey]))
+	params = append(params, payload[whereKey])
 
 	if err := b.ensureTable(table, colDefs); err != nil {
 		return err

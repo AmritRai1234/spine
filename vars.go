@@ -51,6 +51,11 @@ func ResolveVariables(input string, eventName string, payload map[string]interfa
 		return ""
 	}
 
+	// Fast-path: no variable token in input string
+	if strings.IndexByte(input, '$') == -1 {
+		return input
+	}
+
 	// Exact string replacements for standalone tokens
 	if input == "$now" {
 		return time.Now().UTC().Format(time.RFC3339)
