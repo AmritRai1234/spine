@@ -17,8 +17,10 @@ Untitled design.png
 .DS_Store
 Thumbs.db
 
-# IDE
+# IDE & Temp
 .idea/
 .vscode/
 *.swp
 *.swo
+*.resolved
+bin/
