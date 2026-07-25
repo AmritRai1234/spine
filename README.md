@@ -241,25 +241,46 @@ Commands:
 ./spine bench -c 50 -d 5s --host http://localhost:8080
 ```
 
-## Performance
+## Optimization Architecture
 
-Benchmarked using `spine bench` on 50 concurrent client connections:
+Spine implements **Adaptive Load-Based Transaction Batching** (`optimizer.go`):
 
-| Metric | Measurement |
-|--------|-------------|
-| Throughput | **56,800 req/sec** |
-| Minimum Latency | **59 microseconds** |
-| Average Latency | **797 microseconds** |
-| Success Rate | **100% (0 errors)** |
-| Memory Footprint | **21MB RSS** |
+- **Dynamic Workload Sampling**: Samples throughput (RPS) every 100ms using atomic counters.
+- **Adaptive Control Modes**: Automatically shifts between modes to balance latency and disk I/O:
+  - `Micro-Latency` (RPS < 200): 250 item batch limit, 5ms flush window.
+  - `Balanced` (RPS 200 - 2,000): 1,000 item batch limit, 2ms flush window.
+  - `High-Throughput` (RPS 2,000 - 10,000): 2,500 item batch limit, 1ms flush window.
+  - `Extreme-Batching` (RPS > 20,000): 10,000 item batch limit, 250µs flush window.
+- **Lock-Free Registry**: Atomic pointer swaps (`atomic.Pointer`) for zero mutex contention on in-memory event dispatch.
+- **Database Engine Tuning**: SQLite WAL pragmas (`synchronous=NORMAL`, `mmap_size=268435456`, `_busy_timeout=30000`).
 
-### Optimization Stack
+## Security & Parameterization
 
-1. **Channel-Based Transaction Batcher**: Groups writes into single `BEGIN IMMEDIATE ... COMMIT` SQLite transactions.
-2. **In-Memory RAM State Cache**: Sub-microsecond `GetState()` lookups without disk overhead.
-3. **Manifest-Driven Auto-Indexing Engine**: Self-tuning database indexes on query lookup columns.
-4. **Lock-Free Registry**: Atomic pointer swaps (`atomic.Pointer`) for zero mutex contention on event dispatch.
-5. **SQLite WAL Pragmas**: `synchronous=NORMAL`, 64MB cache, mmap, `temp_store=MEMORY`.
+1. **SQL Injection Prevention**:
+   - All database actions (`db.insert`, `db.update`, `db.delete`) use parameterized SQL statements (`?` bindings) and strict identifier sanitization (`sanitizeIdent`).
+   - Where conditions and payload inputs are never concatenated directly into SQL strings.
+
+2. **Schema Drift & Migrations**:
+   - `db.insert` automatically creates missing tables and adds missing payload columns via non-destructive `ALTER TABLE` statements.
+   - Column types default to non-strict SQLite storage classes to prevent data truncations during field type transitions.
+
+3. **Multi-Node Deployment Boundaries**:
+   - Single-node embedded deployments run directly against local WAL SQLite.
+   - Distributed multi-region edge deployments use native Turso/libSQL replication (`turso.tech/database/tursogo`).
+
+## Performance & Benchmark Methodology
+
+Benchmarked using `spine bench` on local loopback:
+
+- **Environment**: Linux x86_64, Go 1.22, 12-core CPU, NVMe SSD.
+- **Test Configuration**: 50 concurrent HTTP client streams emitting standard JSON payloads over 5 seconds.
+- **Results**:
+  - **Throughput**: ~50,000 - 53,000 req/sec
+  - **Min Latency**: 72 microseconds
+  - **Average Latency**: 939 microseconds
+  - **Success Rate**: 100% (0 dropped packets)
+
+> **Note**: Benchmark results vary depending on disk I/O, network latency, and client connection counts. Run `./spine bench -c 50 -d 5s` to reproduce on your target hardware.
 
 ## Go Library Integration
 
