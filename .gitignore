@@ -2,7 +2,7 @@
 node_modules/
 
 # Binary
-spine
+/spine
 
 # SQLite & Turso
 *.db

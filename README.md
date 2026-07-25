@@ -164,12 +164,36 @@ git clone https://github.com/AmritRai1234/spine.git
 cd spine
 go build -o spine ./cmd/spine/
 
-# 2. Run Server
+# 2. Validate your manifest
+./spine parse examples/app.spine
+
+# 3. Start the server
 ./spine serve examples/app.spine --port 8080
 
-# 3. Open Developer Dashboard
-# Navigate to http://localhost:8080 in your browser
+# 4. Emit an event (from another terminal)
+./spine emit SUBMIT_LEAD --payload '{"email":"test@dev.com","name":"Jane"}'
 ```
+
+### Docker
+
+```bash
+# Build
+docker build -t spine .
+
+# Run
+docker run -p 8080:8080 -v $(pwd)/examples:/app spine serve /app/app.spine
+```
+
+### CLI Reference
+
+```bash
+spine serve <manifest.spine> [--port 8080] [--db spine.db] [--api-key KEY] [--rate-limit 1000]
+spine emit  <EVENT_NAME>     [--payload '{}'] [--server http://localhost:8080] [--api-key KEY]
+spine parse <manifest.spine> [--json]
+spine version
+```
+
+Environment variables: `SPINE_PORT`, `SPINE_DB`, `SPINE_API_KEY`
 
 ---
 
