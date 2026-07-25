@@ -143,6 +143,17 @@ func (e *Engine) buildMux() *http.ServeMux {
 		w.Write(buf.Bytes())
 	})
 
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		opt := e.Bus.GetOptimizer()
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":            "ok",
+			"optimizer_mode":    opt.GetMode(),
+			"target_batch_size": opt.GetBatchSize(),
+			"flush_interval":    opt.GetFlushInterval().String(),
+		})
+	})
+
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {

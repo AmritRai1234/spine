@@ -40,9 +40,10 @@ type Bus struct {
 	stateMu    sync.RWMutex
 	stateCache map[string]map[string]interface{}
 
-	// High-throughput batch writer
+	// High-throughput batch writer & Adaptive Optimizer
 	writeChan chan dbTask
 	wg        sync.WaitGroup
+	optimizer *AdaptiveOptimizer
 }
 
 // NewBus creates a Bus wired to a Registry, SQLite/Turso database, and WS hub.
@@ -89,10 +90,16 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 		stmtCache:  make(map[string]*sql.Stmt),
 		stateCache: make(map[string]map[string]interface{}),
 		writeChan:  make(chan dbTask, 100000),
+		optimizer:  NewAdaptiveOptimizer(),
 	}
 	atomic.StorePointer(&bus.registry, unsafe.Pointer(reg))
 	bus.startBatchWriter()
 	return bus, nil
+}
+
+// GetOptimizer returns the active latency optimizer.
+func (b *Bus) GetOptimizer() *AdaptiveOptimizer {
+	return b.optimizer
 }
 
 // GetState retrieves a cached state payload from RAM in sub-microsecond time.
@@ -150,8 +157,9 @@ func (b *Bus) startBatchWriter() {
 					return
 				}
 				batch = append(batch, task)
+				targetBatchSize := b.optimizer.GetBatchSize()
 				// Opportunistic non-blocking drain loop
-				for len(batch) < 1000 {
+				for len(batch) < targetBatchSize {
 					select {
 					case t, ok := <-b.writeChan:
 						if !ok {
@@ -206,6 +214,8 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 	if depth > 10 {
 		return nil, fmt.Errorf("event chaining max depth (10) exceeded on event '%s'", event)
 	}
+
+	b.optimizer.RecordRequest()
 
 	reg := b.GetRegistry()
 
