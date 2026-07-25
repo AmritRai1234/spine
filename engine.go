@@ -3,7 +3,6 @@ package spine
 import (
 	"bytes"
 	"encoding/json"
-	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -77,13 +76,6 @@ func (e *Engine) ListenAndServe(addr string) error {
 		e.startHotReload()
 	}
 	mux := e.buildMux()
-	fmt.Println()
-	fmt.Println("┌──────────────────────────────────────────┐")
-	fmt.Println("│  SPINE v1 Runtime Server (Go)            │")
-	fmt.Printf("│  HTTP:  http://%-26s │\n", addr)
-	fmt.Printf("│  WS:    ws://%-28s │\n", addr+"/ws")
-	fmt.Println("└──────────────────────────────────────────┘")
-	fmt.Println()
 	return http.ListenAndServe(addr, mux)
 }
 
