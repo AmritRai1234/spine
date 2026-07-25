@@ -39,8 +39,9 @@ type Bus struct {
 	db       *sql.DB
 	hub      *Hub
 
-	// Performance: lock-free known tables
+	// Performance: lock-free known tables + identifier cache
 	knownTable sync.Map
+	identCache sync.Map // sanitizeIdent result cache
 
 	// In-memory RAM State Cache
 	stateMu    sync.RWMutex
@@ -156,8 +157,29 @@ func (b *Bus) startBatchWriter() {
 				return
 			}
 
+			// Prepared statement cache within this transaction.
+			// Reusing stmts eliminates sqlite3_prepare_v2 overhead (31% of CPU).
+			stmtCache := make(map[string]*sql.Stmt, 8)
+			defer func() {
+				for _, s := range stmtCache {
+					s.Close()
+				}
+			}()
+
 			for _, task := range batch {
-				if _, err := tx.Exec(task.query, task.params...); err != nil {
+				stmt, ok := stmtCache[task.query]
+				if !ok {
+					stmt, err = tx.Prepare(task.query)
+					if err != nil {
+						// Fallback: direct exec
+						if _, execErr := tx.Exec(task.query, task.params...); execErr != nil {
+							log.Printf("[batch] exec error: %v", execErr)
+						}
+						continue
+					}
+					stmtCache[task.query] = stmt
+				}
+				if _, err := stmt.Exec(task.params...); err != nil {
 					log.Printf("[batch] exec error: %v", err)
 				}
 			}
@@ -402,6 +424,17 @@ func (b *Bus) queuePublish(step *manifest.RouteStep, eventName string, payload m
 }
 
 // sanitizeIdent strips anything that isn't alphanumeric or underscore.
+// Results are cached in identCache sync.Map for repeated column/table names.
+func (b *Bus) sanitizeIdentCached(s string) string {
+	if cached, ok := b.identCache.Load(s); ok {
+		return cached.(string)
+	}
+	result := sanitizeIdent(s)
+	b.identCache.Store(s, result)
+	return result
+}
+
+// sanitizeIdent strips anything that isn't alphanumeric or underscore.
 func sanitizeIdent(s string) string {
 	var b strings.Builder
 	b.Grow(len(s))
@@ -458,7 +491,7 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 		return nil
 	}
 
-	table = sanitizeIdent(table)
+	table = b.sanitizeIdentCached(table)
 
 	// Pre-size all slices to payload length — eliminates append reallocation
 	colDefs := make([]string, 0, n)
@@ -467,7 +500,7 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 	values := make([]interface{}, 0, n)
 
 	for k, v := range payload {
-		safe := sanitizeIdent(k)
+		safe := b.sanitizeIdentCached(k)
 		colDefs = append(colDefs, fmt.Sprintf(`"%s" TEXT`, safe))
 		colNames = append(colNames, `"`+safe+`"`)
 		placeholders = append(placeholders, "?")
@@ -523,7 +556,7 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 		return nil
 	}
 
-	table = sanitizeIdent(table)
+	table = b.sanitizeIdentCached(table)
 
 	whereKey := ""
 	if _, ok := payload["id"]; ok {
@@ -541,7 +574,7 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 	params := make([]interface{}, 0, n)
 
 	for k, v := range payload {
-		safe := sanitizeIdent(k)
+		safe := b.sanitizeIdentCached(k)
 		colDefs = append(colDefs, fmt.Sprintf(`"%s" TEXT`, safe))
 		if k != whereKey {
 			setClauses = append(setClauses, `"`+safe+`" = ?`)
@@ -559,7 +592,7 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 	}
 
 	// Build SQL with strings.Builder
-	safeWhereKey := sanitizeIdent(whereKey)
+	safeWhereKey := b.sanitizeIdentCached(whereKey)
 	var sb strings.Builder
 	sb.Grow(64 + len(table) + n*12)
 	sb.WriteString(`UPDATE "`)
@@ -587,7 +620,7 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 }
 
 func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload map[string]interface{}) error {
-	table = sanitizeIdent(table)
+	table = b.sanitizeIdentCached(table)
 
 	var deleteSQL string
 	var params []interface{}

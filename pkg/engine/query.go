@@ -1,11 +1,23 @@
 package engine
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"time"
 )
+
+// Pool for JSON encoding buffers used in audit logging
+var auditBufPool = sync.Pool{
+	New: func() interface{} {
+		return bytes.NewBuffer(make([]byte, 0, 256))
+	},
+}
+
+// Pre-built constant SQL for audit insert — avoids string allocation per emit
+const auditInsertSQL = `INSERT INTO "_spine_events" (event_name, payload, emitted_states, created_at) VALUES (?, ?, ?, ?)`
 
 // TableInfo describes a database table and its row count.
 type TableInfo struct {
@@ -161,16 +173,22 @@ func (b *Bus) initEventTable() {
 }
 
 // logEventAudit enqueues an event emission to the _spine_events audit table.
+// Uses pooled buffer for JSON encoding and pre-built constant SQL.
 func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitted []string) {
-	payloadBytes, _ := json.Marshal(payload)
+	buf := auditBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+	json.NewEncoder(buf).Encode(payload)
+	// Remove trailing newline from Encode
+	payloadStr := strings.TrimRight(buf.String(), "\n")
+	auditBufPool.Put(buf)
+
 	statesStr := strings.Join(emitted, ",")
 	nowStr := time.Now().UTC().Format(time.RFC3339)
 
-	insertSQL := `INSERT INTO "_spine_events" (event_name, payload, emitted_states, created_at) VALUES (?, ?, ?, ?)`
-	params := []interface{}{event, string(payloadBytes), statesStr, nowStr}
+	params := []interface{}{event, payloadStr, statesStr, nowStr}
 
 	select {
-	case b.writeChan <- dbTask{query: insertSQL, params: params}:
+	case b.writeChan <- dbTask{query: auditInsertSQL, params: params}:
 	default:
 		// Non-blocking drop on high-volume burst saturation
 	}
