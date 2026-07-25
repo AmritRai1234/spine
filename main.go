@@ -506,8 +506,9 @@ type StateBroadcast struct {
 }
 
 type WsClient struct {
-	conn *websocket.Conn
-	send chan []byte
+	conn      *websocket.Conn
+	send      chan []byte
+	closeOnce sync.Once
 }
 
 type Hub struct {
@@ -531,17 +532,21 @@ func (h *Hub) run() {
 		case client := <-h.register:
 			h.mu.Lock()
 			h.clients[client] = true
+			count := len(h.clients)
 			h.mu.Unlock()
-			log.Printf("[ws] client connected (total: %d)", len(h.clients))
+			log.Printf("[ws] client connected (total: %d)", count)
 
 		case client := <-h.unregister:
 			h.mu.Lock()
 			if _, ok := h.clients[client]; ok {
 				delete(h.clients, client)
-				close(client.send)
-				log.Printf("[ws] client disconnected (total: %d)", len(h.clients))
+				client.closeOnce.Do(func() { close(client.send) })
+				count := len(h.clients)
+				h.mu.Unlock()
+				log.Printf("[ws] client disconnected (total: %d)", count)
+			} else {
+				h.mu.Unlock()
 			}
-			h.mu.Unlock()
 		}
 	}
 }
@@ -566,7 +571,7 @@ func (h *Hub) BroadcastState(stateName, eventName string, payload map[string]int
 		select {
 		case client.send <- data:
 		default:
-			close(client.send)
+			client.closeOnce.Do(func() { close(client.send) })
 			delete(h.clients, client)
 		}
 	}
@@ -662,19 +667,34 @@ func (b *Bus) execStep(step *RouteStep, payload map[string]interface{}) error {
 	return nil
 }
 
+// sanitizeIdent strips anything that isn't alphanumeric or underscore
+// to prevent SQL injection through table/column names.
+func sanitizeIdent(s string) string {
+	var b strings.Builder
+	for _, c := range s {
+		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+			(c >= '0' && c <= '9') || c == '_' {
+			b.WriteRune(c)
+		}
+	}
+	return b.String()
+}
+
 func (b *Bus) dbInsert(table string, payload map[string]interface{}) error {
 	if len(payload) == 0 {
 		return nil
 	}
 
+	table = sanitizeIdent(table)
 	var colDefs []string
 	var colNames []string
 	var placeholders []string
 	var values []interface{}
 
 	for k, v := range payload {
-		colDefs = append(colDefs, fmt.Sprintf(`"%s" TEXT`, k))
-		colNames = append(colNames, fmt.Sprintf(`"%s"`, k))
+		safe := sanitizeIdent(k)
+		colDefs = append(colDefs, fmt.Sprintf(`"%s" TEXT`, safe))
+		colNames = append(colNames, fmt.Sprintf(`"%s"`, safe))
 		placeholders = append(placeholders, "?")
 		values = append(values, fmt.Sprintf("%v", v))
 	}
@@ -699,15 +719,32 @@ func (b *Bus) dbUpdate(table string, payload map[string]interface{}) error {
 		return nil
 	}
 
+	table = sanitizeIdent(table)
+
+	// Use 'id' as WHERE key if present, otherwise first key found
+	whereKey := ""
+	if _, ok := payload["id"]; ok {
+		whereKey = "id"
+	} else {
+		for k := range payload {
+			whereKey = k
+			break
+		}
+	}
+
 	var colDefs []string
-	var keys []string
-	var vals []interface{}
+	var setClauses []string
+	var params []interface{}
 
 	for k, v := range payload {
-		colDefs = append(colDefs, fmt.Sprintf(`"%s" TEXT`, k))
-		keys = append(keys, k)
-		vals = append(vals, fmt.Sprintf("%v", v))
+		safe := sanitizeIdent(k)
+		colDefs = append(colDefs, fmt.Sprintf(`"%s" TEXT`, safe))
+		if k != whereKey {
+			setClauses = append(setClauses, fmt.Sprintf(`"%s" = ?`, safe))
+			params = append(params, fmt.Sprintf("%v", v))
+		}
 	}
+	params = append(params, fmt.Sprintf("%v", payload[whereKey]))
 
 	createSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (id INTEGER PRIMARY KEY AUTOINCREMENT, %s)`,
 		table, strings.Join(colDefs, ", "))
@@ -715,16 +752,8 @@ func (b *Bus) dbUpdate(table string, payload map[string]interface{}) error {
 		return fmt.Errorf("create table failed: %w", err)
 	}
 
-	var setClauses []string
-	var params []interface{}
-	for i := 1; i < len(keys); i++ {
-		setClauses = append(setClauses, fmt.Sprintf(`"%s" = ?`, keys[i]))
-		params = append(params, vals[i])
-	}
-	params = append(params, vals[0])
-
 	updateSQL := fmt.Sprintf(`UPDATE "%s" SET %s WHERE "%s" = ?`,
-		table, strings.Join(setClauses, ", "), keys[0])
+		table, strings.Join(setClauses, ", "), sanitizeIdent(whereKey))
 	if _, err := b.db.Exec(updateSQL, params...); err != nil {
 		return fmt.Errorf("update failed: %w", err)
 	}
@@ -861,10 +890,9 @@ func startServer(bus *Bus, hub *Hub, port string) {
 
 		// Client writer pump
 		go func() {
-			defer func() {
-				conn.Close()
-			}()
+			defer conn.Close()
 			for message := range client.send {
+				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
 				if err := conn.WriteMessage(websocket.TextMessage, message); err != nil {
 					break
 				}
@@ -910,7 +938,11 @@ func startServer(bus *Bus, hub *Hub, port string) {
 					}
 
 					ackBytes, _ := json.Marshal(ack)
-					client.send <- ackBytes
+					select {
+					case client.send <- ackBytes:
+					default:
+						// send buffer full, drop ack
+					}
 				}
 			}
 		}()
