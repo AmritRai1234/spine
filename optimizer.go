@@ -15,6 +15,7 @@ type AdaptiveOptimizer struct {
 	batchSize     uint32
 	flushInterval time.Duration
 	mode          unsafeAtomicString
+	stopCh        chan struct{}
 }
 
 type unsafeAtomicString struct {
@@ -38,10 +39,20 @@ func NewAdaptiveOptimizer() *AdaptiveOptimizer {
 		lastCheck:     time.Now(),
 		batchSize:     500,
 		flushInterval: 1 * time.Millisecond,
+		stopCh:        make(chan struct{}),
 	}
 	opt.mode.Store("Micro-Latency")
 	go opt.tuneLoop()
 	return opt
+}
+
+// Close stops the adaptive optimizer background loop.
+func (o *AdaptiveOptimizer) Close() {
+	select {
+	case <-o.stopCh:
+	default:
+		close(o.stopCh)
+	}
 }
 
 // RecordRequest increments the request sampler.
@@ -68,10 +79,14 @@ func (o *AdaptiveOptimizer) tuneLoop() {
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
-	for range ticker.C {
-		now := time.Now()
-		currentReqs := atomic.LoadUint64(&o.reqCount)
-		elapsed := now.Sub(o.lastCheck).Seconds()
+	for {
+		select {
+		case <-o.stopCh:
+			return
+		case <-ticker.C:
+			now := time.Now()
+			currentReqs := atomic.LoadUint64(&o.reqCount)
+			elapsed := now.Sub(o.lastCheck).Seconds()
 
 		if elapsed <= 0 {
 			continue
@@ -109,6 +124,7 @@ func (o *AdaptiveOptimizer) tuneLoop() {
 			atomic.StoreUint32(&o.batchSize, 250)
 			o.flushInterval = 5 * time.Millisecond
 			o.mode.Store("Micro-Latency")
+		}
 		}
 	}
 }

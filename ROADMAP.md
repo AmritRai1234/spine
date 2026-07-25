@@ -55,20 +55,18 @@ Make routes smart with branching, parallel dispatch, fault tolerance, and dynami
 - [x] `GET /metrics` live runtime telemetry endpoint
 - [x] Scaled batch capacity up to 10,000 items with 0% data loss
 
----
+## v1.4 — Query & Read API & Event Audit Log ✅ *SHIPPED*
 
-## v1.4 — Query & Read API 📊 *(NEXT UP)*
+Reading data back directly from manifest specifications and automatic event audit trail.
 
-Reading data back directly from manifest specifications.
-
-- [ ] `GET /tables` — list all tables with row counts
-- [ ] `GET /tables/:name` — query rows with filters
-- [ ] `GET /events` — query the event audit log
-- [ ] Auto-log every emitted event to `_spine_events` table
+- [x] `GET /tables` — list all tables with real-time row counts
+- [x] `GET /tables/:name` — query paginated table rows (`limit`, `offset`)
+- [x] `GET /events` — query event audit log history with event filtering
+- [x] Automatic system audit logging (`_spine_events` table)
 
 ---
 
-## v2.0 — Multi-Runtime & Plugins 🔌
+## v2.0 — Multi-Runtime & Plugins 🔌 🧠 *(NEXT UP)*
 
 - [ ] Plugin system via Go interfaces & `.so` shared libraries
 - [ ] Queue publisher/consumer (`queue.publish` for Redis/NATS)
@@ -85,5 +83,5 @@ Reading data back directly from manifest specifications.
 | **v1.1** | CLI & Load Benchmarking | ✅ Shipped |
 | **v1.2** | Actions, Event Chaining & Performance (56K req/s) | ✅ Shipped |
 | **v1.3** | Conditional Logic, Parallel Execution & Adaptive Engine | ✅ Shipped |
-| **v1.4** | Query API & Event Audit Log | 🧠 Next Up |
-| **v2.0** | Plugins & Multi-DB Engine | Q1 2027 |
+| **v1.4** | Query & Read API (`GET /tables`, `GET /events`) | ✅ Shipped |
+| **v2.0** | Plugins & Multi-DB Engine | 🧠 Next Up |

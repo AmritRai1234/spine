@@ -148,6 +148,53 @@ Returns real-time optimizer mode, batch size targets, and flush windows:
 }
 ```
 
+### GET /tables — List Database Tables & Row Counts
+
+```json
+{
+  "status": "ok",
+  "tables": [
+    {"name": "_spine_events", "rows": 1250},
+    {"name": "landing_analytics", "rows": 480}
+  ]
+}
+```
+
+### GET /tables/:name — Query Table Rows
+
+Returns paginated rows from a specific table (`/tables/landing_analytics?limit=10&offset=0`):
+
+```json
+{
+  "status": "ok",
+  "table": "landing_analytics",
+  "count": 1,
+  "rows": [
+    {"id": 1, "email": "user@example.com"}
+  ]
+}
+```
+
+### GET /events — Event Audit Log
+
+Returns full history of emitted events with payload and state metadata (`/events?event=SUBMIT_LEAD&limit=20`):
+
+```json
+{
+  "status": "ok",
+  "count": 1,
+  "events": [
+    {
+      "id": 1,
+      "event": "SUBMIT_LEAD",
+      "payload": {"email": "user@example.com"},
+      "emitted_states": ["LEAD_STATUS"],
+      "created_at": "2026-07-25T11:02:02Z"
+    }
+  ]
+}
+```
+
 ### GET /health — Engine Status
 
 ```json

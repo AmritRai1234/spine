@@ -64,9 +64,9 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 		return nil, fmt.Errorf("cannot open database '%s' using driver '%s': %w", dbPath, driver, err)
 	}
 
-	// Tune connection pool for concurrent goroutines
-	db.SetMaxOpenConns(1) // Single writer pool
-	db.SetMaxIdleConns(1)
+	// Tune connection pool for concurrent readers and single batch writer
+	db.SetMaxOpenConns(20)
+	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(0) // Keep alive forever
 
 	// Apply performance pragmas for local engines
@@ -95,6 +95,7 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 	}
 	atomic.StorePointer(&bus.registry, unsafe.Pointer(reg))
 	bus.startBatchWriter()
+	bus.initEventTable()
 	return bus, nil
 }
 
@@ -183,6 +184,9 @@ func (b *Bus) startBatchWriter() {
 
 // Close shuts down batch writer, prepared statements, and the database connection.
 func (b *Bus) Close() error {
+	if b.optimizer != nil {
+		b.optimizer.Close()
+	}
 	close(b.writeChan)
 	b.wg.Wait()
 
@@ -287,6 +291,10 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 				}
 			}
 		}
+	}
+
+	if depth == 0 {
+		b.logEventAudit(event, payload, emittedStates)
 	}
 
 	return map[string]interface{}{

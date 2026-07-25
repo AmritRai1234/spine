@@ -7,6 +7,8 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -159,6 +161,90 @@ func (e *Engine) buildMux() *http.ServeMux {
 			"optimizer_mode":    opt.GetMode(),
 			"target_batch_size": opt.GetBatchSize(),
 			"flush_interval":    opt.GetFlushInterval().String(),
+		})
+	})
+
+	mux.HandleFunc("/tables", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		tables, err := e.Bus.GetTables()
+		if err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "ok",
+			"tables": tables,
+		})
+	})
+
+	mux.HandleFunc("/tables/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		tableName := strings.TrimPrefix(r.URL.Path, "/tables/")
+		if tableName == "" {
+			tables, err := e.Bus.GetTables()
+			if err != nil {
+				w.WriteHeader(500)
+				json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": err.Error()})
+				return
+			}
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "tables": tables})
+			return
+		}
+
+		limit := 50
+		offset := 0
+		if lStr := r.URL.Query().Get("limit"); lStr != "" {
+			if l, err := strconv.Atoi(lStr); err == nil {
+				limit = l
+			}
+		}
+		if oStr := r.URL.Query().Get("offset"); oStr != "" {
+			if o, err := strconv.Atoi(oStr); err == nil {
+				offset = o
+			}
+		}
+
+		rows, err := e.Bus.GetTableRows(tableName, limit, offset)
+		if err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "ok",
+			"table":  tableName,
+			"count":  len(rows),
+			"rows":   rows,
+		})
+	})
+
+	mux.HandleFunc("/events", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		eventName := r.URL.Query().Get("event")
+		limit := 50
+		offset := 0
+		if lStr := r.URL.Query().Get("limit"); lStr != "" {
+			if l, err := strconv.Atoi(lStr); err == nil {
+				limit = l
+			}
+		}
+		if oStr := r.URL.Query().Get("offset"); oStr != "" {
+			if o, err := strconv.Atoi(oStr); err == nil {
+				offset = o
+			}
+		}
+
+		logs, err := e.Bus.GetEventLogs(eventName, limit, offset)
+		if err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": err.Error()})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status": "ok",
+			"count":  len(logs),
+			"events": logs,
 		})
 	})
 
