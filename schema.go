@@ -3,6 +3,7 @@ package spine
 // SpineSchema holds the full parsed manifest.
 type SpineSchema struct {
 	SpineVersion int      `json:"spine_version"`
+	Includes     []string `json:"includes,omitempty"`
 	DbTables     []string `json:"db_tables"`
 	Nodes        []Node   `json:"nodes"`
 	Routes       []Route  `json:"routes"`

@@ -40,9 +40,10 @@ type Bus struct {
 	stateCache map[string]map[string]interface{}
 
 	// High-throughput batch writer & Adaptive Optimizer
-	writeChan chan dbTask
-	wg        sync.WaitGroup
-	optimizer *AdaptiveOptimizer
+	writeChan     chan dbTask
+	wg            sync.WaitGroup
+	optimizer     *AdaptiveOptimizer
+	customActions sync.Map
 }
 
 // NewBus creates a Bus wired to a Registry, SQLite/Turso database, and WS hub.
@@ -94,6 +95,12 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 	atomic.StorePointer(&bus.registry, unsafe.Pointer(reg))
 	bus.startBatchWriter()
 	bus.initEventTable()
+
+	// Pre-create tables declared in manifest (including imported sub-manifests)
+	for _, tbl := range reg.load().schema.DbTables {
+		_ = bus.ensureTable(tbl, []string{"created_at TEXT"})
+	}
+
 	return bus, nil
 }
 
@@ -326,6 +333,14 @@ func (b *Bus) execStep(step *RouteStep, eventName string, payload map[string]int
 	return fmt.Errorf("action %s failed after %d attempts: %w", step.Action, attempts, lastErr)
 }
 
+// ActionFunc represents a custom Go plugin action handler function.
+type ActionFunc func(step *RouteStep, eventName string, payload map[string]interface{}) error
+
+// RegisterAction registers a custom Go action handler plugin.
+func (b *Bus) RegisterAction(name string, fn ActionFunc) {
+	b.customActions.Store(name, fn)
+}
+
 func (b *Bus) dispatchAction(step *RouteStep, eventName string, payload map[string]interface{}) error {
 	switch step.Action {
 	case "db.insert":
@@ -344,7 +359,24 @@ func (b *Bus) dispatchAction(step *RouteStep, eventName string, payload map[stri
 		return b.httpPost(step, eventName, payload)
 	case "log.write":
 		return b.logWrite(step, eventName, payload)
+	case "queue.publish":
+		return b.queuePublish(step, eventName, payload)
+	default:
+		if val, ok := b.customActions.Load(step.Action); ok {
+			if fn, isFn := val.(ActionFunc); isFn {
+				return fn(step, eventName, payload)
+			}
+		}
 	}
+	return nil
+}
+
+func (b *Bus) queuePublish(step *RouteStep, eventName string, payload map[string]interface{}) error {
+	topic := step.Table
+	if topic == "" {
+		topic = eventName
+	}
+	b.hub.BroadcastState(topic, eventName, payload)
 	return nil
 }
 
@@ -361,23 +393,23 @@ func sanitizeIdent(s string) string {
 	return b.String()
 }
 
-// ensureTable creates the table and auto-generates column indexes if not seen before.
+// ensureTable creates the table and auto-generates column indexes or adds missing columns.
 func (b *Bus) ensureTable(table string, colDefs []string) error {
-	if _, ok := b.knownTable.Load(table); ok {
-		return nil
-	}
-
 	createSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (id INTEGER PRIMARY KEY AUTOINCREMENT, %s)`,
 		table, strings.Join(colDefs, ", "))
 	if _, err := b.db.Exec(createSQL); err != nil {
 		return fmt.Errorf("create table failed: %w", err)
 	}
 
-	// Auto-index key lookup columns (e.g., email, user_id, project_id, status)
 	for _, colDef := range colDefs {
 		parts := strings.Fields(colDef)
 		if len(parts) > 0 {
 			colName := strings.Trim(parts[0], `"`)
+			if colName != "id" {
+				alterSQL := fmt.Sprintf(`ALTER TABLE "%s" ADD COLUMN %s`, table, colDef)
+				_, _ = b.db.Exec(alterSQL)
+			}
+
 			if strings.HasSuffix(colName, "_id") || colName == "email" || colName == "status" || colName == "state" {
 				idxSQL := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS "idx_%s_%s" ON "%s"("%s")`,
 					table, colName, table, colName)

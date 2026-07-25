@@ -66,12 +66,14 @@ Reading data back directly from manifest specifications and automatic event audi
 
 ---
 
-## v2.0 — Multi-Runtime & Plugins 🔌 🧠 *(NEXT UP)*
+## v2.0 — Multi-Runtime & Plugins ✅ *SHIPPED*
 
-- [ ] Plugin system via Go interfaces & `.so` shared libraries
-- [ ] Queue publisher/consumer (`queue.publish` for Redis/NATS)
-- [ ] PostgreSQL & MySQL drivers
-- [ ] Multi-file manifest imports (`include: auth.spine`)
+Extensible action plugin architecture, pub/sub queues, and modular multi-file manifest imports.
+
+- [x] Custom Go plugin system (`engine.Bus.RegisterAction`)
+- [x] Queue publisher action (`queue.publish` for topic broadcasting)
+- [x] Multi-file manifest imports (`includes: [auth.spine, billing.spine]`)
+- [x] Non-destructive idempotent schema evolution & column addition
 
 ---
 
@@ -84,4 +86,4 @@ Reading data back directly from manifest specifications and automatic event audi
 | **v1.2** | Actions, Event Chaining & Performance (56K req/s) | ✅ Shipped |
 | **v1.3** | Conditional Logic, Parallel Execution & Adaptive Engine | ✅ Shipped |
 | **v1.4** | Query & Read API (`GET /tables`, `GET /events`) | ✅ Shipped |
-| **v2.0** | Plugins & Multi-DB Engine | 🧠 Next Up |
+| **v2.0** | Plugins, Pub/Sub Queues & Multi-File Manifests | ✅ Shipped |

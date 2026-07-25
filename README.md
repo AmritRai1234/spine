@@ -99,9 +99,11 @@ Spine supports multi-step execution pipelines inside routes:
 - `db.delete`: Deletes records by ID or custom SQL expression.
 - `http.post`: Outbound webhook dispatch with retries (`max_attempts`) and payload substitution.
 - `log.write`: Formatted stdout/stderr logging.
+- `queue.publish`: Broadcasts event payload to pub/sub topic queues and WebSocket listeners.
 
 ### Advanced Orchestration Directives
 
+- `includes:`: Imports modular sub-manifests recursively (`includes: [auth.spine, billing.spine]`).
 - `parallel: true`: Runs route steps concurrently using worker goroutines.
 - `if: "..."`: Conditional execution guards (`==`, `!=`, `>`, `<`, `contains`, `exists`).
 - `max_attempts: 3` & `backoff_ms: 100`: Automatic retry loop for transient failures.
@@ -298,6 +300,12 @@ func main() {
         log.Fatal(err)
     }
     defer engine.Close()
+
+    // Register custom Go action plugin
+    engine.Bus.RegisterAction("custom.payment", func(step *spine.RouteStep, eventName string, payload map[string]interface{}) error {
+        log.Printf("Executing custom Go plugin action for event %s", eventName)
+        return nil
+    })
 
     // Programmatic event emission
     result, err := engine.Bus.Emit("SUBMIT_LEAD", map[string]interface{}{

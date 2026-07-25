@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 )
@@ -12,6 +13,7 @@ type parseState int
 
 const (
 	sTop parseState = iota
+	sIncludes
 	sDatabase
 	sDbTables
 	sNodes
@@ -68,10 +70,10 @@ func listKvValue(trimmed, key string) (string, bool) {
 }
 
 // ParseManifest reads a .spine manifest file and returns the parsed schema.
-func ParseManifest(filepath string) (*SpineSchema, error) {
-	f, err := os.Open(filepath)
+func ParseManifest(manifestPath string) (*SpineSchema, error) {
+	f, err := os.Open(manifestPath)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open manifest '%s': %w", filepath, err)
+		return nil, fmt.Errorf("cannot open manifest '%s': %w", manifestPath, err)
 	}
 	defer f.Close()
 
@@ -110,6 +112,14 @@ func ParseManifest(filepath string) (*SpineSchema, error) {
 				fmt.Sscanf(v, "%d", &schema.SpineVersion)
 				continue
 			}
+			if v, ok := kvValue(trimmed, "include"); ok {
+				schema.Includes = append(schema.Includes, unquote(v))
+				continue
+			}
+			if trimmed == "includes:" || trimmed == "include:" {
+				state = sIncludes
+				continue
+			}
 			if trimmed == "database:" {
 				state = sDatabase
 				continue
@@ -120,6 +130,14 @@ func ParseManifest(filepath string) (*SpineSchema, error) {
 			}
 			if trimmed == "routes:" {
 				state = sRoutes
+				continue
+			}
+		}
+
+		// ===== INCLUDES =====
+		if state == sIncludes {
+			if indent >= 1 && isListItem(trimmed) {
+				schema.Includes = append(schema.Includes, unquote(trimmed[2:]))
 				continue
 			}
 		}
@@ -364,6 +382,18 @@ func ParseManifest(filepath string) (*SpineSchema, error) {
 
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("error reading manifest: %w", err)
+	}
+
+	baseDir := filepath.Dir(manifestPath)
+	for _, incRel := range schema.Includes {
+		incPath := filepath.Join(baseDir, incRel)
+		subSchema, err := ParseManifest(incPath)
+		if err != nil {
+			return nil, fmt.Errorf("failed to process included manifest '%s': %w", incPath, err)
+		}
+		schema.DbTables = append(schema.DbTables, subSchema.DbTables...)
+		schema.Nodes = append(schema.Nodes, subSchema.Nodes...)
+		schema.Routes = append(schema.Routes, subSchema.Routes...)
 	}
 
 	return schema, nil
