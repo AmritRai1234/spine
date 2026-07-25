@@ -85,23 +85,28 @@ func (o *AdaptiveOptimizer) tuneLoop() {
 
 		// Autonomous tuning decisions based on live RPS
 		switch {
+		case rps > 20000:
+			atomic.StoreUint32(&o.batchSize, 10000)
+			o.flushInterval = 250 * time.Microsecond
+			o.mode.Store("Extreme-Batching")
+
 		case rps > 10000:
-			atomic.StoreUint32(&o.batchSize, 2000)
+			atomic.StoreUint32(&o.batchSize, 5000)
 			o.flushInterval = 500 * time.Microsecond
 			o.mode.Store("Aggressive-Batching")
 
-		case rps > 1000:
-			atomic.StoreUint32(&o.batchSize, 1000)
+		case rps > 2000:
+			atomic.StoreUint32(&o.batchSize, 2500)
 			o.flushInterval = 1 * time.Millisecond
 			o.mode.Store("High-Throughput")
 
-		case rps > 100:
-			atomic.StoreUint32(&o.batchSize, 500)
+		case rps > 200:
+			atomic.StoreUint32(&o.batchSize, 1000)
 			o.flushInterval = 2 * time.Millisecond
 			o.mode.Store("Balanced")
 
 		default:
-			atomic.StoreUint32(&o.batchSize, 100)
+			atomic.StoreUint32(&o.batchSize, 250)
 			o.flushInterval = 5 * time.Millisecond
 			o.mode.Store("Micro-Latency")
 		}

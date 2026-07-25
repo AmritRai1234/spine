@@ -25,7 +25,7 @@ func TestAdaptiveOptimizer(t *testing.T) {
 		t.Errorf("expected batch size >= 1000 under high load, got %d", batchSize)
 	}
 
-	if mode := opt.GetMode(); mode != "Aggressive-Batching" && mode != "High-Throughput" {
-		t.Errorf("expected Aggressive-Batching or High-Throughput mode, got %s", mode)
+	if mode := opt.GetMode(); mode != "Extreme-Batching" && mode != "Aggressive-Batching" && mode != "High-Throughput" {
+		t.Errorf("expected Extreme-Batching, Aggressive-Batching or High-Throughput mode, got %s", mode)
 	}
 }
