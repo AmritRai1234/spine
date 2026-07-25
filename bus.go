@@ -14,6 +14,7 @@ import (
 	"unsafe"
 
 	_ "github.com/mattn/go-sqlite3"
+	_ "turso.tech/database/tursogo"
 )
 
 type dbTask struct {
@@ -22,7 +23,7 @@ type dbTask struct {
 }
 
 // Bus is the core event dispatch engine. It validates payloads,
-// executes route steps, persists to SQLite, and broadcasts state
+// executes route steps, persists to SQLite/Turso, and broadcasts state
 // changes over WebSocket.
 type Bus struct {
 	registry unsafe.Pointer // *Registry, swapped atomically
@@ -44,28 +45,41 @@ type Bus struct {
 	wg        sync.WaitGroup
 }
 
-// NewBus creates a Bus wired to a Registry, SQLite database, and WS hub.
+// NewBus creates a Bus wired to a Registry, SQLite/Turso database, and WS hub.
 func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000&_busy_timeout=5000")
+	driver := "sqlite3"
+	connStr := dbPath
+
+	if strings.HasPrefix(dbPath, "libsql://") || strings.HasPrefix(dbPath, "turso://") || strings.HasPrefix(dbPath, "turso:") {
+		driver = "turso"
+	} else if strings.HasSuffix(dbPath, ".turso") {
+		driver = "turso"
+	} else {
+		connStr = dbPath + "?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000&_busy_timeout=5000"
+	}
+
+	db, err := sql.Open(driver, connStr)
 	if err != nil {
-		return nil, fmt.Errorf("cannot open sqlite '%s': %w", dbPath, err)
+		return nil, fmt.Errorf("cannot open database '%s' using driver '%s': %w", dbPath, driver, err)
 	}
 
 	// Tune connection pool for concurrent goroutines
-	db.SetMaxOpenConns(1) // SQLite only supports 1 writer
+	db.SetMaxOpenConns(1) // Single writer pool
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0) // Keep alive forever
 
-	// Apply performance pragmas
-	pragmas := []string{
-		"PRAGMA journal_mode=WAL",
-		"PRAGMA synchronous=NORMAL",
-		"PRAGMA cache_size=-64000",
-		"PRAGMA temp_store=MEMORY",
-		"PRAGMA mmap_size=268435456",
-	}
-	for _, p := range pragmas {
-		db.Exec(p)
+	// Apply performance pragmas for local engines
+	if driver == "sqlite3" {
+		pragmas := []string{
+			"PRAGMA journal_mode=WAL",
+			"PRAGMA synchronous=NORMAL",
+			"PRAGMA cache_size=-64000",
+			"PRAGMA temp_store=MEMORY",
+			"PRAGMA mmap_size=268435456",
+		}
+		for _, p := range pragmas {
+			db.Exec(p)
+		}
 	}
 
 	bus := &Bus{

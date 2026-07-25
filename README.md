@@ -14,7 +14,7 @@
 
 ---
 
-**Spine** is a high-performance event-driven runtime that replaces traditional API endpoint handlers with a single declarative manifest. Define events, payload schemas, database tables, and routing logic in one `.spine` file. The runtime handles validation, persistence, action execution, event chaining, and real-time state broadcasting automatically.
+**Spine** is a high-performance event-driven runtime that replaces traditional API endpoint handlers with a single declarative manifest. Define events, payload schemas, database tables, and routing logic in one `.spine` file. The runtime handles validation, persistence (SQLite & Turso/libSQL), action execution, event chaining, and real-time state broadcasting automatically.
 
 ```
 Frontend fires event -> Spine validates -> Executes route steps -> Persists to SQLite -> Broadcasts state over WebSocket
