@@ -1,4 +1,4 @@
-package spine
+package middleware
 
 import (
 	"encoding/json"

@@ -1,4 +1,4 @@
-package spine
+package engine
 
 import (
 	"encoding/json"

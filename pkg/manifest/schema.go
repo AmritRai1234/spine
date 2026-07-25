@@ -1,4 +1,4 @@
-package spine
+package manifest
 
 // SpineSchema holds the full parsed manifest.
 type SpineSchema struct {

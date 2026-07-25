@@ -1,4 +1,4 @@
-package spine
+package tests
 
 import (
 	"encoding/json"
@@ -6,6 +6,8 @@ import (
 	"net/http/httptest"
 	"os"
 	"testing"
+
+	spine "github.com/AmritRai1234/spine"
 )
 
 func TestEventChainingAndActions(t *testing.T) {
@@ -63,7 +65,7 @@ routes:
 	_, _ = tmpFile.WriteString(manifestContent)
 	tmpFile.Close()
 
-	schema, err := ParseManifest(tmpFile.Name())
+	schema, err := spine.ParseManifest(tmpFile.Name())
 	if err != nil {
 		t.Fatalf("ParseManifest failed: %v", err)
 	}
@@ -71,7 +73,7 @@ routes:
 	dbPath := tmpFile.Name() + ".db"
 	defer os.Remove(dbPath)
 
-	engine, err := New(schema, dbPath)
+	engine, err := spine.New(schema, dbPath)
 	if err != nil {
 		t.Fatalf("New engine failed: %v", err)
 	}

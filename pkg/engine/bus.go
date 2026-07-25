@@ -1,4 +1,4 @@
-package spine
+package engine
 
 import (
 	"bytes"
@@ -13,6 +13,7 @@ import (
 	"time"
 	"unsafe"
 
+	"github.com/AmritRai1234/spine/pkg/manifest"
 	_ "github.com/mattn/go-sqlite3"
 	_ "turso.tech/database/tursogo"
 )
@@ -26,7 +27,7 @@ type dbTask struct {
 // executes route steps, persists to SQLite/Turso, and broadcasts state
 // changes over WebSocket.
 type Bus struct {
-	registry unsafe.Pointer // *Registry, swapped atomically
+	registry unsafe.Pointer // *manifest.Registry, swapped atomically
 	db       *sql.DB
 	hub      *Hub
 
@@ -47,7 +48,7 @@ type Bus struct {
 }
 
 // NewBus creates a Bus wired to a Registry, SQLite/Turso database, and WS hub.
-func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
+func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 	driver := "sqlite3"
 	connStr := dbPath
 
@@ -97,7 +98,7 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 	bus.initEventTable()
 
 	// Pre-create tables declared in manifest (including imported sub-manifests)
-	for _, tbl := range reg.load().schema.DbTables {
+	for _, tbl := range reg.GetSchema().DbTables {
 		_ = bus.ensureTable(tbl, []string{"created_at TEXT"})
 	}
 
@@ -204,13 +205,13 @@ func (b *Bus) Close() error {
 }
 
 // UpdateRegistry atomically swaps the registry (used for hot-reload).
-func (b *Bus) UpdateRegistry(newReg *Registry) {
+func (b *Bus) UpdateRegistry(newReg *manifest.Registry) {
 	atomic.StorePointer(&b.registry, unsafe.Pointer(newReg))
 }
 
 // GetRegistry returns the current registry. Lock-free.
-func (b *Bus) GetRegistry() *Registry {
-	return (*Registry)(atomic.LoadPointer(&b.registry))
+func (b *Bus) GetRegistry() *manifest.Registry {
+	return (*manifest.Registry)(atomic.LoadPointer(&b.registry))
 }
 
 // Emit dispatches an event: validates the payload, runs route steps,
@@ -257,7 +258,7 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 			var stepErr error
 			for i := range route.Steps {
 				wg.Add(1)
-				go func(s *RouteStep) {
+				go func(s *manifest.RouteStep) {
 					defer wg.Done()
 					if err := b.execStep(s, event, payload); err != nil {
 						errMu.Lock()
@@ -310,7 +311,7 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 	}, nil
 }
 
-func (b *Bus) execStep(step *RouteStep, eventName string, payload map[string]interface{}) error {
+func (b *Bus) execStep(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
 	if step.IfCondition != "" && !EvaluateCondition(step.IfCondition, eventName, payload) {
 		return nil
 	}
@@ -334,14 +335,14 @@ func (b *Bus) execStep(step *RouteStep, eventName string, payload map[string]int
 }
 
 // ActionFunc represents a custom Go plugin action handler function.
-type ActionFunc func(step *RouteStep, eventName string, payload map[string]interface{}) error
+type ActionFunc func(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error
 
 // RegisterAction registers a custom Go action handler plugin.
 func (b *Bus) RegisterAction(name string, fn ActionFunc) {
 	b.customActions.Store(name, fn)
 }
 
-func (b *Bus) dispatchAction(step *RouteStep, eventName string, payload map[string]interface{}) error {
+func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
 	switch step.Action {
 	case "db.insert":
 		if step.Table != "" {
@@ -371,7 +372,7 @@ func (b *Bus) dispatchAction(step *RouteStep, eventName string, payload map[stri
 	return nil
 }
 
-func (b *Bus) queuePublish(step *RouteStep, eventName string, payload map[string]interface{}) error {
+func (b *Bus) queuePublish(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
 	topic := step.Table
 	if topic == "" {
 		topic = eventName
@@ -545,7 +546,7 @@ func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload
 	return nil
 }
 
-func (b *Bus) httpPost(step *RouteStep, eventName string, payload map[string]interface{}) error {
+func (b *Bus) httpPost(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
 	targetURL := ResolveVariables(step.URL, eventName, payload)
 	if targetURL == "" {
 		return fmt.Errorf("http.post step missing 'url'")
@@ -577,7 +578,7 @@ func (b *Bus) httpPost(step *RouteStep, eventName string, payload map[string]int
 	return nil
 }
 
-func (b *Bus) logWrite(step *RouteStep, eventName string, payload map[string]interface{}) error {
+func (b *Bus) logWrite(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
 	msg := step.Message
 	if msg == "" {
 		msg = "event: $event.name payload: $event.payload"

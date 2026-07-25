@@ -1,12 +1,15 @@
-package spine
+package tests
 
 import (
 	"os"
 	"testing"
+
+	"github.com/AmritRai1234/spine/pkg/engine"
+	"github.com/AmritRai1234/spine/pkg/manifest"
 )
 
 func TestParallelExecutionAndRetries(t *testing.T) {
-	manifest := `
+	manifestContent := `
 spine_version: 1
 
 database:
@@ -32,10 +35,10 @@ routes:
 		t.Fatal(err)
 	}
 	defer os.Remove(tmpManifest.Name())
-	tmpManifest.WriteString(manifest)
+	tmpManifest.WriteString(manifestContent)
 	tmpManifest.Close()
 
-	schema, err := ParseManifest(tmpManifest.Name())
+	schema, err := manifest.ParseManifest(tmpManifest.Name())
 	if err != nil {
 		t.Fatalf("ParseManifest failed: %v", err)
 	}
@@ -47,9 +50,9 @@ routes:
 	dbPath := "test_parallel.db"
 	defer os.Remove(dbPath)
 
-	reg := NewRegistry(schema)
-	hub := NewHub()
-	bus, err := NewBus(reg, dbPath, hub)
+	reg := manifest.NewRegistry(schema)
+	hub := engine.NewHub()
+	bus, err := engine.NewBus(reg, dbPath, hub)
 	if err != nil {
 		t.Fatalf("NewBus failed: %v", err)
 	}

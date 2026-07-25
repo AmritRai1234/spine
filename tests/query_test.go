@@ -1,10 +1,12 @@
-package spine
+package tests
 
 import (
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
+
+	spine "github.com/AmritRai1234/spine"
 )
 
 func TestQueryAPIAndEventAuditLog(t *testing.T) {
@@ -35,7 +37,7 @@ routes:
 `
 	os.WriteFile(spineFile, []byte(manifest), 0644)
 
-	engine, err := NewFromFile(spineFile, dbPath)
+	engine, err := spine.NewFromFile(spineFile, dbPath)
 	if err != nil {
 		t.Fatalf("failed to create engine: %v", err)
 	}

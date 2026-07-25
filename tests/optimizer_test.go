@@ -1,12 +1,14 @@
-package spine
+package tests
 
 import (
 	"testing"
 	"time"
+
+	"github.com/AmritRai1234/spine/pkg/engine"
 )
 
 func TestAdaptiveOptimizer(t *testing.T) {
-	opt := NewAdaptiveOptimizer()
+	opt := engine.NewAdaptiveOptimizer()
 
 	// Initial mode should be Micro-Latency
 	if mode := opt.GetMode(); mode != "Micro-Latency" {

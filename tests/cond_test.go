@@ -1,7 +1,9 @@
-package spine
+package tests
 
 import (
 	"testing"
+
+	"github.com/AmritRai1234/spine/pkg/engine"
 )
 
 func TestEvaluateCondition(t *testing.T) {
@@ -31,7 +33,7 @@ func TestEvaluateCondition(t *testing.T) {
 	}
 
 	for _, tt := range tests {
-		got := EvaluateCondition(tt.cond, "TEST_EVENT", payload)
+		got := engine.EvaluateCondition(tt.cond, "TEST_EVENT", payload)
 		if got != tt.expected {
 			t.Errorf("EvaluateCondition(%q) = %v; want %v", tt.cond, got, tt.expected)
 		}

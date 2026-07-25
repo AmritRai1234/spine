@@ -1,4 +1,4 @@
-package spine
+package tests
 
 import (
 	"net/http"
@@ -8,6 +8,9 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	spine "github.com/AmritRai1234/spine"
+	"github.com/AmritRai1234/spine/pkg/engine"
 )
 
 func TestProductionScaleFeatures(t *testing.T) {
@@ -36,15 +39,15 @@ routes:
 	_ = os.WriteFile(manifestPath, []byte(manifest), 0644)
 
 	dbPath := filepath.Join(tempDir, "prod_scale.db")
-	engine, err := NewFromFile(manifestPath, dbPath)
+	eng, err := spine.NewFromFile(manifestPath, dbPath)
 	if err != nil {
 		t.Fatalf("failed to create engine: %v", err)
 	}
-	defer engine.Close()
+	defer eng.Close()
 
 	// 1. Enable API Key Auth
-	engine.SetAPIKey("secret-api-key-123")
-	handler := engine.HTTPHandler()
+	eng.SetAPIKey("secret-api-key-123")
+	handler := eng.HTTPHandler()
 
 	// Test 1a: Request without API key -> Should fail with 401 Unauthorized
 	req1, _ := http.NewRequest("POST", "/emit", strings.NewReader(`{"event":"TEST_EVENT","payload":{"email":"test@prod.dev"}}`))
@@ -81,7 +84,7 @@ routes:
 	}
 
 	// Test 3: LocalPubSub
-	ps := NewLocalPubSub()
+	ps := engine.NewLocalPubSub()
 	recChan := make(chan string, 1)
 	ps.Subscribe("user_events", func(payload map[string]interface{}) {
 		if email, ok := payload["email"].(string); ok {

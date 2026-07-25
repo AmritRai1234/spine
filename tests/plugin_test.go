@@ -1,4 +1,4 @@
-package spine
+package tests
 
 import (
 	"os"
@@ -6,6 +6,9 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	spine "github.com/AmritRai1234/spine"
+	"github.com/AmritRai1234/spine/pkg/manifest"
 )
 
 func TestMultiFileImportsAndCustomPlugins(t *testing.T) {
@@ -67,7 +70,7 @@ routes:
 	}
 
 	dbPath := filepath.Join(tempDir, "plugin_test.db")
-	engine, err := NewFromFile(mainPath, dbPath)
+	engine, err := spine.NewFromFile(mainPath, dbPath)
 	if err != nil {
 		t.Fatalf("failed to create engine with includes: %v", err)
 	}
@@ -90,7 +93,7 @@ routes:
 
 	// Test 3: Register Custom Plugin Action Handler
 	var pluginExecCount uint64
-	engine.Bus.RegisterAction("custom.audit", func(step *RouteStep, eventName string, payload map[string]interface{}) error {
+	engine.Bus.RegisterAction("custom.audit", func(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
 		atomic.AddUint64(&pluginExecCount, 1)
 		return nil
 	})

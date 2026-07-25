@@ -1,4 +1,4 @@
-package spine
+package engine
 
 import (
 	"bytes"
@@ -12,6 +12,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/AmritRai1234/spine/pkg/manifest"
+	"github.com/AmritRai1234/spine/pkg/middleware"
 	"github.com/gorilla/websocket"
 )
 
@@ -35,24 +37,24 @@ var emitReqPool = sync.Pool{
 
 // Engine is the top-level Spine runtime combining Bus, Hub, and Server.
 type Engine struct {
-	Bus       *Bus
-	Hub       *Hub
-	Schema    *SpineSchema
+	Bus         *Bus
+	Hub         *Hub
+	Schema      *manifest.SpineSchema
 	APIKey      string
-	rateLimiter *RateLimitManager
+	rateLimiter *middleware.RateLimitManager
 	spineFile   string
 }
 
 // SetRateLimit enables IP-based token bucket rate limiting on public endpoints.
 func (e *Engine) SetRateLimit(rps, burst float64) {
-	e.rateLimiter = NewRateLimitManager(rps, burst)
+	e.rateLimiter = middleware.NewRateLimitManager(rps, burst)
 }
 
 // New creates a fully wired Engine from a parsed schema.
-func New(schema *SpineSchema, dbPath string) (*Engine, error) {
+func New(schema *manifest.SpineSchema, dbPath string) (*Engine, error) {
 	hub := NewHub()
 	go hub.Run()
-	reg := NewRegistry(schema)
+	reg := manifest.NewRegistry(schema)
 	bus, err := NewBus(reg, dbPath, hub)
 	if err != nil {
 		return nil, err
@@ -62,7 +64,7 @@ func New(schema *SpineSchema, dbPath string) (*Engine, error) {
 
 // NewFromFile parses a manifest and creates an Engine.
 func NewFromFile(spineFile, dbPath string) (*Engine, error) {
-	schema, err := ParseManifest(spineFile)
+	schema, err := manifest.ParseManifest(spineFile)
 	if err != nil {
 		return nil, err
 	}
@@ -107,7 +109,7 @@ func (e *Engine) HTTPHandler() http.Handler {
 }
 
 func (e *Engine) wrapMiddleware(handler http.HandlerFunc) http.HandlerFunc {
-	h := AuthMiddleware(e.APIKey, handler)
+	h := middleware.AuthMiddleware(e.APIKey, handler)
 	if e.rateLimiter != nil {
 		h = e.rateLimiter.Middleware(h)
 	}
@@ -354,12 +356,12 @@ func (e *Engine) startHotReload() {
 			if fi.ModTime().After(lastMod) {
 				lastMod = fi.ModTime()
 				log.Printf("[spine] manifest change detected, reloading...")
-				s, err := ParseManifest(e.spineFile)
+				s, err := manifest.ParseManifest(e.spineFile)
 				if err != nil {
 					log.Printf("[spine] ✗ hot-reload failed: %v", err)
 					continue
 				}
-				e.Bus.UpdateRegistry(NewRegistry(s))
+				e.Bus.UpdateRegistry(manifest.NewRegistry(s))
 				log.Printf("[spine] ✓ reloaded: %d nodes, %d routes", len(s.Nodes), len(s.Routes))
 			}
 		}

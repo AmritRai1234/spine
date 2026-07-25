@@ -1,19 +1,33 @@
-// Package spine provides an event-driven runtime engine that reads
-// a declarative .spine manifest and provides HTTP/WebSocket APIs for
-// event emission, payload validation, SQLite persistence, and
-// real-time state broadcasting.
-//
-// Usage as a library:
-//
-//	schema, _ := spine.ParseManifest("app.spine")
-//	engine := spine.New(schema, "data.db")
-//	engine.ListenAndServe(":8080")
-//
-// Usage as a CLI:
-//
-//	go install spine-go/cmd/spine@latest
-//	spine --port 8080 app.spine
 package spine
 
-// Version is the library version.
-const Version = "1.0.0"
+import (
+	"github.com/AmritRai1234/spine/pkg/engine"
+	"github.com/AmritRai1234/spine/pkg/manifest"
+)
+
+// Version represents the current release version of Spine.
+const Version = "2.0.0"
+
+// Type aliases for top-level engine & manifest components.
+type Engine = engine.Engine
+type Bus = engine.Bus
+type Hub = engine.Hub
+type SpineSchema = manifest.SpineSchema
+type RouteStep = manifest.RouteStep
+type Route = manifest.Route
+type Node = manifest.Node
+
+// New creates a fully wired Engine from a parsed schema.
+func New(schema *manifest.SpineSchema, dbPath string) (*engine.Engine, error) {
+	return engine.New(schema, dbPath)
+}
+
+// NewFromFile parses a manifest and creates an Engine.
+func NewFromFile(spineFile, dbPath string) (*engine.Engine, error) {
+	return engine.NewFromFile(spineFile, dbPath)
+}
+
+// ParseManifest parses a .spine manifest file into an AST schema.
+func ParseManifest(path string) (*manifest.SpineSchema, error) {
+	return manifest.ParseManifest(path)
+}
