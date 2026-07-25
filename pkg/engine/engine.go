@@ -338,6 +338,15 @@ func (e *Engine) buildMux() *http.ServeMux {
 		}()
 	})
 
+	// Serve static web dashboard
+	if fi, err := os.Stat("web/dist"); err == nil && fi.IsDir() {
+		fs := http.FileServer(http.Dir("web/dist"))
+		mux.Handle("/", fs)
+	} else if fi, err := os.Stat("web"); err == nil && fi.IsDir() {
+		fs := http.FileServer(http.Dir("web"))
+		mux.Handle("/", fs)
+	}
+
 	return mux
 }
 
