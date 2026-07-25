@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/logo.png" width="180" alt="Spine Logo"><br>
+  <img src="https://raw.githubusercontent.com/AmritRai1234/spine/main/assets/logo.png?v=2" width="200" alt="Spine Logo"><br>
   <strong>SPINE</strong><br>
   <em>Declarative Event-Driven Backend Engine</em>
 </p>
