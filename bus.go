@@ -17,23 +17,54 @@ type Bus struct {
 	registry *Registry
 	db       *sql.DB
 	hub      *Hub
+
+	// Performance: cache known tables + prepared insert statements
+	tableMu    sync.RWMutex
+	knownTable map[string]bool
+	stmtMu     sync.RWMutex
+	stmtCache  map[string]*sql.Stmt
 }
 
 // NewBus creates a Bus wired to a Registry, SQLite database, and WS hub.
 func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
-	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL")
+	db, err := sql.Open("sqlite3", dbPath+"?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000&_busy_timeout=5000")
 	if err != nil {
 		return nil, fmt.Errorf("cannot open sqlite '%s': %w", dbPath, err)
 	}
+
+	// Tune connection pool for concurrent goroutines
+	db.SetMaxOpenConns(1)  // SQLite only supports 1 writer
+	db.SetMaxIdleConns(1)
+	db.SetConnMaxLifetime(0) // Keep alive forever
+
+	// Apply performance pragmas
+	pragmas := []string{
+		"PRAGMA journal_mode=WAL",
+		"PRAGMA synchronous=NORMAL",
+		"PRAGMA cache_size=-64000",
+		"PRAGMA temp_store=MEMORY",
+		"PRAGMA mmap_size=268435456",
+	}
+	for _, p := range pragmas {
+		db.Exec(p)
+	}
+
 	return &Bus{
-		registry: reg,
-		db:       db,
-		hub:      hub,
+		registry:   reg,
+		db:         db,
+		hub:        hub,
+		knownTable: make(map[string]bool),
+		stmtCache:  make(map[string]*sql.Stmt),
 	}, nil
 }
 
-// Close shuts down the database connection.
+// Close shuts down prepared statements and the database connection.
 func (b *Bus) Close() error {
+	b.stmtMu.Lock()
+	for _, stmt := range b.stmtCache {
+		stmt.Close()
+	}
+	b.stmtMu.Unlock()
 	return b.db.Close()
 }
 
@@ -105,10 +136,10 @@ func (b *Bus) execStep(step *RouteStep, payload map[string]interface{}) error {
 	return nil
 }
 
-// sanitizeIdent strips anything that isn't alphanumeric or underscore
-// to prevent SQL injection through table/column names.
+// sanitizeIdent strips anything that isn't alphanumeric or underscore.
 func sanitizeIdent(s string) string {
 	var b strings.Builder
+	b.Grow(len(s))
 	for _, c := range s {
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
 			(c >= '0' && c <= '9') || c == '_' {
@@ -116,6 +147,29 @@ func sanitizeIdent(s string) string {
 		}
 	}
 	return b.String()
+}
+
+// ensureTable creates the table only if we haven't seen it before.
+func (b *Bus) ensureTable(table string, colDefs []string) error {
+	b.tableMu.RLock()
+	known := b.knownTable[table]
+	b.tableMu.RUnlock()
+
+	if known {
+		return nil
+	}
+
+	createSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (id INTEGER PRIMARY KEY AUTOINCREMENT, %s)`,
+		table, strings.Join(colDefs, ", "))
+	if _, err := b.db.Exec(createSQL); err != nil {
+		return fmt.Errorf("create table failed: %w", err)
+	}
+
+	b.tableMu.Lock()
+	b.knownTable[table] = true
+	b.tableMu.Unlock()
+
+	return nil
 }
 
 func (b *Bus) dbInsert(table string, payload map[string]interface{}) error {
@@ -137,10 +191,8 @@ func (b *Bus) dbInsert(table string, payload map[string]interface{}) error {
 		values = append(values, fmt.Sprintf("%v", v))
 	}
 
-	createSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (id INTEGER PRIMARY KEY AUTOINCREMENT, %s)`,
-		table, strings.Join(colDefs, ", "))
-	if _, err := b.db.Exec(createSQL); err != nil {
-		return fmt.Errorf("create table failed: %w", err)
+	if err := b.ensureTable(table, colDefs); err != nil {
+		return err
 	}
 
 	insertSQL := fmt.Sprintf(`INSERT INTO "%s" (%s) VALUES (%s)`,
@@ -183,10 +235,8 @@ func (b *Bus) dbUpdate(table string, payload map[string]interface{}) error {
 	}
 	params = append(params, fmt.Sprintf("%v", payload[whereKey]))
 
-	createSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (id INTEGER PRIMARY KEY AUTOINCREMENT, %s)`,
-		table, strings.Join(colDefs, ", "))
-	if _, err := b.db.Exec(createSQL); err != nil {
-		return fmt.Errorf("create table failed: %w", err)
+	if err := b.ensureTable(table, colDefs); err != nil {
+		return err
 	}
 
 	updateSQL := fmt.Sprintf(`UPDATE "%s" SET %s WHERE "%s" = ?`,
