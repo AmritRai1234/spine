@@ -1,4 +1,4 @@
-module spine-go
+module github.com/AmritRai1234/spine
 
 go 1.24.4
 
