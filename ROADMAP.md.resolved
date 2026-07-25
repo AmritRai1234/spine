@@ -1,0 +1,296 @@
+# ⚡ Spine — Product Roadmap
+
+> Declarative Event-Driven Backend Engine
+
+---
+
+## v1.0 — Foundation ✅ *SHIPPED*
+
+The core runtime. Single binary, manifest-driven, production-ready.
+
+- [x] `.spine` manifest parser (state machine, line-by-line)
+- [x] Event dispatch bus with route matching
+- [x] Schema-based payload validation (`string`, `number`, `boolean`)
+- [x] SQLite persistence with WAL mode
+- [x] WebSocket real-time state broadcasting
+- [x] Hot manifest reloading (file watcher, zero-downtime)
+- [x] `GET /schema` — live introspection API
+- [x] `GET /health` — health check endpoint
+- [x] Go library (`go get github.com/AmritRai1234/spine`)
+- [x] Performance: 10K req/s, 6ms P99, 21MB RSS
+
+### v1.1 — CLI & Dashboard ✅ *SHIPPED*
+
+- [x] Premium CLI with gradient ASCII art
+- [x] `spine serve` — start server with graceful shutdown
+- [x] `spine emit` — fire events from terminal with colored JSON
+- [x] `spine schema` — pretty-print manifest as tables
+- [x] `spine validate` — lint manifest for issues
+- [x] `spine status` — health check running servers
+- [x] React dashboard (Vite + TypeScript)
+- [x] Live WebSocket event feed
+- [x] Schema viewer with node/route visualization
+
+---
+
+## v1.2 — Actions & Integrations 🔧
+
+Extend the `steps:` system beyond `db.insert` / `db.update`.
+
+### New Route Actions
+- [ ] `http.post` — fire webhooks to external services
+  ```yaml
+  steps:
+    - action: http.post
+      url: "https://hooks.slack.com/xxx"
+      input: "$event.payload"
+  ```
+- [ ] `http.get` — fetch data from external APIs during route execution
+- [ ] `log.write` — append to a structured log file / stdout
+- [ ] `db.query` — read from SQLite and inject results into the pipeline
+- [ ] `db.delete` — remove rows by condition
+- [ ] `transform` — reshape payload between steps
+  ```yaml
+  steps:
+    - action: transform
+      map:
+        user_email: "$event.payload.email"
+        created_at: "$now"
+  ```
+
+### Event Chaining
+- [ ] Route A emits state → automatically triggers Route B
+  ```yaml
+  routes:
+    - on: USER_SIGNUP
+      steps:
+        - action: db.insert
+          table: users
+      emit: USER_CREATED
+
+    - on: USER_CREATED      # ← triggered by the emit above
+      steps:
+        - action: http.post
+          url: "https://api.sendgrid.com/v3/send"
+  ```
+
+### Built-in Variables
+- [ ] `$now` — current ISO timestamp
+- [ ] `$uuid` — auto-generated UUID
+- [ ] `$event.name` — the event that triggered this route
+- [ ] `$env.SECRET_KEY` — environment variable access
+
+---
+
+## v1.3 — Conditional Logic & Middleware 🧠
+
+Make routes smart with branching and guards.
+
+### Conditional Routes
+- [ ] `if:` conditions on routes
+  ```yaml
+  routes:
+    - on: UPDATE_PROFILE
+      if: "$event.payload.role == 'admin'"
+      steps:
+        - action: db.update
+          table: users
+  ```
+- [ ] `if:` conditions on individual steps
+- [ ] Comparison operators: `==`, `!=`, `>`, `<`, `contains`, `exists`
+
+### Middleware
+- [ ] `before:` hooks — run steps before the main route
+- [ ] `after:` hooks — run steps after route completion
+- [ ] `on_error:` hooks — custom error handling per route
+  ```yaml
+  routes:
+    - on: PAYMENT_RECEIVED
+      before:
+        - action: auth.verify
+          header: "Authorization"
+      steps:
+        - action: db.insert
+          table: payments
+      on_error:
+        - action: http.post
+          url: "https://alerts.slack.com/xxx"
+  ```
+
+### Authentication
+- [ ] JWT validation middleware
+- [ ] API key authentication
+- [ ] Per-route auth requirements in manifest
+  ```yaml
+  nodes:
+    AdminPanel:
+      auth: jwt
+      role: admin
+  ```
+
+---
+
+## v1.4 — Query & Read API 📊
+
+The missing half — reading data back, not just writing.
+
+### Endpoints
+- [ ] `GET /tables` — list all tables with row counts
+- [ ] `GET /tables/:name` — query rows with filters
+  ```
+  GET /tables/users?email=test@dev.com&limit=10&offset=0
+  ```
+- [ ] `GET /tables/:name/:id` — get single row by ID
+- [ ] `GET /events` — query the event audit log
+  ```
+  GET /events?event=SUBMIT_LEAD&since=2026-07-25T00:00:00Z&limit=50
+  ```
+
+### Event Audit Log
+- [ ] Auto-log every emitted event to `_spine_events` table
+- [ ] Fields: `id`, `event`, `payload`, `status`, `route`, `timestamp`, `latency_ms`
+- [ ] `spine events` CLI command to query the log
+- [ ] Event replay — re-emit historical events for recovery
+
+### Manifest Queries
+- [ ] `query:` blocks in manifest for pre-defined read patterns
+  ```yaml
+  queries:
+    recent_leads:
+      table: landing_analytics
+      order_by: id DESC
+      limit: 20
+  ```
+
+---
+
+## v2.0 — Multi-Runtime & Plugins 🔌
+
+Break out of single-binary mode. Support distributed architectures.
+
+### Plugin System
+- [ ] Custom action handlers via Go interfaces
+  ```go
+  type ActionPlugin interface {
+      Name() string
+      Execute(ctx context.Context, step *RouteStep, payload map[string]interface{}) error
+  }
+  
+  engine.RegisterPlugin(&SlackNotifier{})
+  engine.RegisterPlugin(&S3Uploader{})
+  ```
+- [ ] Load plugins from shared libraries (`.so` files)
+- [ ] Plugin marketplace / registry
+
+### Queue Integration
+- [ ] `queue.publish` action — push to Redis/NATS/RabbitMQ
+- [ ] `queue.subscribe` — consume from external queues as events
+  ```yaml
+  steps:
+    - action: queue.publish
+      broker: "redis://localhost:6379"
+      channel: "video_processing"
+      input: "$event.payload"
+  ```
+
+### Database Backends
+- [ ] PostgreSQL support (swap SQLite for production)
+- [ ] MySQL support
+- [ ] In-memory mode (no persistence, max throughput)
+- [ ] Connection pooling configuration in manifest
+
+### Multi-File Manifests
+- [ ] `include:` directive for modular manifests
+  ```yaml
+  spine_version: 2
+  include:
+    - auth.spine
+    - billing.spine
+    - notifications.spine
+  ```
+
+---
+
+## v2.1 — Observability & DevTools 🔬
+
+Production monitoring and developer experience.
+
+### Metrics
+- [ ] `GET /metrics` — Prometheus-compatible endpoint
+  - Events emitted/sec
+  - Route latency histograms (P50/P95/P99)
+  - Error rates by event type
+  - WebSocket client count
+  - SQLite query time
+- [ ] Grafana dashboard template
+
+### Tracing
+- [ ] OpenTelemetry integration
+- [ ] Trace ID propagation through route steps
+- [ ] Distributed tracing across chained events
+
+### Dashboard v2
+- [ ] Route execution visualizer (animated flow diagram)
+- [ ] SQLite table browser with inline editing
+- [ ] Event replay controls
+- [ ] Performance graphs (throughput, latency, errors over time)
+- [ ] Manifest editor with live validation
+- [ ] Dark/light theme toggle
+
+### CLI Enhancements
+- [ ] `spine init` — generate a starter `app.spine` interactively
+- [ ] `spine dev` — start server + dashboard in one command
+- [ ] `spine logs` — tail server logs with colored output
+- [ ] `spine benchmark` — built-in load testing
+- [ ] `spine export` — dump SQLite tables as JSON/CSV
+- [ ] `spine migrate` — diff two manifests and apply DB changes
+
+---
+
+## v3.0 — Spine Cloud ☁️
+
+Managed Spine as a service.
+
+### Deployment
+- [ ] `spine deploy` — one-command deploy to Spine Cloud
+- [ ] Auto-provisioned SQLite → managed Postgres migration
+- [ ] Custom domains + TLS
+- [ ] Environment variables management
+
+### Collaboration
+- [ ] Team workspaces
+- [ ] Manifest version history with diff view
+- [ ] Staging → Production promotion flow
+- [ ] Role-based access control
+
+### Scale
+- [ ] Horizontal auto-scaling
+- [ ] Edge deployment (multi-region)
+- [ ] Event queue with guaranteed delivery
+- [ ] Rate limiting per client/event
+
+---
+
+## Version Timeline
+
+| Version | Focus | Target |
+|---------|-------|--------|
+| **v1.0** | Core runtime | ✅ Done |
+| **v1.1** | CLI + Dashboard | ✅ Done |
+| **v1.2** | Actions & Integrations | Q3 2026 |
+| **v1.3** | Conditional Logic & Auth | Q4 2026 |
+| **v1.4** | Query API & Audit Log | Q4 2026 |
+| **v2.0** | Plugins & Multi-DB | Q1 2027 |
+| **v2.1** | Observability & DevTools | Q2 2027 |
+| **v3.0** | Spine Cloud | Q3 2027 |
+
+---
+
+## Design Principles
+
+1. **Manifest-first** — if it can be declared, don't code it
+2. **Zero-config** — sensible defaults, override when needed
+3. **Single binary** — no Docker, no infra, just `./spine serve`
+4. **Performance** — never sacrifice throughput for features
+5. **Debuggable** — every event is traceable, every error is actionable
+6. **Composable** — small actions that chain together beat monolithic handlers

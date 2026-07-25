@@ -317,6 +317,18 @@ func ParseManifest(filepath string) (*SpineSchema, error) {
 					curStep.Input = unquote(v)
 					continue
 				}
+				if v, ok := kvValue(trimmed, "url"); ok {
+					curStep.URL = unquote(v)
+					continue
+				}
+				if v, ok := kvValue(trimmed, "message"); ok {
+					curStep.Message = unquote(v)
+					continue
+				}
+				if v, ok := kvValue(trimmed, "where"); ok {
+					curStep.Where = unquote(v)
+					continue
+				}
 			}
 
 			continue

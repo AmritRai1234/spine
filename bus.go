@@ -1,11 +1,16 @@
 package spine
 
 import (
+	"bytes"
 	"database/sql"
+	"encoding/json"
 	"fmt"
+	"log"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -83,10 +88,22 @@ func (b *Bus) GetRegistry() *Registry {
 // Emit dispatches an event: validates the payload, runs route steps,
 // persists to SQLite, and broadcasts any emitted states over WS.
 func (b *Bus) Emit(event string, payload map[string]interface{}) (map[string]interface{}, error) {
+	return b.EmitWithDepth(event, payload, 0)
+}
+
+// EmitWithDepth handles event dispatching with a recursion depth guard for event chaining.
+func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth int) (map[string]interface{}, error) {
+	if depth > 10 {
+		return nil, fmt.Errorf("event chaining max depth (10) exceeded on event '%s'", event)
+	}
+
 	reg := b.GetRegistry()
 
-	if err := reg.ValidatePayload(event, payload); err != nil {
-		return nil, fmt.Errorf("validation error: %w", err)
+	// Validate payload only on initial emission (depth 0)
+	if depth == 0 {
+		if err := reg.ValidatePayload(event, payload); err != nil {
+			return nil, fmt.Errorf("validation error: %w", err)
+		}
 	}
 
 	routes, ok := reg.GetRoutes(event)
@@ -101,7 +118,7 @@ func (b *Bus) Emit(event string, payload map[string]interface{}) (map[string]int
 	var emittedStates []string
 	for _, route := range routes {
 		for _, step := range route.Steps {
-			if err := b.execStep(&step, payload); err != nil {
+			if err := b.execStep(&step, event, payload); err != nil {
 				return nil, fmt.Errorf("step execution failed (action=%s, table=%s): %w", step.Action, step.Table, err)
 			}
 		}
@@ -109,6 +126,17 @@ func (b *Bus) Emit(event string, payload map[string]interface{}) (map[string]int
 		if route.EmitState != "" {
 			b.hub.BroadcastState(route.EmitState, event, payload)
 			emittedStates = append(emittedStates, route.EmitState)
+
+			// Event Chaining: trigger routes matching the emitted state
+			if _, hasChained := reg.GetRoutes(route.EmitState); hasChained {
+				chainedRes, err := b.EmitWithDepth(route.EmitState, payload, depth+1)
+				if err != nil {
+					return nil, fmt.Errorf("chained event '%s' failed: %w", route.EmitState, err)
+				}
+				if chainedStates, ok := chainedRes["emitted_states"].([]string); ok {
+					emittedStates = append(emittedStates, chainedStates...)
+				}
+			}
 		}
 	}
 
@@ -120,16 +148,24 @@ func (b *Bus) Emit(event string, payload map[string]interface{}) (map[string]int
 	}, nil
 }
 
-func (b *Bus) execStep(step *RouteStep, payload map[string]interface{}) error {
+func (b *Bus) execStep(step *RouteStep, eventName string, payload map[string]interface{}) error {
 	switch step.Action {
 	case "db.insert":
 		if step.Table != "" {
-			return b.dbInsert(step.Table, payload)
+			return b.dbInsert(step.Table, eventName, payload)
 		}
 	case "db.update":
 		if step.Table != "" {
-			return b.dbUpdate(step.Table, payload)
+			return b.dbUpdate(step.Table, eventName, payload)
 		}
+	case "db.delete":
+		if step.Table != "" {
+			return b.dbDelete(step.Table, step.Where, eventName, payload)
+		}
+	case "http.post":
+		return b.httpPost(step, eventName, payload)
+	case "log.write":
+		return b.logWrite(step, eventName, payload)
 	}
 	return nil
 }
@@ -170,7 +206,7 @@ func (b *Bus) ensureTable(table string, colDefs []string) error {
 	return nil
 }
 
-func (b *Bus) dbInsert(table string, payload map[string]interface{}) error {
+func (b *Bus) dbInsert(table string, eventName string, payload map[string]interface{}) error {
 	if len(payload) == 0 {
 		return nil
 	}
@@ -186,7 +222,13 @@ func (b *Bus) dbInsert(table string, payload map[string]interface{}) error {
 		colDefs = append(colDefs, fmt.Sprintf(`"%s" TEXT`, safe))
 		colNames = append(colNames, fmt.Sprintf(`"%s"`, safe))
 		placeholders = append(placeholders, "?")
-		values = append(values, fmt.Sprintf("%v", v))
+
+		// Support template values in string fields
+		if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
+			values = append(values, ResolveVariables(strVal, eventName, payload))
+		} else {
+			values = append(values, fmt.Sprintf("%v", v))
+		}
 	}
 
 	if err := b.ensureTable(table, colDefs); err != nil {
@@ -202,7 +244,7 @@ func (b *Bus) dbInsert(table string, payload map[string]interface{}) error {
 	return nil
 }
 
-func (b *Bus) dbUpdate(table string, payload map[string]interface{}) error {
+func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interface{}) error {
 	if len(payload) < 2 {
 		return nil
 	}
@@ -228,7 +270,11 @@ func (b *Bus) dbUpdate(table string, payload map[string]interface{}) error {
 		colDefs = append(colDefs, fmt.Sprintf(`"%s" TEXT`, safe))
 		if k != whereKey {
 			setClauses = append(setClauses, fmt.Sprintf(`"%s" = ?`, safe))
-			params = append(params, fmt.Sprintf("%v", v))
+			if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
+				params = append(params, ResolveVariables(strVal, eventName, payload))
+			} else {
+				params = append(params, fmt.Sprintf("%v", v))
+			}
 		}
 	}
 	params = append(params, fmt.Sprintf("%v", payload[whereKey]))
@@ -243,5 +289,68 @@ func (b *Bus) dbUpdate(table string, payload map[string]interface{}) error {
 		return fmt.Errorf("update failed: %w", err)
 	}
 
+	return nil
+}
+
+func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload map[string]interface{}) error {
+	table = sanitizeIdent(table)
+
+	if whereExpr == "" {
+		if idVal, ok := payload["id"]; ok {
+			whereExpr = fmt.Sprintf("id = '%v'", idVal)
+		} else {
+			return fmt.Errorf("db.delete requires 'where' condition or 'id' in payload")
+		}
+	} else {
+		whereExpr = ResolveVariables(whereExpr, eventName, payload)
+	}
+
+	deleteSQL := fmt.Sprintf(`DELETE FROM "%s" WHERE %s`, table, whereExpr)
+	if _, err := b.db.Exec(deleteSQL); err != nil {
+		return fmt.Errorf("delete failed: %w", err)
+	}
+
+	return nil
+}
+
+func (b *Bus) httpPost(step *RouteStep, eventName string, payload map[string]interface{}) error {
+	targetURL := ResolveVariables(step.URL, eventName, payload)
+	if targetURL == "" {
+		return fmt.Errorf("http.post step missing 'url'")
+	}
+
+	var bodyBytes []byte
+	if step.Input != "" && step.Input != "$event.payload" {
+		resolvedInput := ResolveVariables(step.Input, eventName, payload)
+		bodyBytes = []byte(resolvedInput)
+	} else {
+		var err error
+		bodyBytes, err = json.Marshal(payload)
+		if err != nil {
+			return fmt.Errorf("http.post failed to marshal payload: %w", err)
+		}
+	}
+
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Post(targetURL, "application/json", bytes.NewReader(bodyBytes))
+	if err != nil {
+		return fmt.Errorf("http.post request to '%s' failed: %w", targetURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 400 {
+		return fmt.Errorf("http.post to '%s' returned status %d", targetURL, resp.StatusCode)
+	}
+
+	return nil
+}
+
+func (b *Bus) logWrite(step *RouteStep, eventName string, payload map[string]interface{}) error {
+	msg := step.Message
+	if msg == "" {
+		msg = "event: $event.name payload: $event.payload"
+	}
+	resolvedMsg := ResolveVariables(msg, eventName, payload)
+	log.Printf("[SPINE LOG] %s", resolvedMsg)
 	return nil
 }

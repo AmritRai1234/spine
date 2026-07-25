@@ -106,7 +106,14 @@ routes:
       - action: db.insert
         table: landing_analytics
         input: "$event.payload"
+      - action: log.write
+        message: "[LEAD] Received lead for $event.payload.email at $now"
     emit: LEAD_STATUS
+
+  - "on": LEAD_STATUS
+    steps:
+      - action: log.write
+        message: "[AUDIT] Lead status processed successfully"
 
   - "on": UPDATE_PROFILE
     steps:
