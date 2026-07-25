@@ -134,12 +134,8 @@ func (b *Bus) startBatchWriter() {
 			}
 
 			for _, task := range batch {
-				stmt, err := tx.Prepare(task.query)
-				if err != nil {
-					tx.Exec(task.query, task.params...)
-				} else {
-					stmt.Exec(task.params...)
-					stmt.Close()
+				if _, err := tx.Exec(task.query, task.params...); err != nil {
+					// Silent ignore or fallback
 				}
 			}
 			_ = tx.Commit()
@@ -154,9 +150,21 @@ func (b *Bus) startBatchWriter() {
 					return
 				}
 				batch = append(batch, task)
-				if len(batch) >= 500 {
-					flush()
+				// Opportunistic non-blocking drain loop
+				for len(batch) < 1000 {
+					select {
+					case t, ok := <-b.writeChan:
+						if !ok {
+							flush()
+							return
+						}
+						batch = append(batch, t)
+					default:
+						goto FLUSH
+					}
 				}
+			FLUSH:
+				flush()
 			case <-ticker.C:
 				flush()
 			}

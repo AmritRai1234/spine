@@ -21,7 +21,6 @@ nodes:
       - event: SUBMIT_LEAD
         payload:
           email: string
-          source: string
     listens:
       - state: LEAD_STATUS
         payload:
@@ -58,7 +57,7 @@ nodes:
           status: string
 
 routes:
-  # Submit Lead Route (with parallel execution & HTTP webhook retries)
+  # Submit Lead Route (with parallel execution)
   - on: SUBMIT_LEAD
     parallel: true
     steps:
@@ -68,12 +67,6 @@ routes:
 
       - action: log.write
         message: "[LEAD] Received lead for $event.payload.email at $now"
-
-      - action: http.post
-        url: "https://hooks.slack.com/services/test/lead"
-        max_attempts: 3
-        backoff_ms: 100
-        if: "$event.payload.email contains '@'"
 
     emit: LEAD_STATUS
 
