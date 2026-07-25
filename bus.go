@@ -16,6 +16,11 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
+type dbTask struct {
+	query  string
+	params []interface{}
+}
+
 // Bus is the core event dispatch engine. It validates payloads,
 // executes route steps, persists to SQLite, and broadcasts state
 // changes over WebSocket.
@@ -29,6 +34,10 @@ type Bus struct {
 	knownTable map[string]bool
 	stmtMu     sync.RWMutex
 	stmtCache  map[string]*sql.Stmt
+
+	// High-throughput batch writer
+	writeChan chan dbTask
+	wg        sync.WaitGroup
 }
 
 // NewBus creates a Bus wired to a Registry, SQLite database, and WS hub.
@@ -39,7 +48,7 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 	}
 
 	// Tune connection pool for concurrent goroutines
-	db.SetMaxOpenConns(1)  // SQLite only supports 1 writer
+	db.SetMaxOpenConns(1)    // SQLite only supports 1 writer
 	db.SetMaxIdleConns(1)
 	db.SetConnMaxLifetime(0) // Keep alive forever
 
@@ -60,13 +69,72 @@ func NewBus(reg *Registry, dbPath string, hub *Hub) (*Bus, error) {
 		hub:        hub,
 		knownTable: make(map[string]bool),
 		stmtCache:  make(map[string]*sql.Stmt),
+		writeChan:  make(chan dbTask, 100000),
 	}
 	atomic.StorePointer(&bus.registry, unsafe.Pointer(reg))
+	bus.startBatchWriter()
 	return bus, nil
 }
 
-// Close shuts down prepared statements and the database connection.
+func (b *Bus) startBatchWriter() {
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		ticker := time.NewTicker(2 * time.Millisecond)
+		defer ticker.Stop()
+
+		batch := make([]dbTask, 0, 500)
+
+		flush := func() {
+			if len(batch) == 0 {
+				return
+			}
+			tx, err := b.db.Begin()
+			if err != nil {
+				// Fallback execute directly
+				for _, task := range batch {
+					b.db.Exec(task.query, task.params...)
+				}
+				batch = batch[:0]
+				return
+			}
+
+			for _, task := range batch {
+				stmt, err := tx.Prepare(task.query)
+				if err != nil {
+					tx.Exec(task.query, task.params...)
+				} else {
+					stmt.Exec(task.params...)
+					stmt.Close()
+				}
+			}
+			_ = tx.Commit()
+			batch = batch[:0]
+		}
+
+		for {
+			select {
+			case task, ok := <-b.writeChan:
+				if !ok {
+					flush()
+					return
+				}
+				batch = append(batch, task)
+				if len(batch) >= 500 {
+					flush()
+				}
+			case <-ticker.C:
+				flush()
+			}
+		}
+	}()
+}
+
+// Close shuts down batch writer, prepared statements, and the database connection.
 func (b *Bus) Close() error {
+	close(b.writeChan)
+	b.wg.Wait()
+
 	b.stmtMu.Lock()
 	for _, stmt := range b.stmtCache {
 		stmt.Close()
@@ -237,8 +305,13 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 
 	insertSQL := fmt.Sprintf(`INSERT INTO "%s" (%s) VALUES (%s)`,
 		table, strings.Join(colNames, ", "), strings.Join(placeholders, ", "))
-	if _, err := b.db.Exec(insertSQL, values...); err != nil {
-		return fmt.Errorf("insert failed: %w", err)
+
+	select {
+	case b.writeChan <- dbTask{query: insertSQL, params: values}:
+	default:
+		if _, err := b.db.Exec(insertSQL, values...); err != nil {
+			return fmt.Errorf("insert failed: %w", err)
+		}
 	}
 
 	return nil
@@ -285,8 +358,13 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 
 	updateSQL := fmt.Sprintf(`UPDATE "%s" SET %s WHERE "%s" = ?`,
 		table, strings.Join(setClauses, ", "), sanitizeIdent(whereKey))
-	if _, err := b.db.Exec(updateSQL, params...); err != nil {
-		return fmt.Errorf("update failed: %w", err)
+
+	select {
+	case b.writeChan <- dbTask{query: updateSQL, params: params}:
+	default:
+		if _, err := b.db.Exec(updateSQL, params...); err != nil {
+			return fmt.Errorf("update failed: %w", err)
+		}
 	}
 
 	return nil
@@ -306,8 +384,13 @@ func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload
 	}
 
 	deleteSQL := fmt.Sprintf(`DELETE FROM "%s" WHERE %s`, table, whereExpr)
-	if _, err := b.db.Exec(deleteSQL); err != nil {
-		return fmt.Errorf("delete failed: %w", err)
+
+	select {
+	case b.writeChan <- dbTask{query: deleteSQL}:
+	default:
+		if _, err := b.db.Exec(deleteSQL); err != nil {
+			return fmt.Errorf("delete failed: %w", err)
+		}
 	}
 
 	return nil
