@@ -36,17 +36,19 @@ type PayloadField struct {
 
 // Route maps an event to a sequence of steps and an optional state emission.
 type Route struct {
-	OnEvent   string      `json:"on_event"`
-	Steps     []RouteStep `json:"steps"`
-	EmitState string      `json:"emit_state,omitempty"`
+	OnEvent     string      `json:"on_event"`
+	IfCondition string      `json:"if_condition,omitempty"`
+	Steps       []RouteStep `json:"steps"`
+	EmitState   string      `json:"emit_state,omitempty"`
 }
 
 // RouteStep is a single action within a route (e.g. db.insert).
 type RouteStep struct {
-	Action  string `json:"action"`
-	Table   string `json:"table,omitempty"`
-	Input   string `json:"input,omitempty"`
-	URL     string `json:"url,omitempty"`
-	Message string `json:"message,omitempty"`
-	Where   string `json:"where,omitempty"`
+	Action      string `json:"action"`
+	IfCondition string `json:"if_condition,omitempty"`
+	Table       string `json:"table,omitempty"`
+	Input       string `json:"input,omitempty"`
+	URL         string `json:"url,omitempty"`
+	Message     string `json:"message,omitempty"`
+	Where       string `json:"where,omitempty"`
 }

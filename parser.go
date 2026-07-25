@@ -292,6 +292,11 @@ func ParseManifest(filepath string) (*SpineSchema, error) {
 					state = sRouteSteps
 					continue
 				}
+				if v, ok := kvValue(trimmed, "if"); ok {
+					curRoute.IfCondition = unquote(v)
+					state = sRouteBody
+					continue
+				}
 				if v, ok := kvValue(trimmed, "emit"); ok {
 					curRoute.EmitState = unquote(v)
 					state = sRouteBody
@@ -309,6 +314,10 @@ func ParseManifest(filepath string) (*SpineSchema, error) {
 			}
 
 			if state == sRouteStepBody && indent == 4 && curStep != nil {
+				if v, ok := kvValue(trimmed, "if"); ok {
+					curStep.IfCondition = unquote(v)
+					continue
+				}
 				if v, ok := kvValue(trimmed, "table"); ok {
 					curStep.Table = unquote(v)
 					continue

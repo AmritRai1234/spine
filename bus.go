@@ -205,6 +205,10 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 
 	var emittedStates []string
 	for _, route := range routes {
+		if route.IfCondition != "" && !EvaluateCondition(route.IfCondition, event, payload) {
+			continue
+		}
+
 		for _, step := range route.Steps {
 			if err := b.execStep(&step, event, payload); err != nil {
 				return nil, fmt.Errorf("step execution failed (action=%s, table=%s): %w", step.Action, step.Table, err)
@@ -238,6 +242,10 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 }
 
 func (b *Bus) execStep(step *RouteStep, eventName string, payload map[string]interface{}) error {
+	if step.IfCondition != "" && !EvaluateCondition(step.IfCondition, eventName, payload) {
+		return nil
+	}
+
 	switch step.Action {
 	case "db.insert":
 		if step.Table != "" {
