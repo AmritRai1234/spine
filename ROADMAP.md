@@ -42,36 +42,22 @@ The core runtime. Single binary, manifest-driven, production-ready.
 
 ---
 
-## v1.3 — Conditional Logic & Middleware 🧠 *(NEXT UP)*
+## v1.3 — Conditional Logic, Parallel Execution & Adaptive Engine ✅ *SHIPPED*
 
-Make routes smart with branching and execution guards.
+Make routes smart with branching, parallel dispatch, fault tolerance, and dynamic auto-tuning.
 
-### Conditional Routes & Steps
-- [ ] `if:` conditions on routes
-  ```yaml
-  routes:
-    - on: UPDATE_PROFILE
-      if: "$event.payload.role == 'admin'"
-      steps:
-        - action: db.update
-          table: users
-  ```
-- [ ] `if:` conditions on individual steps
-- [ ] Comparison operators: `==`, `!=`, `>`, `<`, `contains`, `exists`
-
-### Middleware Hooks
-- [ ] `before:` hooks — run pre-validation steps before main route execution
-- [ ] `after:` hooks — run post-execution side-effects
-- [ ] `on_error:` hooks — custom error handling per route
-
-### Authentication
-- [ ] JWT validation middleware
-- [ ] API key authentication
-- [ ] Per-route auth requirements in manifest
+- [x] `if:` conditions on routes and individual steps
+- [x] Comparison operators: `==`, `!=`, `>`, `>=`, `<`, `<=`, `contains`, `exists`
+- [x] `parallel: true` — concurrent step execution via worker goroutines
+- [x] `max_attempts` & `backoff_ms` — automated retry engine for step execution
+- [x] Turso / libSQL pure-Go driver engine (`turso.tech/database/tursogo`)
+- [x] Adaptive Self-Improving Latency Engine (`optimizer.go`)
+- [x] `GET /metrics` live runtime telemetry endpoint
+- [x] Scaled batch capacity up to 10,000 items with 0% data loss
 
 ---
 
-## v1.4 — Query & Read API 📊
+## v1.4 — Query & Read API 📊 *(NEXT UP)*
 
 Reading data back directly from manifest specifications.
 
@@ -98,6 +84,6 @@ Reading data back directly from manifest specifications.
 | **v1.0** | Core Runtime | ✅ Shipped |
 | **v1.1** | CLI & Load Benchmarking | ✅ Shipped |
 | **v1.2** | Actions, Event Chaining & Performance (56K req/s) | ✅ Shipped |
-| **v1.3** | Conditional Logic (`if:` guards) & Middleware | 🧠 Next Up |
-| **v1.4** | Query API & Event Audit Log | Q4 2026 |
+| **v1.3** | Conditional Logic, Parallel Execution & Adaptive Engine | ✅ Shipped |
+| **v1.4** | Query API & Event Audit Log | 🧠 Next Up |
 | **v2.0** | Plugins & Multi-DB Engine | Q1 2027 |

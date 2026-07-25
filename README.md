@@ -90,15 +90,21 @@ routes:
         message: "[AUDIT] Lead status processed successfully"
 ```
 
-## Route Actions
+## Route Actions & Capabilities
 
 Spine supports multi-step execution pipelines inside routes:
 
-- `db.insert`: Inserts event payload into SQLite table with auto-schema creation.
+- `db.insert`: Inserts event payload into database table with auto-schema creation.
 - `db.update`: Updates table record by payload ID or matching key.
 - `db.delete`: Deletes records by ID or custom SQL expression.
-- `http.post`: Outbound webhook dispatch with 5s timeout and payload substitution.
+- `http.post`: Outbound webhook dispatch with retries (`max_attempts`) and payload substitution.
 - `log.write`: Formatted stdout/stderr logging.
+
+### Advanced Orchestration Directives
+
+- `parallel: true`: Runs route steps concurrently using worker goroutines.
+- `if: "..."`: Conditional execution guards (`==`, `!=`, `>`, `<`, `contains`, `exists`).
+- `max_attempts: 3` & `backoff_ms: 100`: Automatic retry loop for transient failures.
 
 ### Template Variable Resolution
 
@@ -129,12 +135,16 @@ Response:
 }
 ```
 
-Invalid payloads are rejected with descriptive field errors:
+### GET /metrics — Self-Improving Latency Engine Metrics
+
+Returns real-time optimizer mode, batch size targets, and flush windows:
 
 ```json
 {
-  "status": "error",
-  "error": "validation error: missing required field 'email' (expected type string)"
+  "status": "ok",
+  "optimizer_mode": "Extreme-Batching",
+  "target_batch_size": 10000,
+  "flush_interval": "250µs"
 }
 ```
 
