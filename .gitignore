@@ -4,10 +4,13 @@ node_modules/
 # Binary
 spine
 
-# SQLite
+# SQLite & Turso
 *.db
 *.db-wal
 *.db-shm
+*.turso
+*.turso-wal
+*.turso-shm
 Untitled design.png
 
 # OS
