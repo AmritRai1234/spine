@@ -9,7 +9,7 @@
   <a href="#performance"><img src="https://img.shields.io/badge/latency-59%CE%BCs-blue?style=flat-square" alt="Latency"></a>
   <a href="#performance"><img src="https://img.shields.io/badge/memory-21MB%20RSS-purple?style=flat-square" alt="Memory"></a>
   <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-library-00ADD8?style=flat-square&logo=go" alt="Go"></a>
-  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-gray?style=flat-square" alt="License"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-GPLv3-blue?style=flat-square" alt="License"></a>
 </p>
 
 ---
@@ -324,4 +324,4 @@ func main() {
 
 ## License
 
-MIT
+Distributed under the [GNU General Public License v3.0 (GPLv3)](LICENSE).
