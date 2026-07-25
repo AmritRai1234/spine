@@ -8,8 +8,9 @@
   <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/throughput-56K%20req%2Fs-brightgreen?style=flat-square" alt="Throughput"></a>
   <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/latency-59%CE%BCs-blue?style=flat-square" alt="Latency"></a>
   <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/memory-21MB%20RSS-purple?style=flat-square" alt="Memory"></a>
-  <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-v2.0.0-00ADD8?style=flat-square&logo=go" alt="Go"></a>
+  <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-v2.1.0-00ADD8?style=flat-square&logo=go" alt="Go"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPLv3-blue?style=flat-square" alt="License"></a>
+  <a href="#tests"><img src="https://img.shields.io/badge/tests-24%2F24%20pass-brightgreen?style=flat-square" alt="Tests"></a>
 </p>
 
 ---
@@ -34,11 +35,11 @@ Client Event ➔ Load Balancer ➔ Spine Node (Auth & Rate Limit) ➔ Event Bus 
 - [Database Schema & Migrations](#database-schema--migrations)
 - [HTTP & WebSocket API Reference](#http--websocket-api-reference)
 - [Minimalist Developer Web Dashboard](#minimalist-developer-web-dashboard)
-- [CLI Reference](#cli-reference)
 - [Optimization & High-Throughput Engine](#optimization--high-throughput-engine)
 - [Security & Governance](#security--governance)
-- [Go SDK / Embedding Guide](#go-sdk--embedding-guide)
 - [Performance & Benchmarks](#performance--benchmarks)
+- [Tests](#tests)
+- [Go SDK / Embedding Guide](#go-sdk--embedding-guide)
 - [License](#license)
 
 ---
@@ -121,13 +122,10 @@ When any node processes an event that emits state, it publishes the update to th
 
 ```
 Spine/
-├── cmd/
-│   └── spine/           # Standalone CLI application executable (cmd/spine/main.go)
-│
 ├── pkg/
 │   ├── engine/          # Core runtime execution engine
 │   │   ├── bus.go       # Event dispatch, batch writer, table indexing
-│   │   ├── engine.go    # HTTP server mux & health/probe endpoints
+│   │   ├── engine.go    # HTTP server mux, graceful shutdown & health probes
 │   │   ├── hub.go       # WebSocket real-time state broadcasting hub
 │   │   ├── outbox.go    # DB-backed outbox retry queue (survives process/node crashes)
 │   │   ├── pubsub.go    # Local & distributed PubSub backplane interface (Redis/NATS)
@@ -138,16 +136,20 @@ Spine/
 │   │   └── migrations.go# Versioned schema migration tracker
 │   │
 │   ├── manifest/        # Declarative .spine language parser & AST
-│   │   ├── parser.go    # Multi-file manifest parser state machine
+│   │   ├── parser.go    # Hardened multi-file manifest parser with validation
 │   │   ├── registry.go  # Lock-free atomic route & node registry
 │   │   └── schema.go    # AST struct definitions
 │   │
 │   └── middleware/      # Security & access control middleware
-│       ├── auth.go      # API key & Bearer token header verification
-│       └── ratelimit.go # Token-bucket rate limiter (with Trusted Proxy IP extraction)
+│       ├── auth.go      # Timing-safe API key & Bearer token verification
+│       └── ratelimit.go # Token-bucket rate limiter with auto-eviction
 │
 ├── web/                 # Minimalist developer web dashboard (Vite + React + TS)
-├── tests/               # End-to-end unit test suites (10 test suites)
+├── tests/               # End-to-end test suites (24 tests across 11 files)
+│   ├── parser_test.go   # 14 parser validation & edge case tests
+│   ├── benchmark_test.go# Performance benchmarks (parse, emit, registry)
+│   └── ...              # Bus, conditions, optimizer, plugins, queries, etc.
+├── examples/            # Example .spine manifest files
 ├── spine.go             # Public top-level Go library API facade
 └── README.md            # Master project documentation
 ```
@@ -173,16 +175,93 @@ go build -o spine ./cmd/spine/
 
 ## Security & Governance
 
-1. **API Key & Bearer Token Authentication**:
-   - Gatekeep endpoints using `--api-key <KEY>` or `SPINE_API_KEY`.
+1. **Timing-Safe API Key Verification**:
+   - Gatekeep endpoints using `SetAPIKey(key)` or `SPINE_API_KEY`.
    - Accepts headers: `Authorization: Bearer <KEY>` or `X-API-Key: <KEY>`.
+   - Uses `crypto/subtle.ConstantTimeCompare` to prevent timing side-channel attacks.
 
-2. **Trusted Proxy Rate Limiting**:
-   - Token-bucket rate limiting (`pkg/middleware/ratelimit.go`) extracts client IPs securely.
-   - Parses `X-Forwarded-For` and `X-Real-IP` headers **only** when requests originate from configured trusted proxy IPs (`SetTrustedProxies([]string{"127.0.0.1", "10.0.0.1"})`), preventing malicious IP spoofing evasions.
+2. **WebSocket Authentication**:
+   - WebSocket connections (`/ws`) require API key validation **before** upgrading the connection.
+   - Supports authentication via `?token=<KEY>` query parameter or standard auth headers.
 
-3. **Durable Outbox Queue Resilience**:
-   - Outbound webhooks and action retries are stored in the primary database (`_spine_outbox` table). If a node dies mid-execution, pending retries are resumed automatically by surviving cluster nodes.
+3. **Request Body Size Limits**:
+   - All request bodies are capped at **1 MB** via `io.LimitReader` to prevent memory exhaustion attacks.
+
+4. **SQL Injection Protection**:
+   - All table/column identifiers are sanitized via `sanitizeIdent()` (alphanumeric + underscore only).
+   - `db.delete` uses **parameterized queries** (`WHERE id = ?`) instead of string interpolation.
+
+5. **Trusted Proxy Rate Limiting**:
+   - Token-bucket rate limiting with automatic **stale entry eviction** (>5min idle entries cleaned every 60s).
+   - Parses `X-Forwarded-For` and `X-Real-IP` headers **only** from configured trusted proxy IPs.
+
+6. **Graceful Shutdown**:
+   - Handles `SIGINT` / `SIGTERM` with a 10-second drain timeout via `http.Server.Shutdown()`.
+   - Ensures in-flight requests complete and the batch writer flushes before exit.
+
+7. **Durable Outbox Queue Resilience**:
+   - Outbound webhooks and action retries are stored in the primary database (`_spine_outbox` table). Pending retries are automatically processed by a background goroutine every 5 seconds.
+
+---
+
+## Performance & Benchmarks
+
+| Benchmark | Result |
+|---|---|
+| **EmitSingle** (full pipeline) | 7.9μs / 44 allocs / 1,587 B |
+| **EmitWithValidation** (typed payload) | 9.6μs / 57 allocs / 2,223 B |
+| **EmitParallel** (multi-goroutine) | 9.2μs / 57 allocs |
+| **RegistryLookup** (lock-free) | 70ns / 1 alloc / 7 B |
+| **ParseSmallManifest** (3 nodes) | 14μs / 86 allocs |
+| **ParseLargeManifest** (20 nodes) | 52μs / 586 allocs |
+
+### Key Optimizations
+- **ensureTable fast-path**: Skips all SQL for known table+column combos (sync.Map cache)
+- **Pre-sized slices**: All hot-path slices pre-allocated to payload length (zero reallocs)
+- **strings.Builder SQL**: Single-allocation SQL construction instead of fmt.Sprintf + strings.Join
+- **Pooled emittedStates**: sync.Pool for emitted state slices (reduced GC pressure)
+- **Dynamic batch writer**: Ticker auto-resets when adaptive optimizer changes mode
+- **Lock-free registry**: atomic.LoadPointer for zero-contention route lookups
+- **Object pooling**: sync.Pool for emitRequest structs and bytes.Buffer on HTTP hot path
+- **SQLite WAL tuning**: Aggressive pragma configuration (WAL, NORMAL sync, 256MB mmap)
+
+---
+
+## Tests
+
+**24/24 tests pass** across 11 test files:
+
+| Suite | Coverage |
+|---|---|
+| `bus_v12_test.go` | Core emit → insert → state → WebSocket flow |
+| `parser_test.go` | 14 cases: duplicates, circular includes, tabs, validation |
+| `benchmark_test.go` | Parse, emit, and registry performance benchmarks |
+| `cond_test.go` / `cond_route_test.go` | Condition evaluator + route/step guards |
+| `optimizer_test.go` | Adaptive optimizer mode switching |
+| `parallel_retry_test.go` | Parallel step execution + retry/backoff |
+| `plugin_test.go` | Multi-file imports + custom action plugins |
+| `prod_scale_test.go` | API key auth, health probes, PubSub |
+| `query_test.go` | GET /tables, GET /events query APIs |
+| `turso_test.go` | Turso/libSQL driver detection |
+| `vars_test.go` | Template variable resolution |
+
+```bash
+go test ./... -v
+```
+
+---
+
+## Manifest Parser
+
+The `.spine` manifest parser includes production-grade hardening:
+
+- **Line-numbered errors**: `app.spine:17: duplicate node name 'Dashboard'`
+- **Duplicate node detection**: Prevents silent collisions with line-number references
+- **Circular include guard**: Detects `a.spine → b.spine → a.spine` cycles
+- **Tab tolerance**: Tabs normalized to 2-space equivalents
+- **Mixed whitespace detection**: Rejects ambiguous tab+space indentation
+- **Post-parse semantic validation**: Catches missing `spine_version`, empty routes, unknown events
+- **Unknown top-level key detection**: Catches typos like `routs:` with suggestions
 
 ---
 

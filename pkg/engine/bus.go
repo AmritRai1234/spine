@@ -23,6 +23,14 @@ type dbTask struct {
 	params []interface{}
 }
 
+// Pool for emitted states slices to reduce allocs on the hot path
+var statesPool = sync.Pool{
+	New: func() interface{} {
+		s := make([]string, 0, 4)
+		return &s
+	},
+}
+
 // Bus is the core event dispatch engine. It validates payloads,
 // executes route steps, persists to SQLite/Turso, and broadcasts state
 // changes over WebSocket.
@@ -31,10 +39,8 @@ type Bus struct {
 	db       *sql.DB
 	hub      *Hub
 
-	// Performance: lock-free known tables + prepared insert statements
+	// Performance: lock-free known tables
 	knownTable sync.Map
-	stmtMu     sync.RWMutex
-	stmtCache  map[string]*sql.Stmt
 
 	// In-memory RAM State Cache
 	stateMu    sync.RWMutex
@@ -88,7 +94,6 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 	bus := &Bus{
 		db:         db,
 		hub:        hub,
-		stmtCache:  make(map[string]*sql.Stmt),
 		stateCache: make(map[string]map[string]interface{}),
 		writeChan:  make(chan dbTask, 500000),
 		optimizer:  NewAdaptiveOptimizer(),
@@ -96,6 +101,8 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 	atomic.StorePointer(&bus.registry, unsafe.Pointer(reg))
 	bus.startBatchWriter()
 	bus.initEventTable()
+	bus.initOutboxTable()
+	go bus.processOutboxQueue()
 
 	// Pre-create tables declared in manifest (including imported sub-manifests)
 	for _, tbl := range reg.GetSchema().DbTables {
@@ -129,10 +136,11 @@ func (b *Bus) startBatchWriter() {
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
-		ticker := time.NewTicker(2 * time.Millisecond)
+		curInterval := b.optimizer.GetFlushInterval()
+		ticker := time.NewTicker(curInterval)
 		defer ticker.Stop()
 
-		batch := make([]dbTask, 0, 500)
+		batch := make([]dbTask, 0, 1000)
 
 		flush := func() {
 			if len(batch) == 0 {
@@ -150,7 +158,7 @@ func (b *Bus) startBatchWriter() {
 
 			for _, task := range batch {
 				if _, err := tx.Exec(task.query, task.params...); err != nil {
-					// Silent ignore or fallback
+					log.Printf("[batch] exec error: %v", err)
 				}
 			}
 			_ = tx.Commit()
@@ -181,6 +189,13 @@ func (b *Bus) startBatchWriter() {
 				}
 			FLUSH:
 				flush()
+
+				// Dynamically adjust ticker when optimizer changes mode
+				newInterval := b.optimizer.GetFlushInterval()
+				if newInterval != curInterval {
+					ticker.Reset(newInterval)
+					curInterval = newInterval
+				}
 			case <-ticker.C:
 				flush()
 			}
@@ -188,19 +203,13 @@ func (b *Bus) startBatchWriter() {
 	}()
 }
 
-// Close shuts down batch writer, prepared statements, and the database connection.
+// Close shuts down batch writer and the database connection.
 func (b *Bus) Close() error {
 	if b.optimizer != nil {
 		b.optimizer.Close()
 	}
 	close(b.writeChan)
 	b.wg.Wait()
-
-	b.stmtMu.Lock()
-	for _, stmt := range b.stmtCache {
-		stmt.Close()
-	}
-	b.stmtMu.Unlock()
 	return b.db.Close()
 }
 
@@ -246,7 +255,14 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 		}, nil
 	}
 
-	var emittedStates []string
+	// Pool the emittedStates slice to reduce GC pressure on high-throughput paths
+	statesPtr := statesPool.Get().(*[]string)
+	emittedStates := (*statesPtr)[:0]
+	defer func() {
+		*statesPtr = emittedStates[:0]
+		statesPool.Put(statesPtr)
+	}()
+
 	for _, route := range routes {
 		if route.IfCondition != "" && !EvaluateCondition(route.IfCondition, event, payload) {
 			continue
@@ -303,11 +319,15 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 		b.logEventAudit(event, payload, emittedStates)
 	}
 
+	// Copy emittedStates before returning (original goes back to pool)
+	resStates := make([]string, len(emittedStates))
+	copy(resStates, emittedStates)
+
 	return map[string]interface{}{
 		"status":         "ok",
 		"event":          event,
 		"routes_matched": len(routes),
-		"emitted_states": emittedStates,
+		"emitted_states": resStates,
 	}, nil
 }
 
@@ -395,7 +415,16 @@ func sanitizeIdent(s string) string {
 }
 
 // ensureTable creates the table and auto-generates column indexes or adds missing columns.
+// Uses knownTable sync.Map to skip SQL when the same column set has been seen before.
 func (b *Bus) ensureTable(table string, colDefs []string) error {
+	// Build a fingerprint of the column definitions for this call
+	colKey := table + "|" + strings.Join(colDefs, ",")
+
+	// Fast path: this exact table+columns combo already ensured — skip all SQL
+	if _, known := b.knownTable.Load(colKey); known {
+		return nil
+	}
+
 	createSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (id INTEGER PRIMARY KEY AUTOINCREMENT, %s)`,
 		table, strings.Join(colDefs, ", "))
 	if _, err := b.db.Exec(createSQL); err != nil {
@@ -419,25 +448,28 @@ func (b *Bus) ensureTable(table string, colDefs []string) error {
 		}
 	}
 
-	b.knownTable.Store(table, true)
+	b.knownTable.Store(colKey, true)
 	return nil
 }
 
 func (b *Bus) dbInsert(table string, eventName string, payload map[string]interface{}) error {
-	if len(payload) == 0 {
+	n := len(payload)
+	if n == 0 {
 		return nil
 	}
 
 	table = sanitizeIdent(table)
-	var colDefs []string
-	var colNames []string
-	var placeholders []string
-	var values []interface{}
+
+	// Pre-size all slices to payload length — eliminates append reallocation
+	colDefs := make([]string, 0, n)
+	colNames := make([]string, 0, n)
+	placeholders := make([]string, 0, n)
+	values := make([]interface{}, 0, n)
 
 	for k, v := range payload {
 		safe := sanitizeIdent(k)
 		colDefs = append(colDefs, fmt.Sprintf(`"%s" TEXT`, safe))
-		colNames = append(colNames, fmt.Sprintf(`"%s"`, safe))
+		colNames = append(colNames, `"`+safe+`"`)
 		placeholders = append(placeholders, "?")
 
 		// Support template values in string fields
@@ -452,23 +484,42 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 		return err
 	}
 
-	insertSQL := fmt.Sprintf(`INSERT INTO "%s" (%s) VALUES (%s)`,
-		table, strings.Join(colNames, ", "), strings.Join(placeholders, ", "))
+	// Build SQL with strings.Builder — single allocation
+	var sb strings.Builder
+	sb.Grow(64 + len(table) + n*12)
+	sb.WriteString(`INSERT INTO "`)
+	sb.WriteString(table)
+	sb.WriteString(`" (`)
+	for i, c := range colNames {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(c)
+	}
+	sb.WriteString(") VALUES (")
+	for i := range placeholders {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteByte('?')
+	}
+	sb.WriteByte(')')
 
 	select {
-	case b.writeChan <- dbTask{query: insertSQL, params: values}:
+	case b.writeChan <- dbTask{query: sb.String(), params: values}:
 	default:
 		// Channel buffer backup queue
 		go func(t dbTask) {
 			b.writeChan <- t
-		}(dbTask{query: insertSQL, params: values})
+		}(dbTask{query: sb.String(), params: values})
 	}
 
 	return nil
 }
 
 func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interface{}) error {
-	if len(payload) < 2 {
+	n := len(payload)
+	if n < 2 {
 		return nil
 	}
 
@@ -484,15 +535,16 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 		}
 	}
 
-	var colDefs []string
-	var setClauses []string
-	var params []interface{}
+	// Pre-size slices
+	colDefs := make([]string, 0, n)
+	setClauses := make([]string, 0, n-1)
+	params := make([]interface{}, 0, n)
 
 	for k, v := range payload {
 		safe := sanitizeIdent(k)
 		colDefs = append(colDefs, fmt.Sprintf(`"%s" TEXT`, safe))
 		if k != whereKey {
-			setClauses = append(setClauses, fmt.Sprintf(`"%s" = ?`, safe))
+			setClauses = append(setClauses, `"`+safe+`" = ?`)
 			if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
 				params = append(params, ResolveVariables(strVal, eventName, payload))
 			} else {
@@ -506,13 +558,27 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 		return err
 	}
 
-	updateSQL := fmt.Sprintf(`UPDATE "%s" SET %s WHERE "%s" = ?`,
-		table, strings.Join(setClauses, ", "), sanitizeIdent(whereKey))
+	// Build SQL with strings.Builder
+	safeWhereKey := sanitizeIdent(whereKey)
+	var sb strings.Builder
+	sb.Grow(64 + len(table) + n*12)
+	sb.WriteString(`UPDATE "`)
+	sb.WriteString(table)
+	sb.WriteString(`" SET `)
+	for i, c := range setClauses {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		sb.WriteString(c)
+	}
+	sb.WriteString(` WHERE "`)
+	sb.WriteString(safeWhereKey)
+	sb.WriteString(`" = ?`)
 
 	select {
-	case b.writeChan <- dbTask{query: updateSQL, params: params}:
+	case b.writeChan <- dbTask{query: sb.String(), params: params}:
 	default:
-		if _, err := b.db.Exec(updateSQL, params...); err != nil {
+		if _, err := b.db.Exec(sb.String(), params...); err != nil {
 			return fmt.Errorf("update failed: %w", err)
 		}
 	}
@@ -523,22 +589,26 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload map[string]interface{}) error {
 	table = sanitizeIdent(table)
 
+	var deleteSQL string
+	var params []interface{}
+
 	if whereExpr == "" {
 		if idVal, ok := payload["id"]; ok {
-			whereExpr = fmt.Sprintf("id = '%v'", idVal)
+			// Parameterized query prevents SQL injection via payload values
+			deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE id = ?`, table)
+			params = []interface{}{idVal}
 		} else {
 			return fmt.Errorf("db.delete requires 'where' condition or 'id' in payload")
 		}
 	} else {
 		whereExpr = ResolveVariables(whereExpr, eventName, payload)
+		deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE %s`, table, whereExpr)
 	}
 
-	deleteSQL := fmt.Sprintf(`DELETE FROM "%s" WHERE %s`, table, whereExpr)
-
 	select {
-	case b.writeChan <- dbTask{query: deleteSQL}:
+	case b.writeChan <- dbTask{query: deleteSQL, params: params}:
 	default:
-		if _, err := b.db.Exec(deleteSQL); err != nil {
+		if _, err := b.db.Exec(deleteSQL, params...); err != nil {
 			return fmt.Errorf("delete failed: %w", err)
 		}
 	}

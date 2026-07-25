@@ -31,16 +31,45 @@ const (
 	sRouteStepBody
 )
 
+// parseError formats an error with file path and line number context.
+func parseError(file string, lineno int, format string, args ...interface{}) error {
+	prefix := filepath.Base(file)
+	if lineno > 0 {
+		prefix = fmt.Sprintf("%s:%d", prefix, lineno)
+	}
+	return fmt.Errorf("%s: %s", prefix, fmt.Sprintf(format, args...))
+}
+
+// getIndent computes indentation level from leading whitespace.
+// Tabs are normalized to 2 spaces each for tolerance.
 func getIndent(line string) int {
 	count := 0
 	for _, c := range line {
 		if c == ' ' {
 			count++
+		} else if c == '\t' {
+			count += 2
 		} else {
 			break
 		}
 	}
 	return count / 2
+}
+
+// hasMixedWhitespace returns true if a line has both leading tabs and spaces.
+func hasMixedWhitespace(line string) bool {
+	hasTabs := false
+	hasSpaces := false
+	for _, c := range line {
+		if c == '\t' {
+			hasTabs = true
+		} else if c == ' ' {
+			hasSpaces = true
+		} else {
+			break
+		}
+	}
+	return hasTabs && hasSpaces
 }
 
 func unquote(s string) string {
@@ -70,7 +99,31 @@ func listKvValue(trimmed, key string) (string, bool) {
 }
 
 // ParseManifest reads a .spine manifest file and returns the parsed schema.
+// This is the public API entry point — it delegates to the internal parser
+// with an empty include stack for circular include detection.
 func ParseManifest(manifestPath string) (*SpineSchema, error) {
+	absPath, err := filepath.Abs(manifestPath)
+	if err != nil {
+		return nil, fmt.Errorf("cannot resolve path '%s': %w", manifestPath, err)
+	}
+	return parseManifestWithStack(absPath, nil)
+}
+
+// parseManifestWithStack is the internal parser that carries the include chain
+// for circular dependency detection.
+func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineSchema, error) {
+	// Circular include detection
+	for _, ancestor := range includeStack {
+		if ancestor == manifestPath {
+			chain := append(includeStack, manifestPath)
+			names := make([]string, len(chain))
+			for i, p := range chain {
+				names[i] = filepath.Base(p)
+			}
+			return nil, fmt.Errorf("circular include detected: %s", strings.Join(names, " → "))
+		}
+	}
+
 	f, err := os.Open(manifestPath)
 	if err != nil {
 		return nil, fmt.Errorf("cannot open manifest '%s': %w", manifestPath, err)
@@ -86,6 +139,10 @@ func ParseManifest(manifestPath string) (*SpineSchema, error) {
 	var curRoute *Route
 	var curStep *RouteStep
 
+	// Duplicate tracking
+	seenNodes := make(map[string]int)  // node name → first line number
+	seenTables := make(map[string]bool) // table name deduplication
+
 	scanner := bufio.NewScanner(f)
 	lineno := 0
 
@@ -97,6 +154,11 @@ func ParseManifest(manifestPath string) (*SpineSchema, error) {
 
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
+		}
+
+		// Warn on mixed tabs + spaces (parse continues, but flag it)
+		if hasMixedWhitespace(line) {
+			return nil, parseError(manifestPath, lineno, "mixed tabs and spaces in indentation; use spaces only")
 		}
 
 		// ===== TOP LEVEL =====
@@ -132,6 +194,12 @@ func ParseManifest(manifestPath string) (*SpineSchema, error) {
 				state = sRoutes
 				continue
 			}
+
+			// Unknown top-level key detection
+			if strings.Contains(trimmed, ":") {
+				key := strings.TrimSpace(trimmed[:strings.Index(trimmed, ":")])
+				return nil, parseError(manifestPath, lineno, "unknown top-level key '%s' (expected: spine_version, includes, database, nodes, routes)", key)
+			}
 		}
 
 		// ===== INCLUDES =====
@@ -149,7 +217,11 @@ func ParseManifest(manifestPath string) (*SpineSchema, error) {
 		}
 		if state == sDbTables {
 			if indent == 2 && isListItem(trimmed) {
-				schema.DbTables = append(schema.DbTables, unquote(trimmed[2:]))
+				tableName := unquote(trimmed[2:])
+				if !seenTables[tableName] {
+					schema.DbTables = append(schema.DbTables, tableName)
+					seenTables[tableName] = true
+				}
 				continue
 			}
 			if indent <= 1 {
@@ -160,7 +232,15 @@ func ParseManifest(manifestPath string) (*SpineSchema, error) {
 		// ===== NODES =====
 		if state >= sNodes && state <= sNodeListenPayload {
 			if indent == 1 && strings.HasSuffix(trimmed, ":") && !isListItem(trimmed) {
-				n := Node{Name: trimmed[:len(trimmed)-1]}
+				nodeName := trimmed[:len(trimmed)-1]
+
+				// Duplicate node detection
+				if firstLine, exists := seenNodes[nodeName]; exists {
+					return nil, parseError(manifestPath, lineno, "duplicate node name '%s' (first declared at line %d)", nodeName, firstLine)
+				}
+				seenNodes[nodeName] = lineno
+
+				n := Node{Name: nodeName}
 				schema.Nodes = append(schema.Nodes, n)
 				curNode = &schema.Nodes[len(schema.Nodes)-1]
 				curEmit = nil
@@ -384,17 +464,83 @@ func ParseManifest(manifestPath string) (*SpineSchema, error) {
 		return nil, fmt.Errorf("error reading manifest: %w", err)
 	}
 
+	// Post-parse semantic validation
+	if err := validateSchema(manifestPath, schema); err != nil {
+		return nil, err
+	}
+
+	// Process includes with circular detection
+	newStack := append(includeStack, manifestPath)
 	baseDir := filepath.Dir(manifestPath)
 	for _, incRel := range schema.Includes {
 		incPath := filepath.Join(baseDir, incRel)
-		subSchema, err := ParseManifest(incPath)
+		absIncPath, err := filepath.Abs(incPath)
 		if err != nil {
-			return nil, fmt.Errorf("failed to process included manifest '%s': %w", incPath, err)
+			return nil, fmt.Errorf("cannot resolve include path '%s': %w", incPath, err)
 		}
-		schema.DbTables = append(schema.DbTables, subSchema.DbTables...)
+
+		subSchema, err := parseManifestWithStack(absIncPath, newStack)
+		if err != nil {
+			return nil, fmt.Errorf("failed to process included manifest '%s': %w", incRel, err)
+		}
+
+		// Deduplicate tables from includes
+		for _, t := range subSchema.DbTables {
+			if !seenTables[t] {
+				schema.DbTables = append(schema.DbTables, t)
+				seenTables[t] = true
+			}
+		}
 		schema.Nodes = append(schema.Nodes, subSchema.Nodes...)
 		schema.Routes = append(schema.Routes, subSchema.Routes...)
 	}
 
 	return schema, nil
+}
+
+// validateSchema performs post-parse semantic validation on the parsed schema.
+func validateSchema(file string, schema *SpineSchema) error {
+	// Missing spine_version
+	if schema.SpineVersion == 0 {
+		return parseError(file, 0, "missing required 'spine_version' declaration")
+	}
+
+	// Build set of known emitted events from nodes
+	knownEvents := make(map[string]bool)
+	for _, node := range schema.Nodes {
+		for _, e := range node.Emits {
+			knownEvents[e.Event] = true
+		}
+	}
+
+	for i, route := range schema.Routes {
+		// Empty action in step
+		for j, step := range route.Steps {
+			if step.Action == "" {
+				return parseError(file, 0, "route %d, step %d has an empty 'action' field", i+1, j+1)
+			}
+		}
+
+		// Route with no steps
+		if len(route.Steps) == 0 {
+			return parseError(file, 0, "route on '%s' has no steps defined", route.OnEvent)
+		}
+
+		// Route referencing an event not declared by any node (warning-grade: only if nodes exist)
+		if len(schema.Nodes) > 0 && !knownEvents[route.OnEvent] {
+			// Check if the route.OnEvent matches an emitted state (chained events are valid)
+			isChainedState := false
+			for _, r := range schema.Routes {
+				if r.EmitState == route.OnEvent {
+					isChainedState = true
+					break
+				}
+			}
+			if !isChainedState {
+				return parseError(file, 0, "route references event '%s' which is not declared in any node's emits (possible typo?)", route.OnEvent)
+			}
+		}
+	}
+
+	return nil
 }

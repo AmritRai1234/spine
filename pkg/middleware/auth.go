@@ -1,12 +1,14 @@
 package middleware
 
 import (
+	"crypto/subtle"
 	"encoding/json"
 	"net/http"
 	"strings"
 )
 
 // AuthMiddleware wraps an HTTP handler and validates the API key if key is configured.
+// Uses constant-time comparison to prevent timing side-channel attacks.
 func AuthMiddleware(apiKey string, next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if apiKey == "" {
@@ -22,7 +24,8 @@ func AuthMiddleware(apiKey string, next http.HandlerFunc) http.HandlerFunc {
 			}
 		}
 
-		if clientKey != apiKey {
+		// Constant-time comparison prevents timing side-channel attacks
+		if subtle.ConstantTimeCompare([]byte(clientKey), []byte(apiKey)) != 1 {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusUnauthorized)
 			json.NewEncoder(w).Encode(map[string]string{

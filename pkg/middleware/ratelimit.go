@@ -23,17 +23,54 @@ type RateLimitManager struct {
 	limit          float64
 	burst          float64
 	trustedProxies map[string]bool
+	stopCh         chan struct{}
 }
 
 // NewRateLimitManager creates a rate limit manager allowing `rps` requests/sec with `burst` capacity.
+// Starts a background eviction goroutine that removes stale IP entries every 60 seconds.
 func NewRateLimitManager(rps float64, burst float64) *RateLimitManager {
 	m := &RateLimitManager{
 		limiters:       make(map[string]*rateLimiter),
 		limit:          rps,
 		burst:          burst,
 		trustedProxies: make(map[string]bool),
+		stopCh:         make(chan struct{}),
 	}
+	go m.evictStaleEntries()
 	return m
+}
+
+// Close stops the background eviction goroutine.
+func (m *RateLimitManager) Close() {
+	select {
+	case <-m.stopCh:
+	default:
+		close(m.stopCh)
+	}
+}
+
+// evictStaleEntries removes rate limiter entries that haven't been used in 5 minutes.
+// Runs every 60 seconds to prevent unbounded memory growth from unique IP addresses.
+func (m *RateLimitManager) evictStaleEntries() {
+	ticker := time.NewTicker(60 * time.Second)
+	defer ticker.Stop()
+
+	const staleDuration = 5 * time.Minute
+
+	for {
+		select {
+		case <-m.stopCh:
+			return
+		case now := <-ticker.C:
+			m.mu.Lock()
+			for ip, lim := range m.limiters {
+				if now.Sub(lim.lastRefill) > staleDuration {
+					delete(m.limiters, ip)
+				}
+			}
+			m.mu.Unlock()
+		}
+	}
 }
 
 // SetTrustedProxies configures trusted reverse proxy IPs (e.g., "127.0.0.1", "10.0.0.1").
@@ -111,7 +148,7 @@ func (m *RateLimitManager) ExtractIP(r *http.Request) string {
 	return remoteIP
 }
 
-// RateLimitMiddleware returns an HTTP handler middleware enforcing IP rate limits.
+// Middleware returns an HTTP handler middleware enforcing IP rate limits.
 func (m *RateLimitManager) Middleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ip := m.ExtractIP(r)

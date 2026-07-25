@@ -2,20 +2,26 @@ package engine
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 	"os"
+	"os/signal"
 	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/AmritRai1234/spine/pkg/manifest"
 	"github.com/AmritRai1234/spine/pkg/middleware"
 	"github.com/gorilla/websocket"
 )
+
+// maxRequestBodySize is the maximum allowed request body size (1 MB).
+const maxRequestBodySize = 1 << 20 // 1 MB
 
 var upgrader = websocket.Upgrader{
 	CheckOrigin: func(r *http.Request) bool { return true },
@@ -81,12 +87,15 @@ func (e *Engine) SetAPIKey(key string) {
 	e.APIKey = key
 }
 
-// Close shuts down the engine.
+// Close shuts down the engine and its rate limiter.
 func (e *Engine) Close() error {
+	if e.rateLimiter != nil {
+		e.rateLimiter.Close()
+	}
 	return e.Bus.Close()
 }
 
-// ListenAndServe starts HTTP+WS server and optional hot-reload watcher.
+// ListenAndServe starts HTTP+WS server with graceful shutdown on SIGINT/SIGTERM.
 func (e *Engine) ListenAndServe(addr string) error {
 	if e.spineFile != "" {
 		e.startHotReload()
@@ -100,7 +109,30 @@ func (e *Engine) ListenAndServe(addr string) error {
 		IdleTimeout:  60 * time.Second,
 	}
 	srv.SetKeepAlivesEnabled(true)
-	return srv.ListenAndServe()
+
+	// Graceful shutdown on SIGINT/SIGTERM
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- srv.ListenAndServe()
+	}()
+
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+
+	select {
+	case err := <-errCh:
+		return err
+	case sig := <-quit:
+		log.Printf("[spine] received signal %v, shutting down gracefully...", sig)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := srv.Shutdown(ctx); err != nil {
+			log.Printf("[spine] graceful shutdown error: %v", err)
+			return err
+		}
+		log.Printf("[spine] server stopped")
+		return nil
+	}
 }
 
 // HTTPHandler returns the configured http.Handler for embedding in custom servers.
@@ -114,6 +146,30 @@ func (e *Engine) wrapMiddleware(handler http.HandlerFunc) http.HandlerFunc {
 		h = e.rateLimiter.Middleware(h)
 	}
 	return h
+}
+
+// wsAuthCheck validates the API key for WebSocket connections.
+// Accepts key via query param ?token= or X-API-Key header.
+func (e *Engine) wsAuthCheck(r *http.Request) bool {
+	if e.APIKey == "" {
+		return true
+	}
+
+	// Check query parameter
+	if token := r.URL.Query().Get("token"); token != "" {
+		return token == e.APIKey
+	}
+
+	// Check headers (same logic as AuthMiddleware)
+	clientKey := r.Header.Get("X-API-Key")
+	if clientKey == "" {
+		authHeader := r.Header.Get("Authorization")
+		if strings.HasPrefix(authHeader, "Bearer ") {
+			clientKey = strings.TrimPrefix(authHeader, "Bearer ")
+		}
+	}
+
+	return clientKey == e.APIKey
 }
 
 func (e *Engine) buildMux() *http.ServeMux {
@@ -153,8 +209,9 @@ func (e *Engine) buildMux() *http.ServeMux {
 		body.Payload = nil
 		defer emitReqPool.Put(body)
 
-		// Read body once, unmarshal (faster than NewDecoder for small payloads)
-		raw, err := io.ReadAll(r.Body)
+		// Read body with size limit to prevent memory exhaustion
+		limitedReader := io.LimitReader(r.Body, maxRequestBodySize)
+		raw, err := io.ReadAll(limitedReader)
 		if err != nil || json.Unmarshal(raw, body) != nil {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(400)
@@ -286,6 +343,14 @@ func (e *Engine) buildMux() *http.ServeMux {
 	}))
 
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+		// WebSocket auth check — validate before upgrading the connection
+		if !e.wsAuthCheck(r) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			w.Write([]byte(`{"status":"error","error":"unauthorized: invalid or missing API key"}`))
+			return
+		}
+
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Printf("[ws] upgrade error: %v", err)
