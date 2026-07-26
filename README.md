@@ -274,13 +274,25 @@ const posts = await fetch(`${SPINE}/tables/posts?where=author_email:jane@example
 }).then(r => r.json());
 ```
 
-### JavaScript — Real-Time Updates
+### JavaScript — Real-Time Updates & Browser WebSocket Auth
+
+Connect via `?token=` query parameter or send an in-band `{ "type": "auth", "token": "..." }` handshake message (ideal for browser clients):
 
 ```javascript
+// Option A: Connection URL token
 const ws = new WebSocket(`ws://localhost:8080/ws?token=${API_KEY}`);
+
+// Option B: In-band message handshake (for browsers without custom headers)
+const wsBrowser = new WebSocket('ws://localhost:8080/ws');
+wsBrowser.onopen = () => {
+  wsBrowser.send(JSON.stringify({ type: 'auth', token: API_KEY }));
+};
 
 ws.onmessage = (event) => {
   const msg = JSON.parse(event.data);
+  if (msg.type === 'auth_ack' && msg.status === 'ok') {
+    console.log('WebSocket authenticated successfully!');
+  }
   if (msg.type === 'state') {
     switch (msg.state) {
       case 'USER_REGISTERED':
@@ -322,6 +334,10 @@ database:
   tables:                  # Declare tables (auto-created with schema evolution)
     - users
     - orders
+  outbox:                  # Optional. Durable webhook retry worker pool tuning
+    max_workers: 10        # Concurrent worker goroutines (default: 10)
+    max_retries: 5         # Maximum outbox retry attempts (default: 5)
+    backoff_ms: 1000       # Initial retry backoff interval in ms (default: 1000)
 
 nodes:                     # Declare UI/service nodes and their event contracts
   NodeName:
@@ -355,7 +371,7 @@ routes:                    # Event → action pipelines
 
 When an action step fails (or exceeds its `max_attempts`), Spine automatically triggers failure route handling if `on_failure` (or `on_error`) is defined at the step or route level:
 
-1. **Error Context**: Spine enriches the error payload with `error`, `failed_action`, `failed_event`, and original payload parameters.
+1. **Error Context**: Spine enriches the failure payload with `error`, `failed_action`, `failed_event`, and preserves an immutable `_error_context` object (`original_payload`, `step_index`, `failed_event`, `failed_action`, `timestamp`).
 2. **RAM State Cache**: Updates state cache for instant `GetState("PROCESSING_FAILED")` access.
 3. **WebSocket Broadcast**: Pushes state change to all connected UI / Dashboard WebSocket clients.
 4. **Event Chaining**: Automatically triggers any downstream routes listening on the failure state.
@@ -381,8 +397,8 @@ routes:
 | Action | Description | Parameters |
 |---|---|---|
 | `db.insert` | Insert a row into a table | `table` (required) |
-| `db.update` | Update a row (matches on `id` or first key) | `table` (required) |
-| `db.upsert` | Insert or update on conflict | `table` (required), `key` (conflict column, default: `id`) |
+| `db.update` | Update a row (matches on `id` or specified key) | `table` (required) |
+| `db.upsert` | Insert or update on conflict | `table` (required), `key` (conflict column, default: `id`). Fails explicitly if `key` is missing from payload. |
 | `db.delete` | Delete a row by `id` or `where` condition | `table`, `where` (optional) |
 | `set` | Inject computed fields into the payload | Any `key: value` pairs (supports `$uuid`, `$now`, etc.) |
 | `log.write` | Write a log message with template variables | `message` (required) |

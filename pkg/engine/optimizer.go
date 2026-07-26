@@ -8,14 +8,14 @@ import (
 // AdaptiveOptimizer continuously monitors execution metrics and automatically
 // tunes batch sizes and flush intervals in real-time.
 type AdaptiveOptimizer struct {
-	reqCount     uint64
-	lastReqCount uint64
-	lastCheck    time.Time
+	reqCount          uint64
+	lastReqCount      uint64
+	lastCheck         time.Time
 
-	batchSize     uint32
-	flushInterval time.Duration
-	mode          unsafeAtomicString
-	stopCh        chan struct{}
+	batchSize         uint32
+	flushIntervalNano int64
+	mode              unsafeAtomicString
+	stopCh            chan struct{}
 }
 
 type unsafeAtomicString struct {
@@ -36,10 +36,10 @@ func (s *unsafeAtomicString) Load() string {
 // NewAdaptiveOptimizer creates and starts a self-improving latency optimizer.
 func NewAdaptiveOptimizer() *AdaptiveOptimizer {
 	opt := &AdaptiveOptimizer{
-		lastCheck:     time.Now(),
-		batchSize:     500,
-		flushInterval: 1 * time.Millisecond,
-		stopCh:        make(chan struct{}),
+		lastCheck:         time.Now(),
+		batchSize:         500,
+		flushIntervalNano: int64(1 * time.Millisecond),
+		stopCh:            make(chan struct{}),
 	}
 	opt.mode.Store("Micro-Latency")
 	go opt.tuneLoop()
@@ -67,7 +67,7 @@ func (o *AdaptiveOptimizer) GetBatchSize() int {
 
 // GetFlushInterval returns the current optimized flush interval.
 func (o *AdaptiveOptimizer) GetFlushInterval() time.Duration {
-	return o.flushInterval
+	return time.Duration(atomic.LoadInt64(&o.flushIntervalNano))
 }
 
 // GetMode returns the current active optimization mode name.
@@ -88,43 +88,43 @@ func (o *AdaptiveOptimizer) tuneLoop() {
 			currentReqs := atomic.LoadUint64(&o.reqCount)
 			elapsed := now.Sub(o.lastCheck).Seconds()
 
-		if elapsed <= 0 {
-			continue
-		}
+			if elapsed <= 0 {
+				continue
+			}
 
-		delta := currentReqs - o.lastReqCount
-		rps := float64(delta) / elapsed
+			delta := currentReqs - o.lastReqCount
+			rps := float64(delta) / elapsed
 
-		o.lastReqCount = currentReqs
-		o.lastCheck = now
+			o.lastReqCount = currentReqs
+			o.lastCheck = now
 
-		// Autonomous tuning decisions based on live RPS
-		switch {
-		case rps > 20000:
-			atomic.StoreUint32(&o.batchSize, 10000)
-			o.flushInterval = 250 * time.Microsecond
-			o.mode.Store("Extreme-Batching")
+			// Autonomous tuning decisions based on live RPS
+			switch {
+			case rps > 20000:
+				atomic.StoreUint32(&o.batchSize, 10000)
+				atomic.StoreInt64(&o.flushIntervalNano, int64(250*time.Microsecond))
+				o.mode.Store("Extreme-Batching")
 
-		case rps > 10000:
-			atomic.StoreUint32(&o.batchSize, 5000)
-			o.flushInterval = 500 * time.Microsecond
-			o.mode.Store("Aggressive-Batching")
+			case rps > 10000:
+				atomic.StoreUint32(&o.batchSize, 5000)
+				atomic.StoreInt64(&o.flushIntervalNano, int64(500*time.Microsecond))
+				o.mode.Store("Aggressive-Batching")
 
-		case rps > 2000:
-			atomic.StoreUint32(&o.batchSize, 2500)
-			o.flushInterval = 1 * time.Millisecond
-			o.mode.Store("High-Throughput")
+			case rps > 2000:
+				atomic.StoreUint32(&o.batchSize, 2500)
+				atomic.StoreInt64(&o.flushIntervalNano, int64(1*time.Millisecond))
+				o.mode.Store("High-Throughput")
 
-		case rps > 200:
-			atomic.StoreUint32(&o.batchSize, 1000)
-			o.flushInterval = 2 * time.Millisecond
-			o.mode.Store("Balanced")
+			case rps > 200:
+				atomic.StoreUint32(&o.batchSize, 1000)
+				atomic.StoreInt64(&o.flushIntervalNano, int64(2*time.Millisecond))
+				o.mode.Store("Balanced")
 
-		default:
-			atomic.StoreUint32(&o.batchSize, 250)
-			o.flushInterval = 5 * time.Millisecond
-			o.mode.Store("Micro-Latency")
-		}
+			default:
+				atomic.StoreUint32(&o.batchSize, 250)
+				atomic.StoreInt64(&o.flushIntervalNano, int64(5*time.Millisecond))
+				o.mode.Store("Micro-Latency")
+			}
 		}
 	}
 }

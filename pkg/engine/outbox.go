@@ -2,7 +2,10 @@ package engine
 
 import (
 	"encoding/json"
+	"sync"
 	"time"
+
+	"github.com/AmritRai1234/spine/pkg/manifest"
 )
 
 // initOutboxTable creates the _spine_outbox table for persistent webhook retries.
@@ -23,6 +26,14 @@ func (b *Bus) initOutboxTable() {
 // enqueueOutbox persistent retry task into _spine_outbox table.
 // Signals the processor to wake up immediately via outboxNotify.
 func (b *Bus) enqueueOutbox(action string, payload map[string]interface{}, backoffMs int) {
+	if backoffMs <= 0 {
+		if reg := b.GetRegistry(); reg != nil && reg.GetSchema() != nil && reg.GetSchema().Database.Outbox.BackoffMs > 0 {
+			backoffMs = reg.GetSchema().Database.Outbox.BackoffMs
+		} else {
+			backoffMs = 1000
+		}
+	}
+
 	payloadBytes, _ := json.Marshal(payload)
 	now := time.Now().UTC()
 	nextRetry := now.Add(time.Duration(backoffMs) * time.Millisecond).Format(time.RFC3339)
@@ -31,26 +42,45 @@ func (b *Bus) enqueueOutbox(action string, payload map[string]interface{}, backo
 	params := []interface{}{action, string(payloadBytes), nextRetry, now.Format(time.RFC3339)}
 
 	b.writer.submitAny(dbTask{query: insertSQL, params: params})
-	// Non-blocking: submitAny silently drops if all shards saturated
 
-	// Notify the processor to wake up immediately instead of waiting for next tick
+	// Notify the processor to wake up immediately
 	select {
 	case b.outboxNotify <- struct{}{}:
 	default:
-		// Already signaled, no need to duplicate
 	}
 }
 
 // processOutboxQueue processes pending outbox retry tasks surviving server restarts.
-// Wakes up immediately on enqueue notification, with a 5-second fallback ticker
-// for crash recovery of items already in the database.
+// Uses a bounded worker pool configured via database.outbox.max_workers in the manifest.
 func (b *Bus) processOutboxQueue() {
-	ticker := time.NewTicker(5 * time.Second)
+	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
 
+	getOutboxConfig := func() (int, int, int) {
+		maxWorkers := 10
+		maxRetries := 5
+		backoffMs := 1000
+
+		if reg := b.GetRegistry(); reg != nil && reg.GetSchema() != nil {
+			cfg := reg.GetSchema().Database.Outbox
+			if cfg.MaxWorkers > 0 {
+				maxWorkers = cfg.MaxWorkers
+			}
+			if cfg.MaxRetries > 0 {
+				maxRetries = cfg.MaxRetries
+			}
+			if cfg.BackoffMs > 0 {
+				backoffMs = cfg.BackoffMs
+			}
+		}
+		return maxWorkers, maxRetries, backoffMs
+	}
+
 	process := func() {
+		maxWorkers, maxRetries, backoffMs := getOutboxConfig()
 		nowStr := time.Now().UTC().Format(time.RFC3339)
-		rows, err := b.db.Query(`SELECT id, action, payload, attempts FROM "_spine_outbox" WHERE status = 'pending' AND next_retry_at <= ? LIMIT 50`, nowStr)
+
+		rows, err := b.db.Query(`SELECT id, action, payload, attempts FROM "_spine_outbox" WHERE status = 'pending' AND next_retry_at <= ? ORDER BY id ASC LIMIT 50`, nowStr)
 		if err != nil {
 			return
 		}
@@ -70,13 +100,49 @@ func (b *Bus) processOutboxQueue() {
 		}
 		rows.Close()
 
-		for _, task := range pending {
-			var payload map[string]interface{}
-			_ = json.Unmarshal([]byte(task.payload), &payload)
-
-			// Mark processed or increment attempts
-			b.db.Exec(`UPDATE "_spine_outbox" SET status = 'completed' WHERE id = ?`, task.id)
+		if len(pending) == 0 {
+			return
 		}
+
+		sem := make(chan struct{}, maxWorkers)
+		var wg sync.WaitGroup
+
+		for _, task := range pending {
+			sem <- struct{}{}
+			wg.Add(1)
+
+			go func(t outboxTask) {
+				defer func() {
+					<-sem
+					wg.Done()
+				}()
+
+				var payload map[string]interface{}
+				_ = json.Unmarshal([]byte(t.payload), &payload)
+
+				step := &manifest.RouteStep{
+					Action: t.action,
+				}
+
+				err := b.execStep(step, "_spine_outbox_retry", payload)
+				if err == nil {
+					b.db.Exec(`UPDATE "_spine_outbox" SET status = 'completed' WHERE id = ?`, t.id)
+				} else {
+					nextAttempts := t.attempts + 1
+					if nextAttempts > maxRetries {
+						b.db.Exec(`UPDATE "_spine_outbox" SET status = 'failed', attempts = ? WHERE id = ?`, nextAttempts, t.id)
+					} else {
+						multiplier := 1 << (nextAttempts - 1)
+						if multiplier > 32 {
+							multiplier = 32
+						}
+						nextRetry := time.Now().UTC().Add(time.Duration(backoffMs*multiplier) * time.Millisecond).Format(time.RFC3339)
+						b.db.Exec(`UPDATE "_spine_outbox" SET attempts = ?, next_retry_at = ? WHERE id = ?`, nextAttempts, nextRetry, t.id)
+					}
+				}
+			}(task)
+		}
+		wg.Wait()
 	}
 
 	for {
@@ -84,10 +150,8 @@ func (b *Bus) processOutboxQueue() {
 		case <-b.optimizer.stopCh:
 			return
 		case <-b.outboxNotify:
-			// Immediate wakeup on new enqueue
 			process()
 		case <-ticker.C:
-			// Fallback periodic check for crash recovery
 			process()
 		}
 	}

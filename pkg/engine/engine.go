@@ -353,13 +353,8 @@ func (e *Engine) buildMux() *http.ServeMux {
 	}))
 
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
-		// WebSocket auth check — validate before upgrading the connection
-		if !e.wsAuthCheck(r) {
-			w.Header().Set("Content-Type", "application/json")
-			w.WriteHeader(http.StatusUnauthorized)
-			w.Write([]byte(`{"status":"error","error":"unauthorized: invalid or missing API key"}`))
-			return
-		}
+		// WebSocket auth check — upfront header/query param check
+		authenticated := e.wsAuthCheck(r)
 
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -367,7 +362,10 @@ func (e *Engine) buildMux() *http.ServeMux {
 			return
 		}
 		client := &WsClient{Conn: conn, Send: make(chan []byte, 256)}
-		e.Hub.Register <- client
+		
+		if authenticated {
+			e.Hub.Register <- client
+		}
 
 		go func() {
 			defer conn.Close()
@@ -380,28 +378,70 @@ func (e *Engine) buildMux() *http.ServeMux {
 		}()
 
 		go func() {
-			defer func() { e.Hub.Unregister <- client; conn.Close() }()
+			defer func() {
+				if authenticated {
+					e.Hub.Unregister <- client
+				}
+				conn.Close()
+			}()
 			for {
 				_, message, err := conn.ReadMessage()
 				if err != nil {
 					break
 				}
+
+				var raw map[string]interface{}
+				if err := json.Unmarshal(message, &raw); err != nil {
+					continue
+				}
+
+				// Handle in-band WS authentication handshake (for browser clients)
+				if msgType, _ := raw["type"].(string); msgType == "auth" {
+					token, _ := raw["token"].(string)
+					if e.APIKey == "" || token == e.APIKey {
+						if !authenticated {
+							authenticated = true
+							e.Hub.Register <- client
+						}
+						ack := map[string]interface{}{"type": "auth_ack", "status": "ok"}
+						ackBytes, _ := json.Marshal(ack)
+						select {
+						case client.Send <- ackBytes:
+						default:
+						}
+					} else {
+						ack := map[string]interface{}{"type": "auth_ack", "status": "error", "error": "invalid API key"}
+						ackBytes, _ := json.Marshal(ack)
+						select {
+						case client.Send <- ackBytes:
+						default:
+						}
+					}
+					continue
+				}
+
+				// Handle event emit request
 				var req struct {
 					Event   string                 `json:"event"`
 					Payload map[string]interface{} `json:"payload"`
 				}
 				if err := json.Unmarshal(message, &req); err == nil && req.Event != "" {
-					if req.Payload == nil {
-						req.Payload = make(map[string]interface{})
-					}
-					result, err := e.Bus.Emit(req.Event, req.Payload)
 					ack := map[string]interface{}{"type": "event_ack", "event": req.Event}
-					if err != nil {
+					if !authenticated {
 						ack["status"] = "error"
-						ack["error"] = err.Error()
+						ack["error"] = "unauthorized: authentication required"
 					} else {
-						ack["status"] = "ok"
-						ack["result"] = result
+						if req.Payload == nil {
+							req.Payload = make(map[string]interface{})
+						}
+						result, err := e.Bus.Emit(req.Event, req.Payload)
+						if err != nil {
+							ack["status"] = "error"
+							ack["error"] = err.Error()
+						} else {
+							ack["status"] = "ok"
+							ack["result"] = result
+						}
 					}
 					ackBytes, _ := json.Marshal(ack)
 					select {

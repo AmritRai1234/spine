@@ -115,14 +115,6 @@ var statesPool = sync.Pool{
 	},
 }
 
-// Pool for sorted key slices — avoids alloc on every insert/update
-var sortedKeysPool = sync.Pool{
-	New: func() interface{} {
-		s := make([]string, 0, 16)
-		return &s
-	},
-}
-
 // sqlTemplate holds a pre-built SQL string and the deterministic column order.
 // Cached per table+columns fingerprint to eliminate per-call string building.
 type sqlTemplate struct {
@@ -423,6 +415,12 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 		}, nil
 	}
 
+	// Capture initial trigger payload copy to guarantee preservation in on_failure handlers
+	origPayload := make(map[string]interface{}, len(payload))
+	for k, v := range payload {
+		origPayload[k] = v
+	}
+
 	// Pool the emittedStates slice to reduce GC pressure on high-throughput paths
 	statesPtr := statesPool.Get().(*[]string)
 	emittedStates := (*statesPtr)[:0]
@@ -441,19 +439,28 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 			var errMu sync.Mutex
 			var stepErr error
 			var failedStep *manifest.RouteStep
+			var failedIdx int
+
 			for i := range route.Steps {
 				wg.Add(1)
-				go func(s *manifest.RouteStep) {
+				// Deep-copy payload map for each goroutine to prevent concurrent map write races
+				stepPayload := make(map[string]interface{}, len(payload))
+				for k, v := range payload {
+					stepPayload[k] = v
+				}
+				idx := i
+				go func(s *manifest.RouteStep, p map[string]interface{}, stepIndex int) {
 					defer wg.Done()
-					if err := b.execStep(s, event, payload); err != nil {
+					if err := b.execStep(s, event, p); err != nil {
 						errMu.Lock()
 						if stepErr == nil {
 							stepErr = err
 							failedStep = s
+							failedIdx = stepIndex
 						}
 						errMu.Unlock()
 					}
-				}(&route.Steps[i])
+				}(&route.Steps[i], stepPayload, idx)
 			}
 			wg.Wait()
 			if stepErr != nil {
@@ -462,12 +469,12 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 					onFailure = failedStep.OnFailure
 				}
 				if onFailure != "" {
-					return b.handleRouteFailure(onFailure, event, payload, failedStep, stepErr, depth, &emittedStates)
+					return b.handleRouteFailure(onFailure, event, payload, origPayload, failedStep, failedIdx, stepErr, depth, &emittedStates)
 				}
 				return nil, fmt.Errorf("parallel step execution failed: %w", stepErr)
 			}
 		} else {
-			for _, step := range route.Steps {
+			for i, step := range route.Steps {
 				if err := b.execStep(&step, event, payload); err != nil {
 					execErr := fmt.Errorf("step execution failed (action=%s, table=%s): %w", step.Action, step.Table, err)
 					onFailure := step.OnFailure
@@ -475,7 +482,7 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 						onFailure = route.OnFailure
 					}
 					if onFailure != "" {
-						return b.handleRouteFailure(onFailure, event, payload, &step, execErr, depth, &emittedStates)
+						return b.handleRouteFailure(onFailure, event, payload, origPayload, &step, i, execErr, depth, &emittedStates)
 					}
 					return nil, execErr
 				}
@@ -516,16 +523,43 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 	}, nil
 }
 
-func (b *Bus) handleRouteFailure(onFailureState string, event string, payload map[string]interface{}, step *manifest.RouteStep, stepErr error, depth int, emittedStates *[]string) (map[string]interface{}, error) {
-	errPayload := make(map[string]interface{}, len(payload)+4)
-	for k, v := range payload {
+func (b *Bus) handleRouteFailure(onFailureState string, event string, currentPayload map[string]interface{}, origPayload map[string]interface{}, step *manifest.RouteStep, stepIdx int, stepErr error, depth int, emittedStates *[]string) (map[string]interface{}, error) {
+	errPayload := make(map[string]interface{}, len(currentPayload)+len(origPayload)+5)
+	// Preserve all keys from current payload state
+	for k, v := range currentPayload {
 		errPayload[k] = v
+	}
+	// Restore any original keys that might have been lost/deleted during failed step execution
+	for k, v := range origPayload {
+		if _, exists := errPayload[k]; !exists {
+			errPayload[k] = v
+		}
 	}
 	errPayload["error"] = stepErr.Error()
 	errPayload["failed_event"] = event
 	if step != nil {
 		errPayload["failed_action"] = step.Action
 	}
+
+	// Build immutable _error_context object
+	origCopy := make(map[string]interface{}, len(origPayload))
+	for k, v := range origPayload {
+		origCopy[k] = v
+	}
+	errCtx := map[string]interface{}{
+		"original_payload": origCopy,
+		"failed_event":     event,
+		"step_index":       stepIdx,
+		"error":            stepErr.Error(),
+		"timestamp":        time.Now().UTC().Format(time.RFC3339Nano),
+	}
+	if step != nil {
+		errCtx["failed_action"] = step.Action
+		if step.Table != "" {
+			errCtx["failed_table"] = step.Table
+		}
+	}
+	errPayload["_error_context"] = errCtx
 
 	b.SetState(onFailureState, errPayload)
 	b.hub.BroadcastState(onFailureState, event, errPayload)
@@ -696,6 +730,20 @@ func (b *Bus) ensureTable(table string, colDefs []string) error {
 	return nil
 }
 
+func normalizeParam(v interface{}, eventName string, payload map[string]interface{}) interface{} {
+	if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
+		return ResolveVariables(strVal, eventName, payload)
+	}
+	switch val := v.(type) {
+	case map[string]interface{}, []interface{}, []string, map[string]string:
+		bytes, err := json.Marshal(val)
+		if err == nil {
+			return string(bytes)
+		}
+	}
+	return v
+}
+
 func (b *Bus) dbInsert(table string, eventName string, payload map[string]interface{}) error {
 	n := len(payload)
 	if n == 0 {
@@ -705,8 +753,7 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 	table = b.sanitizeIdentCached(table)
 
 	// Deterministic key ordering: sort payload keys for stable SQL + caching
-	keysPtr := sortedKeysPool.Get().(*[]string)
-	keys := (*keysPtr)[:0]
+	keys := make([]string, 0, n)
 	for k := range payload {
 		keys = append(keys, k)
 	}
@@ -748,8 +795,6 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 
 		// Ensure table exists (only on first encounter of this fingerprint)
 		if err := b.ensureTable(table, colDefs); err != nil {
-			*keysPtr = keys
-			sortedKeysPool.Put(keysPtr)
 			return err
 		}
 
@@ -787,17 +832,10 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 	// Build values in deterministic column order
 	values := make([]interface{}, n)
 	for i, k := range keys {
-		v := payload[k]
-		if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
-			values[i] = ResolveVariables(strVal, eventName, payload)
-		} else {
-			values[i] = v
-		}
+		values[i] = normalizeParam(payload[k], eventName, payload)
 	}
 
-	// Return sorted keys to pool
-	*keysPtr = keys
-	sortedKeysPool.Put(keysPtr)
+
 
 	if !b.writer.submit(table, dbTask{query: tmpl.sql, params: values}) {
 		// All shards full — async overflow
@@ -824,8 +862,7 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 	}
 
 	// Deterministic key ordering: sort payload keys for stable SQL + caching
-	keysPtr := sortedKeysPool.Get().(*[]string)
-	keys := (*keysPtr)[:0]
+	keys := make([]string, 0, n)
 	for k := range payload {
 		keys = append(keys, k)
 	}
@@ -876,8 +913,6 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 
 		// Ensure table exists (only on first encounter of this fingerprint)
 		if err := b.ensureTable(table, colDefs); err != nil {
-			*keysPtr = keys
-			sortedKeysPool.Put(keysPtr)
 			return err
 		}
 
@@ -918,18 +953,11 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 		if k == whereKey {
 			continue
 		}
-		v := payload[k]
-		if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
-			params = append(params, ResolveVariables(strVal, eventName, payload))
-		} else {
-			params = append(params, v)
-		}
+		params = append(params, normalizeParam(payload[k], eventName, payload))
 	}
-	params = append(params, payload[whereKey])
+	params = append(params, normalizeParam(payload[whereKey], eventName, payload))
 
-	// Return sorted keys to pool
-	*keysPtr = keys
-	sortedKeysPool.Put(keysPtr)
+
 
 	if !b.writer.submit(table, dbTask{query: tmpl.sql, params: params}) {
 		if _, err := b.db.Exec(tmpl.sql, params...); err != nil {
@@ -1039,12 +1067,15 @@ func (b *Bus) dbUpsert(table string, conflictKey string, eventName string, paylo
 		return nil
 	}
 
+	if _, exists := payload[conflictKey]; !exists {
+		return fmt.Errorf("db.upsert failed: conflict key '%s' not present in payload", conflictKey)
+	}
+
 	table = b.sanitizeIdentCached(table)
 	safeConflictKey := b.sanitizeIdentCached(conflictKey)
 
 	// Deterministic key ordering
-	keysPtr := sortedKeysPool.Get().(*[]string)
-	keys := (*keysPtr)[:0]
+	keys := make([]string, 0, n)
 	for k := range payload {
 		keys = append(keys, k)
 	}
@@ -1087,8 +1118,6 @@ func (b *Bus) dbUpsert(table string, conflictKey string, eventName string, paylo
 		}
 
 		if err := b.ensureTable(table, colDefs); err != nil {
-			*keysPtr = keys
-			sortedKeysPool.Put(keysPtr)
 			return err
 		}
 
@@ -1148,16 +1177,10 @@ func (b *Bus) dbUpsert(table string, conflictKey string, eventName string, paylo
 	// Build values in deterministic column order
 	values := make([]interface{}, n)
 	for i, k := range keys {
-		v := payload[k]
-		if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
-			values[i] = ResolveVariables(strVal, eventName, payload)
-		} else {
-			values[i] = v
-		}
+		values[i] = normalizeParam(payload[k], eventName, payload)
 	}
 
-	*keysPtr = keys
-	sortedKeysPool.Put(keysPtr)
+
 
 	if !b.writer.submit(table, dbTask{query: tmpl.sql, params: values}) {
 		go func(t dbTask) {

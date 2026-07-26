@@ -2,11 +2,25 @@ package manifest
 
 // SpineSchema holds the full parsed manifest.
 type SpineSchema struct {
-	SpineVersion int      `json:"spine_version"`
-	Includes     []string `json:"includes,omitempty"`
-	DbTables     []string `json:"db_tables"`
-	Nodes        []Node   `json:"nodes"`
-	Routes       []Route  `json:"routes"`
+	SpineVersion int            `json:"spine_version"`
+	Includes     []string       `json:"includes,omitempty"`
+	DbTables     []string       `json:"db_tables"`
+	Database     DatabaseConfig `json:"database,omitempty"`
+	Nodes        []Node         `json:"nodes"`
+	Routes       []Route        `json:"routes"`
+}
+
+// OutboxConfig holds configuration for durable outbox worker pool retries.
+type OutboxConfig struct {
+	MaxWorkers int `json:"max_workers,omitempty"`
+	MaxRetries int `json:"max_retries,omitempty"`
+	BackoffMs  int `json:"backoff_ms,omitempty"`
+}
+
+// DatabaseConfig holds database configuration including table definitions and outbox settings.
+type DatabaseConfig struct {
+	Tables []string     `json:"tables,omitempty"`
+	Outbox OutboxConfig `json:"outbox,omitempty"`
 }
 
 // Node represents a UI page or backend service declared in the manifest.

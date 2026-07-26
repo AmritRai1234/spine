@@ -16,6 +16,7 @@ const (
 	sIncludes
 	sDatabase
 	sDbTables
+	sDbOutbox
 	sNodes
 	sNodeBody
 	sNodeOwnFiles
@@ -211,18 +212,54 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 		}
 
 		// ===== DATABASE =====
-		if state == sDatabase && indent == 1 && trimmed == "tables:" {
-			state = sDbTables
-			continue
+		if state == sDatabase || state == sDbTables || state == sDbOutbox {
+			if indent == 1 {
+				if trimmed == "tables:" {
+					state = sDbTables
+					continue
+				}
+				if trimmed == "outbox:" {
+					state = sDbOutbox
+					continue
+				}
+			}
 		}
+
 		if state == sDbTables {
 			if indent == 2 && isListItem(trimmed) {
 				tableName := unquote(trimmed[2:])
 				if !seenTables[tableName] {
 					schema.DbTables = append(schema.DbTables, tableName)
+					schema.Database.Tables = append(schema.Database.Tables, tableName)
 					seenTables[tableName] = true
 				}
 				continue
+			}
+			if indent <= 1 {
+				state = sTop
+			}
+		}
+
+		if state == sDbOutbox {
+			if indent == 2 {
+				if v, ok := kvValue(trimmed, "max_workers"); ok {
+					if n, err := strconv.Atoi(v); err == nil {
+						schema.Database.Outbox.MaxWorkers = n
+					}
+					continue
+				}
+				if v, ok := kvValue(trimmed, "max_retries"); ok {
+					if n, err := strconv.Atoi(v); err == nil {
+						schema.Database.Outbox.MaxRetries = n
+					}
+					continue
+				}
+				if v, ok := kvValue(trimmed, "backoff_ms"); ok {
+					if n, err := strconv.Atoi(v); err == nil {
+						schema.Database.Outbox.BackoffMs = n
+					}
+					continue
+				}
 			}
 			if indent <= 1 {
 				state = sTop
