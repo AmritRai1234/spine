@@ -10,7 +10,7 @@
   <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/allocs-25%20per%20emit-purple?style=flat-square" alt="Allocs"></a>
   <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-v2.2.0-00ADD8?style=flat-square&logo=go" alt="Go"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPLv3-blue?style=flat-square" alt="License"></a>
-  <a href="#tests"><img src="https://img.shields.io/badge/tests-24%2F24%20pass-brightgreen?style=flat-square" alt="Tests"></a>
+  <a href="#tests"><img src="https://img.shields.io/badge/tests-38%2F38%20pass-brightgreen?style=flat-square" alt="Tests"></a>
 </p>
 
 ---
@@ -30,6 +30,7 @@ Client Event → Load Balancer → Spine Node (Auth & Rate Limit) → Event Bus 
 - [Why Spine?](#why-spine)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [Building a Website with Spine](#building-a-website-with-spine)
 - [The `.spine` Manifest Specification](#the-spine-manifest-specification)
 - [HTTP & WebSocket API Reference](#http--websocket-api-reference)
 - [Go SDK / Embedding Guide](#go-sdk--embedding-guide)
@@ -148,6 +149,9 @@ curl http://localhost:8080/tables
 # Query table rows
 curl http://localhost:8080/tables/leads?limit=10
 
+# Filter by column value
+curl http://localhost:8080/tables/leads?where=status:active&limit=20
+
 # Query event audit log
 curl http://localhost:8080/events?event=SUBMIT_LEAD&limit=20
 ```
@@ -167,6 +171,139 @@ ws.send(JSON.stringify({
   payload: { email: "ws@example.com", name: "WS User" }
 }));
 ```
+
+---
+
+## Building a Website with Spine
+
+A complete example showing how a frontend app talks to Spine. No Go code required — just a `.spine` manifest and JavaScript.
+
+### Full Manifest Example
+
+```yaml
+spine_version: 1
+
+database:
+  tables:
+    - users
+    - posts
+
+nodes:
+  Frontend:
+    emits:
+      - event: REGISTER_USER
+        payload:
+          email: string
+          name: string
+          age: number        # → SQLite REAL (enables numeric sorting)
+          active: boolean    # → SQLite INTEGER
+
+      - event: CREATE_POST
+        payload:
+          title: string
+          author_email: string
+
+    listens:
+      - state: USER_REGISTERED
+      - state: POST_CREATED
+
+routes:
+  # Register a user — auto-generate ID and timestamp
+  - on: REGISTER_USER
+    steps:
+      - action: set
+        id: $uuid
+        created_at: $now
+      - action: db.upsert
+        table: users
+        key: email
+    emit: USER_REGISTERED
+
+  # Create a post
+  - on: CREATE_POST
+    steps:
+      - action: set
+        id: $uuid
+        created_at: $now
+      - action: db.insert
+        table: posts
+      - action: log.write
+        message: "New post '$event.payload.title' by $event.payload.author_email"
+    emit: POST_CREATED
+```
+
+### JavaScript — Emit Events
+
+```javascript
+const SPINE = 'http://localhost:8080';
+const API_KEY = 'your-api-key';
+
+// Register a user
+async function registerUser(email, name, age) {
+  const res = await fetch(`${SPINE}/emit`, {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'X-API-Key': API_KEY
+    },
+    body: JSON.stringify({
+      event: 'REGISTER_USER',
+      payload: { email, name, age, active: true }
+    })
+  });
+  return res.json();
+}
+```
+
+### JavaScript — Query Data
+
+```javascript
+// Get all users
+const users = await fetch(`${SPINE}/tables/users`, {
+  headers: { 'X-API-Key': API_KEY }
+}).then(r => r.json());
+
+// Filter: get only active users
+const active = await fetch(`${SPINE}/tables/users?where=active:1&limit=50`, {
+  headers: { 'X-API-Key': API_KEY }
+}).then(r => r.json());
+
+// Filter: get posts by a specific author
+const posts = await fetch(`${SPINE}/tables/posts?where=author_email:jane@example.com`, {
+  headers: { 'X-API-Key': API_KEY }
+}).then(r => r.json());
+```
+
+### JavaScript — Real-Time Updates
+
+```javascript
+const ws = new WebSocket(`ws://localhost:8080/ws?token=${API_KEY}`);
+
+ws.onmessage = (event) => {
+  const msg = JSON.parse(event.data);
+  if (msg.type === 'state') {
+    switch (msg.state) {
+      case 'USER_REGISTERED':
+        showNotification(`Welcome ${msg.payload.name}!`);
+        break;
+      case 'POST_CREATED':
+        addPostToFeed(msg.payload);
+        break;
+    }
+  }
+};
+```
+
+### What Spine Handles For You
+
+| You write | Spine does |
+|---|---|
+| `event: REGISTER_USER` with `email: string` | Validates payload types at runtime |
+| `action: set` with `id: $uuid` | Auto-generates UUID and timestamps |
+| `action: db.upsert` with `key: email` | Creates table, adds columns, upserts rows |
+| `age: number` in payload | Creates `REAL` column (not TEXT), enables numeric sorting |
+| `emit: USER_REGISTERED` | Broadcasts to all WebSocket clients instantly |
+| `?where=active:1` | Returns filtered rows with parameterized SQL (injection-safe) |
 
 ---
 
@@ -193,7 +330,8 @@ nodes:                     # Declare UI/service nodes and their event contracts
     emits:                 # Events this node can emit
       - event: EVENT_NAME
         payload:
-          field_name: type # Supported: string, number, boolean, object, array
+          field_name: type # Supported: string, number, integer, boolean
+                           # Maps to SQLite: TEXT, REAL, INTEGER, INTEGER
     listens:               # States this node subscribes to (via WebSocket)
       - state: STATE_NAME
         payload:
@@ -217,7 +355,9 @@ routes:                    # Event → action pipelines
 |---|---|---|
 | `db.insert` | Insert a row into a table | `table` (required) |
 | `db.update` | Update a row (matches on `id` or first key) | `table` (required) |
+| `db.upsert` | Insert or update on conflict | `table` (required), `key` (conflict column, default: `id`) |
 | `db.delete` | Delete a row by `id` or `where` condition | `table`, `where` (optional) |
+| `set` | Inject computed fields into the payload | Any `key: value` pairs (supports `$uuid`, `$now`, etc.) |
 | `log.write` | Write a log message with template variables | `message` (required) |
 | `http.post` | Send an HTTP POST webhook | `url` (required) |
 | `emit` | Emit a chained event | `event`, `payload` (optional) |
@@ -261,7 +401,7 @@ if: "$event.payload.status != 'deleted'"
 | `POST` | `/emit` | Yes | Emit an event with payload |
 | `GET` | `/schema` | Yes | Return parsed manifest schema as JSON |
 | `GET` | `/tables` | Yes | List all database tables |
-| `GET` | `/tables/{name}` | Yes | Query rows from a table (`?limit=50&offset=0`) |
+| `GET` | `/tables/{name}` | Yes | Query rows (`?limit=50&offset=0&where=col:val`) |
 | `GET` | `/events` | Yes | Query event audit log (`?event=NAME&limit=50`) |
 | `GET` | `/metrics` | No | Optimizer mode and batch metrics |
 | `WS` | `/ws` | Yes | Real-time WebSocket (state broadcasts + emit) |
@@ -405,6 +545,26 @@ state, ok := eng.Bus.GetState("USER_PROFILE")
 if ok {
     log.Printf("cached user: %v", state["name"])
 }
+```
+
+### Filtered Queries
+
+```go
+// Query rows with column filter (SQL-injection safe)
+rows, err := eng.Bus.QueryWhere("leads", "status", "active", 50, 0)
+for _, row := range rows {
+    log.Printf("Lead: %v", row["email"])
+}
+```
+
+### Direct Database Access
+
+```go
+// Access Spine's internal DB for custom queries
+// Shares the same connection pool and WAL visibility
+db := eng.Bus.DB()
+var count int
+db.QueryRow(`SELECT COUNT(*) FROM "leads" WHERE status = ?`, "active").Scan(&count)
 ```
 
 ### Schema Inspection
@@ -647,7 +807,7 @@ go test ./tests/ -bench=. -benchmem -count=3
 
 ## Tests
 
-**24/24 tests pass** across 11 test files:
+**38/38 tests pass** across 13 test files:
 
 | Suite | Coverage |
 |---|---|
@@ -662,6 +822,8 @@ go test ./tests/ -bench=. -benchmem -count=3
 | `query_test.go` | GET /tables, GET /events query APIs |
 | `turso_test.go` | Turso/libSQL driver detection |
 | `vars_test.go` | Template variable resolution |
+| `v21_features_test.go` | QueryWhere, DB accessor, RouteStep Config |
+| `v22_features_test.go` | db.upsert, set action, typed columns |
 
 ```bash
 # Run all tests
