@@ -299,7 +299,17 @@ func (e *Engine) buildMux() *http.ServeMux {
 			}
 		}
 
-		rows, err := e.Bus.GetTableRows(tableName, limit, offset)
+		rows, err := func() ([]map[string]interface{}, error) {
+			if whereParam := r.URL.Query().Get("where"); whereParam != "" {
+				// Format: ?where=column:value
+				if idx := strings.Index(whereParam, ":"); idx > 0 {
+					col := whereParam[:idx]
+					val := whereParam[idx+1:]
+					return e.Bus.QueryWhere(tableName, col, val, limit, offset)
+				}
+			}
+			return e.Bus.GetTableRows(tableName, limit, offset)
+		}()
 		if err != nil {
 			w.WriteHeader(400)
 			json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": err.Error()})

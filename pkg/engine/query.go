@@ -107,6 +107,61 @@ func (b *Bus) GetTableRows(table string, limit, offset int) ([]map[string]interf
 	return results, nil
 }
 
+// QueryWhere returns rows from a table filtered by a single column equality condition.
+// Both table and column names are sanitized; the value uses a parameterized query.
+func (b *Bus) QueryWhere(table, column, value string, limit, offset int) ([]map[string]interface{}, error) {
+	table = sanitizeIdent(table)
+	column = sanitizeIdent(column)
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" = ? ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
+		table, column, limit, offset)
+	rows, err := b.db.Query(query, value)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query table '%s' where %s = '%s': %w", table, column, value, err)
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		values := make([]interface{}, len(cols))
+		valuePtrs := make([]interface{}, len(cols))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			continue
+		}
+
+		rowMap := make(map[string]interface{})
+		for i, col := range cols {
+			val := values[i]
+			if bVal, ok := val.([]byte); ok {
+				rowMap[col] = string(bVal)
+			} else {
+				rowMap[col] = val
+			}
+		}
+		results = append(results, rowMap)
+	}
+
+	if results == nil {
+		results = []map[string]interface{}{}
+	}
+	return results, nil
+}
+
 // GetEventLogs queries recent event audit records from the _spine_events table.
 func (b *Bus) GetEventLogs(eventName string, limit, offset int) ([]map[string]interface{}, error) {
 	if limit <= 0 || limit > 500 {

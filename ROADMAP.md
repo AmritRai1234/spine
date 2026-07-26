@@ -77,6 +77,27 @@ Extensible action plugin architecture, pub/sub queues, and modular multi-file ma
 
 ---
 
+## v2.1 — Query Filtering, DB Accessor & RouteStep Config ✅ *SHIPPED*
+
+Developer experience improvements based on real-world app feedback.
+
+- [x] `?where=column:value` filtered queries on `GET /tables/{name}`
+- [x] `Bus.QueryWhere()` Go method for programmatic filtered queries
+- [x] `Bus.DB()` accessor — share Spine's internal `*sql.DB` for custom queries
+- [x] `RouteStep.Config map[string]string` — capture arbitrary YAML keys for custom actions
+
+---
+
+## v2.2 — Upsert, Typed Columns & Computed Fields ✅ *SHIPPED*
+
+Reduce Go boilerplate for common data patterns.
+
+- [x] `db.upsert` action — insert-or-update with `ON CONFLICT` using a `key:` field
+- [x] Typed schema columns — manifest types (`number`, `boolean`, `integer`) map to SQLite `REAL`/`INTEGER`
+- [x] `set` action — inject computed fields (`$uuid`, `$now`, static values) into payload from manifest
+
+---
+
 ## Version Timeline
 
 | Version | Focus | Status |
@@ -87,3 +108,5 @@ Extensible action plugin architecture, pub/sub queues, and modular multi-file ma
 | **v1.3** | Conditional Logic, Parallel Execution & Adaptive Engine | ✅ Shipped |
 | **v1.4** | Query & Read API (`GET /tables`, `GET /events`) | ✅ Shipped |
 | **v2.0** | Plugins, Pub/Sub Queues & Multi-File Manifests | ✅ Shipped |
+| **v2.1** | Query Filtering, DB Accessor & RouteStep Config | ✅ Shipped |
+| **v2.2** | Upsert, Typed Columns & Computed Fields | ✅ Shipped |

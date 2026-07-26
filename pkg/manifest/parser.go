@@ -454,6 +454,16 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 					curStep.Where = unquote(v)
 					continue
 				}
+				// Capture unknown key:value pairs into Config map for custom actions
+				if idx := strings.Index(trimmed, ":"); idx > 0 {
+					key := strings.TrimSpace(trimmed[:idx])
+					val := strings.TrimSpace(trimmed[idx+1:])
+					if curStep.Config == nil {
+						curStep.Config = make(map[string]string)
+					}
+					curStep.Config[key] = unquote(val)
+					continue
+				}
 			}
 
 			continue

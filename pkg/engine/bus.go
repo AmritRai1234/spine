@@ -154,6 +154,7 @@ type Bus struct {
 	identCache    sync.Map // sanitizeIdent result cache
 	insertSQLCache sync.Map // "table|col1,col2" → *sqlTemplate
 	updateSQLCache sync.Map // "table|whereKey|col1,col2" → *sqlTemplate
+	upsertSQLCache sync.Map // "table|conflictKey|col1,col2" → *sqlTemplate
 
 	// In-memory RAM State Cache
 	stateMu    sync.RWMutex
@@ -384,6 +385,12 @@ func (b *Bus) GetRegistry() *manifest.Registry {
 	return (*manifest.Registry)(atomic.LoadPointer(&b.registry))
 }
 
+// DB returns the underlying *sql.DB connection for advanced queries.
+// Shares the same connection pool and WAL visibility as Spine's internal writes.
+func (b *Bus) DB() *sql.DB {
+	return b.db
+}
+
 // Emit dispatches an event: validates the payload, runs route steps,
 // persists to SQLite, and broadcasts any emitted states over WS.
 func (b *Bus) Emit(event string, payload map[string]interface{}) (map[string]interface{}, error) {
@@ -533,10 +540,20 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		if step.Table != "" {
 			return b.dbUpdate(step.Table, eventName, payload)
 		}
+	case "db.upsert":
+		if step.Table != "" {
+			key := step.Config["key"]
+			if key == "" {
+				key = "id"
+			}
+			return b.dbUpsert(step.Table, key, eventName, payload)
+		}
 	case "db.delete":
 		if step.Table != "" {
 			return b.dbDelete(step.Table, step.Where, eventName, payload)
 		}
+	case "set":
+		return b.setFields(step, eventName, payload)
 	case "http.post":
 		return b.httpPost(step, eventName, payload)
 	case "log.write":
@@ -663,10 +680,17 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 	if cached, ok := b.insertSQLCache.Load(fingerprint); ok {
 		tmpl = cached.(*sqlTemplate)
 	} else {
-		// Build column definitions without fmt.Sprintf
+		// Build typed column definitions from manifest field types
+		fieldTypes := b.GetRegistry().GetFieldTypes(eventName)
 		colDefs := make([]string, n)
 		for i, safe := range sanitizedKeys {
-			colDefs[i] = `"` + safe + `" TEXT`
+			sqlType := "TEXT"
+			if fieldTypes != nil {
+				if ft, ok := fieldTypes[keys[i]]; ok {
+					sqlType = sqliteType(ft)
+				}
+			}
+			colDefs[i] = `"` + safe + `" ` + sqlType
 		}
 
 		// Ensure table exists (only on first encounter of this fingerprint)
@@ -784,10 +808,17 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 	if cached, ok := b.updateSQLCache.Load(fingerprint); ok {
 		tmpl = cached.(*sqlTemplate)
 	} else {
-		// Build column definitions without fmt.Sprintf
+		// Build typed column definitions from manifest field types
+		fieldTypes := b.GetRegistry().GetFieldTypes(eventName)
 		colDefs := make([]string, n)
 		for i, safe := range sanitizedKeys {
-			colDefs[i] = `"` + safe + `" TEXT`
+			sqlType := "TEXT"
+			if fieldTypes != nil {
+				if ft, ok := fieldTypes[keys[i]]; ok {
+					sqlType = sqliteType(ft)
+				}
+			}
+			colDefs[i] = `"` + safe + `" ` + sqlType
 		}
 
 		// Ensure table exists (only on first encounter of this fingerprint)
@@ -922,5 +953,164 @@ func (b *Bus) logWrite(step *manifest.RouteStep, eventName string, payload map[s
 	}
 	resolvedMsg := ResolveVariables(msg, eventName, payload)
 	log.Printf("[SPINE LOG] %s", resolvedMsg)
+	return nil
+}
+
+// sqliteType maps a manifest field type to the corresponding SQLite column type.
+func sqliteType(fieldType string) string {
+	switch strings.ToLower(fieldType) {
+	case "number", "float":
+		return "REAL"
+	case "int", "integer":
+		return "INTEGER"
+	case "boolean", "bool":
+		return "INTEGER"
+	default:
+		return "TEXT"
+	}
+}
+
+// setFields merges key-value pairs from step.Config into the event payload.
+// Values are resolved through ResolveVariables, so $uuid, $now, $event.payload.X work.
+func (b *Bus) setFields(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
+	for key, val := range step.Config {
+		resolved := ResolveVariables(val, eventName, payload)
+		payload[key] = resolved
+	}
+	return nil
+}
+
+func (b *Bus) dbUpsert(table string, conflictKey string, eventName string, payload map[string]interface{}) error {
+	n := len(payload)
+	if n == 0 {
+		return nil
+	}
+
+	table = b.sanitizeIdentCached(table)
+	safeConflictKey := b.sanitizeIdentCached(conflictKey)
+
+	// Deterministic key ordering
+	keysPtr := sortedKeysPool.Get().(*[]string)
+	keys := (*keysPtr)[:0]
+	for k := range payload {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Build cache fingerprint
+	var fpBuf strings.Builder
+	fpBuf.Grow(len(table) + len(safeConflictKey) + n*10)
+	fpBuf.WriteString(table)
+	fpBuf.WriteByte('|')
+	fpBuf.WriteString(safeConflictKey)
+	fpBuf.WriteByte('|')
+	sanitizedKeys := make([]string, n)
+	for i, k := range keys {
+		safe := b.sanitizeIdentCached(k)
+		sanitizedKeys[i] = safe
+		if i > 0 {
+			fpBuf.WriteByte(',')
+		}
+		fpBuf.WriteString(safe)
+	}
+	fingerprint := fpBuf.String()
+
+	// Lookup or build the SQL template
+	var tmpl *sqlTemplate
+	if cached, ok := b.upsertSQLCache.Load(fingerprint); ok {
+		tmpl = cached.(*sqlTemplate)
+	} else {
+		// Build typed column definitions
+		fieldTypes := b.GetRegistry().GetFieldTypes(eventName)
+		colDefs := make([]string, n)
+		for i, safe := range sanitizedKeys {
+			sqlType := "TEXT"
+			if fieldTypes != nil {
+				if ft, ok := fieldTypes[keys[i]]; ok {
+					sqlType = sqliteType(ft)
+				}
+			}
+			colDefs[i] = `"` + safe + `" ` + sqlType
+		}
+
+		if err := b.ensureTable(table, colDefs); err != nil {
+			*keysPtr = keys
+			sortedKeysPool.Put(keysPtr)
+			return err
+		}
+
+		// Create unique index on conflict key if not exists
+		idxSQL := fmt.Sprintf(`CREATE UNIQUE INDEX IF NOT EXISTS "uq_%s_%s" ON "%s"("%s")`,
+			table, safeConflictKey, table, safeConflictKey)
+		_, _ = b.db.Exec(idxSQL)
+
+		// Build: INSERT INTO "t" ("a","b") VALUES (?,?) ON CONFLICT("key") DO UPDATE SET "a"=excluded."a"
+		var sb strings.Builder
+		sb.Grow(128 + len(table) + n*24)
+		sb.WriteString(`INSERT INTO "`)
+		sb.WriteString(table)
+		sb.WriteString(`" (`)
+		for i, safe := range sanitizedKeys {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteByte('"')
+			sb.WriteString(safe)
+			sb.WriteByte('"')
+		}
+		sb.WriteString(") VALUES (")
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteByte('?')
+		}
+		sb.WriteString(`) ON CONFLICT("`)
+		sb.WriteString(safeConflictKey)
+		sb.WriteString(`") DO UPDATE SET `)
+		first := true
+		for _, safe := range sanitizedKeys {
+			if safe == safeConflictKey {
+				continue
+			}
+			if !first {
+				sb.WriteString(", ")
+			}
+			sb.WriteByte('"')
+			sb.WriteString(safe)
+			sb.WriteString(`" = excluded."`)
+			sb.WriteString(safe)
+			sb.WriteByte('"')
+			first = false
+		}
+
+		tmpl = &sqlTemplate{
+			sql:      sb.String(),
+			colOrder: sanitizedKeys,
+			colDefs:  colDefs,
+		}
+		b.upsertSQLCache.Store(fingerprint, tmpl)
+	}
+
+	// Build values in deterministic column order
+	values := make([]interface{}, n)
+	for i, k := range keys {
+		v := payload[k]
+		if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
+			values[i] = ResolveVariables(strVal, eventName, payload)
+		} else {
+			values[i] = v
+		}
+	}
+
+	*keysPtr = keys
+	sortedKeysPool.Put(keysPtr)
+
+	if !b.writer.submit(table, dbTask{query: tmpl.sql, params: values}) {
+		go func(t dbTask) {
+			b.writer.submit(table, t)
+		}(dbTask{query: tmpl.sql, params: values})
+	}
+
 	return nil
 }

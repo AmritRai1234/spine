@@ -46,13 +46,14 @@ type Route struct {
 
 // RouteStep is a single action within a route (e.g. db.insert).
 type RouteStep struct {
-	Action      string `json:"action"`
-	IfCondition string `json:"if_condition,omitempty"`
-	Table       string `json:"table,omitempty"`
-	Input       string `json:"input,omitempty"`
-	URL         string `json:"url,omitempty"`
-	Message     string `json:"message,omitempty"`
-	Where       string `json:"where,omitempty"`
-	MaxAttempts int    `json:"max_attempts,omitempty"`
-	BackoffMs   int    `json:"backoff_ms,omitempty"`
+	Action      string            `json:"action"`
+	IfCondition string            `json:"if_condition,omitempty"`
+	Table       string            `json:"table,omitempty"`
+	Input       string            `json:"input,omitempty"`
+	URL         string            `json:"url,omitempty"`
+	Message     string            `json:"message,omitempty"`
+	Where       string            `json:"where,omitempty"`
+	MaxAttempts int               `json:"max_attempts,omitempty"`
+	BackoffMs   int               `json:"backoff_ms,omitempty"`
+	Config      map[string]string `json:"config,omitempty"`
 }

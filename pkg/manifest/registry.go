@@ -115,3 +115,18 @@ func (r *Registry) GetNode(name string) (*Node, bool) {
 	n, ok := d.nodes[name]
 	return n, ok
 }
+
+// GetFieldTypes returns a map of field name → declared type for an event.
+// Returns nil if the event has no declared fields. Lock-free.
+func (r *Registry) GetFieldTypes(event string) map[string]string {
+	d := r.load()
+	fields, ok := d.eventEmits[event]
+	if !ok {
+		return nil
+	}
+	result := make(map[string]string, len(fields))
+	for _, f := range fields {
+		result[f.Name] = f.FieldType
+	}
+	return result
+}
