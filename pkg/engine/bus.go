@@ -440,6 +440,7 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 			var wg sync.WaitGroup
 			var errMu sync.Mutex
 			var stepErr error
+			var failedStep *manifest.RouteStep
 			for i := range route.Steps {
 				wg.Add(1)
 				go func(s *manifest.RouteStep) {
@@ -448,6 +449,7 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 						errMu.Lock()
 						if stepErr == nil {
 							stepErr = err
+							failedStep = s
 						}
 						errMu.Unlock()
 					}
@@ -455,12 +457,27 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 			}
 			wg.Wait()
 			if stepErr != nil {
+				onFailure := route.OnFailure
+				if failedStep != nil && failedStep.OnFailure != "" {
+					onFailure = failedStep.OnFailure
+				}
+				if onFailure != "" {
+					return b.handleRouteFailure(onFailure, event, payload, failedStep, stepErr, depth, &emittedStates)
+				}
 				return nil, fmt.Errorf("parallel step execution failed: %w", stepErr)
 			}
 		} else {
 			for _, step := range route.Steps {
 				if err := b.execStep(&step, event, payload); err != nil {
-					return nil, fmt.Errorf("step execution failed (action=%s, table=%s): %w", step.Action, step.Table, err)
+					execErr := fmt.Errorf("step execution failed (action=%s, table=%s): %w", step.Action, step.Table, err)
+					onFailure := step.OnFailure
+					if onFailure == "" {
+						onFailure = route.OnFailure
+					}
+					if onFailure != "" {
+						return b.handleRouteFailure(onFailure, event, payload, &step, execErr, depth, &emittedStates)
+					}
+					return nil, execErr
 				}
 			}
 		}
@@ -497,6 +514,42 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 		"routes_matched": len(routes),
 		"emitted_states": resStates,
 	}, nil
+}
+
+func (b *Bus) handleRouteFailure(onFailureState string, event string, payload map[string]interface{}, step *manifest.RouteStep, stepErr error, depth int, emittedStates *[]string) (map[string]interface{}, error) {
+	errPayload := make(map[string]interface{}, len(payload)+4)
+	for k, v := range payload {
+		errPayload[k] = v
+	}
+	errPayload["error"] = stepErr.Error()
+	errPayload["failed_event"] = event
+	if step != nil {
+		errPayload["failed_action"] = step.Action
+	}
+
+	b.SetState(onFailureState, errPayload)
+	b.hub.BroadcastState(onFailureState, event, errPayload)
+	*emittedStates = append(*emittedStates, onFailureState)
+
+	reg := b.GetRegistry()
+	if _, hasChained := reg.GetRoutes(onFailureState); hasChained {
+		chainedRes, _ := b.EmitWithDepth(onFailureState, errPayload, depth+1)
+		if chainedRes != nil {
+			if chainedStates, ok := chainedRes["emitted_states"].([]string); ok {
+				*emittedStates = append(*emittedStates, chainedStates...)
+			}
+		}
+	}
+
+	resStates := make([]string, len(*emittedStates))
+	copy(resStates, *emittedStates)
+
+	return map[string]interface{}{
+		"status":         "error",
+		"error":          stepErr.Error(),
+		"event":          event,
+		"emitted_states": resStates,
+	}, stepErr
 }
 
 func (b *Bus) execStep(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {

@@ -406,6 +406,16 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 					state = sRouteBody
 					continue
 				}
+				if v, ok := kvValue(trimmed, "on_failure"); ok {
+					curRoute.OnFailure = unquote(v)
+					state = sRouteBody
+					continue
+				}
+				if v, ok := kvValue(trimmed, "on_error"); ok {
+					curRoute.OnFailure = unquote(v)
+					state = sRouteBody
+					continue
+				}
 			}
 
 			if (state == sRouteSteps || state == sRouteStepBody) && indent == 3 && curRoute != nil {
@@ -452,6 +462,14 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				}
 				if v, ok := kvValue(trimmed, "where"); ok {
 					curStep.Where = unquote(v)
+					continue
+				}
+				if v, ok := kvValue(trimmed, "on_failure"); ok {
+					curStep.OnFailure = unquote(v)
+					continue
+				}
+				if v, ok := kvValue(trimmed, "on_error"); ok {
+					curStep.OnFailure = unquote(v)
 					continue
 				}
 				// Capture unknown key:value pairs into Config map for custom actions
@@ -538,11 +556,20 @@ func validateSchema(file string, schema *SpineSchema) error {
 
 		// Route referencing an event not declared by any node (warning-grade: only if nodes exist)
 		if len(schema.Nodes) > 0 && !knownEvents[route.OnEvent] {
-			// Check if the route.OnEvent matches an emitted state (chained events are valid)
+			// Check if the route.OnEvent matches an emitted state or failure state (chained events are valid)
 			isChainedState := false
 			for _, r := range schema.Routes {
-				if r.EmitState == route.OnEvent {
+				if r.EmitState == route.OnEvent || r.OnFailure == route.OnEvent {
 					isChainedState = true
+					break
+				}
+				for _, step := range r.Steps {
+					if step.OnFailure == route.OnEvent {
+						isChainedState = true
+						break
+					}
+				}
+				if isChainedState {
 					break
 				}
 			}

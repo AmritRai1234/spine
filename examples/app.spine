@@ -50,11 +50,22 @@ nodes:
         payload:
           title: string
           source_url: string
+      - event: PROCESS_PIPELINE
+        payload:
+          project_id: string
+          progress: int
+          score: float
+          duration: float
+          segment_count: int
     listens:
       - state: PROJECT_CREATED
         payload:
           project_id: string
           status: string
+      - state: PROCESSING_FAILED
+        payload:
+          error: string
+          failed_action: string
 
 routes:
   # Submit Lead Route (with parallel execution)
@@ -93,3 +104,19 @@ routes:
         table: projects
         input: "$event.payload"
     emit: PROJECT_CREATED
+
+  # Pipeline Processing Route (with error route on failure)
+  - on: PROCESS_PIPELINE
+    on_failure: PROCESSING_FAILED
+    steps:
+      - action: pipeline.run
+        timeout_sec: 30
+      - action: db.insert
+        table: clips
+
+  - on: PROCESSING_FAILED
+    steps:
+      - action: db.insert
+        table: audit_logs
+      - action: log.write
+        message: "[ERROR] Pipeline failed: $event.payload.error"

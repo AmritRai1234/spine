@@ -341,12 +341,39 @@ routes:                    # Event → action pipelines
   - on: EVENT_NAME         # Trigger event
     if: "condition"        # Optional. Route-level guard condition
     parallel: true         # Optional. Execute steps concurrently
+    on_failure: FAILURE_STATE # Optional. Failure state to emit if route steps fail
     steps:
       - action: ACTION     # Step action (see Actions Reference)
         if: "condition"    # Optional. Step-level guard condition
-        retry: 3           # Optional. Retry count on failure
-        backoff: 1000      # Optional. Backoff in ms between retries
+        max_attempts: 3    # Optional. Retry count on failure
+        backoff_ms: 1000   # Optional. Backoff in ms between retries
+        on_failure: STEP_FAILED # Optional. Step-specific failure state emission
     emit: STATE_NAME       # Optional. Emit state after route completes
+```
+
+### Error & Failure Routes (`on_failure` / `on_error`)
+
+When an action step fails (or exceeds its `max_attempts`), Spine automatically triggers failure route handling if `on_failure` (or `on_error`) is defined at the step or route level:
+
+1. **Error Context**: Spine enriches the error payload with `error`, `failed_action`, `failed_event`, and original payload parameters.
+2. **RAM State Cache**: Updates state cache for instant `GetState("PROCESSING_FAILED")` access.
+3. **WebSocket Broadcast**: Pushes state change to all connected UI / Dashboard WebSocket clients.
+4. **Event Chaining**: Automatically triggers any downstream routes listening on the failure state.
+
+```yaml
+routes:
+  - on: PROCESS_VIDEO
+    on_failure: PROCESSING_FAILED
+    steps:
+      - action: pipeline.run
+        timeout_sec: 30
+
+  - on: PROCESSING_FAILED
+    steps:
+      - action: db.insert
+        table: error_logs
+      - action: log.write
+        message: "[ALERT] Pipeline failed for $event.payload.project_id: $event.payload.error"
 ```
 
 ### Built-in Actions

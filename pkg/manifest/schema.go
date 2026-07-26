@@ -42,6 +42,7 @@ type Route struct {
 	Parallel    bool        `json:"parallel,omitempty"`
 	Steps       []RouteStep `json:"steps"`
 	EmitState   string      `json:"emit_state,omitempty"`
+	OnFailure   string      `json:"on_failure,omitempty"`
 }
 
 // RouteStep is a single action within a route (e.g. db.insert).
@@ -55,5 +56,6 @@ type RouteStep struct {
 	Where       string            `json:"where,omitempty"`
 	MaxAttempts int               `json:"max_attempts,omitempty"`
 	BackoffMs   int               `json:"backoff_ms,omitempty"`
+	OnFailure   string            `json:"on_failure,omitempty"`
 	Config      map[string]string `json:"config,omitempty"`
 }
