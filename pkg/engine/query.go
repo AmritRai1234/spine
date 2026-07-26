@@ -65,7 +65,7 @@ func (b *Bus) GetTableRows(table string, limit, offset int) ([]map[string]interf
 		offset = 0
 	}
 
-	query := fmt.Sprintf(`SELECT * FROM "%s" ORDER BY id DESC LIMIT %d OFFSET %d`, table, limit, offset)
+	query := fmt.Sprintf(`SELECT * FROM "%s" ORDER BY _spine_id DESC LIMIT %d OFFSET %d`, table, limit, offset)
 	rows, err := b.db.Query(query)
 	if err != nil {
 		return nil, fmt.Errorf("failed to query table '%s': %w", table, err)
@@ -187,9 +187,6 @@ func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitte
 
 	params := []interface{}{event, payloadStr, statesStr, nowStr}
 
-	select {
-	case b.writeChan <- dbTask{query: auditInsertSQL, params: params}:
-	default:
-		// Non-blocking drop on high-volume burst saturation
-	}
+	b.writer.submitAny(dbTask{query: auditInsertSQL, params: params})
+	// Non-blocking: submitAny silently drops if all shards saturated
 }

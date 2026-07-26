@@ -5,22 +5,22 @@
 </p>
 
 <p align="center">
-  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/throughput-56K%20req%2Fs-brightgreen?style=flat-square" alt="Throughput"></a>
-  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/latency-59%CE%BCs-blue?style=flat-square" alt="Latency"></a>
-  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/memory-21MB%20RSS-purple?style=flat-square" alt="Memory"></a>
-  <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-v2.1.0-00ADD8?style=flat-square&logo=go" alt="Go"></a>
+  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/throughput-420K%20emit%2Fs-brightgreen?style=flat-square" alt="Throughput"></a>
+  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/latency-2.7μs-blue?style=flat-square" alt="Latency"></a>
+  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/allocs-25%20per%20emit-purple?style=flat-square" alt="Allocs"></a>
+  <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-v2.2.0-00ADD8?style=flat-square&logo=go" alt="Go"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPLv3-blue?style=flat-square" alt="License"></a>
   <a href="#tests"><img src="https://img.shields.io/badge/tests-24%2F24%20pass-brightgreen?style=flat-square" alt="Tests"></a>
 </p>
 
 ---
 
-**Spine** is a high-performance, declarative event-driven runtime and orchestration engine written in Go. It replaces complex API controllers and scattered database handlers with a single, type-safe `.spine` manifest file. 
+**Spine** is a high-performance, declarative event-driven runtime and orchestration engine written in Go. It replaces complex API controllers and scattered database handlers with a single, type-safe `.spine` manifest file.
 
 With Spine, you declare database tables, event nodes, and multi-step action routes in code. The runtime automatically handles type contract validation, high-throughput database persistence (SQLite WAL / Turso libSQL), outbox webhook retries, multi-node clustering (Redis Streams / NATS), and real-time WebSocket state broadcasting.
 
 ```
-Client Event ➔ Load Balancer ➔ Spine Node (Auth & Rate Limit) ➔ Event Bus ➔ PubSub Backplane ➔ Batched DB / WebSocket
+Client Event → Load Balancer → Spine Node (Auth & Rate Limit) → Event Bus → PubSub Backplane → Batched DB / WebSocket
 ```
 
 ---
@@ -28,18 +28,18 @@ Client Event ➔ Load Balancer ➔ Spine Node (Auth & Rate Limit) ➔ Event Bus 
 ## Table of Contents
 
 - [Why Spine?](#why-spine)
-- [System & Cluster Architecture](#system--cluster-architecture)
-- [Project Layout](#project-layout)
+- [Installation](#installation)
 - [Quick Start](#quick-start)
 - [The `.spine` Manifest Specification](#the-spine-manifest-specification)
-- [Database Schema & Migrations](#database-schema--migrations)
 - [HTTP & WebSocket API Reference](#http--websocket-api-reference)
-- [Minimalist Developer Web Dashboard](#minimalist-developer-web-dashboard)
+- [Go SDK / Embedding Guide](#go-sdk--embedding-guide)
+- [System & Cluster Architecture](#system--cluster-architecture)
+- [Project Layout](#project-layout)
+- [Configuration Reference](#configuration-reference)
 - [Optimization & High-Throughput Engine](#optimization--high-throughput-engine)
 - [Security & Governance](#security--governance)
 - [Performance & Benchmarks](#performance--benchmarks)
 - [Tests](#tests)
-- [Go SDK / Embedding Guide](#go-sdk--embedding-guide)
 - [License](#license)
 
 ---
@@ -56,11 +56,381 @@ Client Event ➔ Load Balancer ➔ Spine Node (Auth & Rate Limit) ➔ Event Bus 
 
 ---
 
+## Installation
+
+### From Source
+
+```bash
+git clone https://github.com/AmritRai1234/spine.git
+cd spine
+go build -o spine ./cmd/spine/
+```
+
+### As a Go Module
+
+```bash
+go get github.com/AmritRai1234/spine@latest
+```
+
+### Docker
+
+```bash
+docker build -t spine .
+docker run -p 8080:8080 -v $(pwd)/examples:/app spine serve /app/app.spine
+```
+
+---
+
+## Quick Start
+
+### 1. Create a Manifest
+
+Create `app.spine`:
+
+```yaml
+spine_version: 1
+
+database:
+  tables:
+    - users
+    - leads
+
+nodes:
+  LandingPage:
+    emits:
+      - event: SUBMIT_LEAD
+        payload:
+          email: string
+          name: string
+    listens:
+      - state: LEAD_STATUS
+        payload:
+          status: string
+
+routes:
+  - on: SUBMIT_LEAD
+    steps:
+      - action: db.insert
+        table: leads
+      - action: log.write
+        message: "New lead from $event.payload.email"
+    emit: LEAD_STATUS
+```
+
+### 2. Start the Server
+
+```bash
+# From source
+./spine serve app.spine --port 8080
+
+# Or with Docker
+docker run -p 8080:8080 -v $(pwd):/app spine serve /app/app.spine
+```
+
+### 3. Emit an Event
+
+```bash
+# Via CLI
+./spine emit SUBMIT_LEAD --payload '{"email":"jane@example.com","name":"Jane"}'
+
+# Via HTTP
+curl -X POST http://localhost:8080/emit \
+  -H "Content-Type: application/json" \
+  -d '{"event":"SUBMIT_LEAD","payload":{"email":"jane@example.com","name":"Jane"}}'
+```
+
+### 4. Query Data
+
+```bash
+# List all tables
+curl http://localhost:8080/tables
+
+# Query table rows
+curl http://localhost:8080/tables/leads?limit=10
+
+# Query event audit log
+curl http://localhost:8080/events?event=SUBMIT_LEAD&limit=20
+```
+
+### 5. Real-Time WebSocket
+
+```javascript
+const ws = new WebSocket("ws://localhost:8080/ws");
+ws.onmessage = (event) => {
+  const data = JSON.parse(event.data);
+  console.log("State update:", data.state, data.payload);
+};
+
+// Emit events via WebSocket
+ws.send(JSON.stringify({
+  event: "SUBMIT_LEAD",
+  payload: { email: "ws@example.com", name: "WS User" }
+}));
+```
+
+---
+
+## The `.spine` Manifest Specification
+
+### Structure
+
+```yaml
+spine_version: 1          # Required. Manifest format version.
+
+include:                   # Optional. Import other .spine files.
+  - auth.spine
+  - billing.spine
+
+database:
+  tables:                  # Declare tables (auto-created with schema evolution)
+    - users
+    - orders
+
+nodes:                     # Declare UI/service nodes and their event contracts
+  NodeName:
+    owns_files:            # Optional. Maps node to source files
+      - src/pages/Node.tsx
+    emits:                 # Events this node can emit
+      - event: EVENT_NAME
+        payload:
+          field_name: type # Supported: string, number, boolean, object, array
+    listens:               # States this node subscribes to (via WebSocket)
+      - state: STATE_NAME
+        payload:
+          field_name: type
+
+routes:                    # Event → action pipelines
+  - on: EVENT_NAME         # Trigger event
+    if: "condition"        # Optional. Route-level guard condition
+    parallel: true         # Optional. Execute steps concurrently
+    steps:
+      - action: ACTION     # Step action (see Actions Reference)
+        if: "condition"    # Optional. Step-level guard condition
+        retry: 3           # Optional. Retry count on failure
+        backoff: 1000      # Optional. Backoff in ms between retries
+    emit: STATE_NAME       # Optional. Emit state after route completes
+```
+
+### Built-in Actions
+
+| Action | Description | Parameters |
+|---|---|---|
+| `db.insert` | Insert a row into a table | `table` (required) |
+| `db.update` | Update a row (matches on `id` or first key) | `table` (required) |
+| `db.delete` | Delete a row by `id` or `where` condition | `table`, `where` (optional) |
+| `log.write` | Write a log message with template variables | `message` (required) |
+| `http.post` | Send an HTTP POST webhook | `url` (required) |
+| `emit` | Emit a chained event | `event`, `payload` (optional) |
+
+### Template Variables
+
+| Variable | Description | Example |
+|---|---|---|
+| `$event.name` | Current event name | `SUBMIT_LEAD` |
+| `$event.payload.field` | Payload field value | `$event.payload.email` |
+| `$now` | Current UTC timestamp (RFC 3339) | `2026-07-26T16:00:00Z` |
+| `$uuid` | Generated UUID v4 | `a1b2c3d4-...` |
+| `$env.VAR_NAME` | Environment variable | `$env.API_KEY` |
+
+### Conditions
+
+Route and step guards support comparison operators:
+
+```yaml
+# String comparison
+if: "$event.payload.role == 'admin'"
+
+# Numeric comparison
+if: "$event.payload.amount > 100"
+
+# Not equal
+if: "$event.payload.status != 'deleted'"
+```
+
+---
+
+## HTTP & WebSocket API Reference
+
+### Endpoints
+
+| Method | Path | Auth | Description |
+|---|---|---|---|
+| `GET` | `/health` | No | Health check (`{"status":"ok"}`) |
+| `GET` | `/healthz` | No | Kubernetes liveness probe |
+| `GET` | `/readyz` | No | Kubernetes readiness probe |
+| `POST` | `/emit` | Yes | Emit an event with payload |
+| `GET` | `/schema` | Yes | Return parsed manifest schema as JSON |
+| `GET` | `/tables` | Yes | List all database tables |
+| `GET` | `/tables/{name}` | Yes | Query rows from a table (`?limit=50&offset=0`) |
+| `GET` | `/events` | Yes | Query event audit log (`?event=NAME&limit=50`) |
+| `GET` | `/metrics` | No | Optimizer mode and batch metrics |
+| `WS` | `/ws` | Yes | Real-time WebSocket (state broadcasts + emit) |
+
+### Authentication
+
+Protected endpoints require an API key via one of:
+
+```bash
+# Header: X-API-Key
+curl -H "X-API-Key: YOUR_KEY" http://localhost:8080/emit ...
+
+# Header: Authorization Bearer
+curl -H "Authorization: Bearer YOUR_KEY" http://localhost:8080/emit ...
+
+# WebSocket: query parameter
+ws://localhost:8080/ws?token=YOUR_KEY
+```
+
+### Emit Request/Response
+
+```bash
+# Request
+POST /emit
+Content-Type: application/json
+{
+  "event": "SUBMIT_LEAD",
+  "payload": {
+    "email": "jane@example.com",
+    "name": "Jane"
+  }
+}
+
+# Response (200 OK)
+{
+  "status": "ok",
+  "event": "SUBMIT_LEAD",
+  "emitted_states": ["LEAD_STATUS"],
+  "steps_executed": 2
+}
+```
+
+### WebSocket Protocol
+
+```javascript
+// Client → Server: Emit event
+{ "event": "EVENT_NAME", "payload": { ... } }
+
+// Server → Client: Event acknowledgment
+{ "type": "event_ack", "status": "ok", "event": "EVENT_NAME", "result": { ... } }
+
+// Server → Client: State broadcast (push)
+{ "type": "state", "state": "STATE_NAME", "event": "EVENT_NAME", "payload": { ... }, "timestamp": 1722009600000 }
+```
+
+---
+
+## Go SDK / Embedding Guide
+
+Spine can be embedded directly in your Go application:
+
+### Basic Usage
+
+```go
+package main
+
+import (
+    "log"
+    spine "github.com/AmritRai1234/spine"
+)
+
+func main() {
+    // Create engine from manifest file
+    eng, err := spine.NewFromFile("app.spine", "data.db")
+    if err != nil {
+        log.Fatal(err)
+    }
+    defer eng.Close()
+
+    // Configure security
+    eng.SetAPIKey("my-secret-key")
+    eng.SetRateLimit(1000, 2000) // 1000 req/s, burst 2000
+
+    // Start HTTP + WebSocket server
+    log.Println("Spine running on :8080")
+    log.Fatal(eng.ListenAndServe(":8080"))
+}
+```
+
+### Programmatic Emit
+
+```go
+// Emit events directly from Go code
+result, err := eng.Bus.Emit("SUBMIT_LEAD", map[string]interface{}{
+    "email": "api@example.com",
+    "name":  "API User",
+})
+if err != nil {
+    log.Printf("emit error: %v", err)
+}
+log.Printf("emitted states: %v", result["emitted_states"])
+```
+
+### Custom HTTP Handler
+
+```go
+// Embed Spine's handler in your own mux
+mux := http.NewServeMux()
+mux.Handle("/api/", http.StripPrefix("/api", eng.HTTPHandler()))
+mux.HandleFunc("/custom", myCustomHandler)
+http.ListenAndServe(":8080", mux)
+```
+
+### Custom Action Plugins
+
+```go
+// Register custom actions callable from .spine manifests
+eng.Bus.RegisterAction("notify.slack", func(step *spine.RouteStep, event string, payload map[string]interface{}) error {
+    channel := step.Config["channel"]
+    message := spine.ResolveVariables(step.Config["message"], event, payload)
+    return sendSlackMessage(channel, message)
+})
+```
+
+Then use in your manifest:
+
+```yaml
+routes:
+  - on: CRITICAL_ERROR
+    steps:
+      - action: notify.slack
+        channel: "#alerts"
+        message: "Error from $event.payload.service: $event.payload.error"
+```
+
+### Reading State Cache
+
+```go
+// Read cached state (sub-microsecond, lock-free)
+state, ok := eng.Bus.GetState("USER_PROFILE")
+if ok {
+    log.Printf("cached user: %v", state["name"])
+}
+```
+
+### Schema Inspection
+
+```go
+// Parse manifest without creating an engine
+schema, err := spine.ParseManifest("app.spine")
+if err != nil {
+    log.Fatal(err)
+}
+
+for name, node := range schema.Nodes {
+    log.Printf("Node %s emits %d events", name, len(node.Emits))
+}
+for _, route := range schema.Routes {
+    log.Printf("Route on %s → %d steps", route.On, len(route.Steps))
+}
+```
+
+---
+
 ## System & Cluster Architecture
 
 Spine adapts the **Blackboard Architectural Pattern** for high-performance event dispatch—in-memory event emissions act as state updates posted to the central blackboard, while route steps function as reactive handlers.
 
-### 1. Single-Node Execution Pipeline
+### Single-Node Execution Pipeline
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
@@ -84,14 +454,12 @@ Spine adapts the **Blackboard Architectural Pattern** for high-performance event
     │                        │                        │
     ▼                        ▼                        ▼
 ┌──────────────────────┐ ┌──────────────────────┐ ┌──────────────────────┐
-│  Batched Write Queue │ │  Outbox Retry Queue  │ │  WebSocket Hub Push  │
-│  (SQLite / Turso)    │ │  (DB-Backed Outbox)  │ │  (ws://.../ws)       │
+│  Sharded Write Queue │ │  Outbox Retry Queue  │ │  Async WS Hub Push   │
+│  (8 channels→SQLite) │ │  (DB-Backed Outbox)  │ │  (ws://.../ws)       │
 └──────────────────────┘ └──────────────────────┘ └──────────────────────┘
 ```
 
-### 2. Multi-Node Distributed Cluster Topology
-
-For production workloads exceeding single-node writer capacity, Spine instances scale horizontally behind a Load Balancer using a **PubSub Backplane (Redis Streams / NATS)** and a primary database (Turso / libSQL):
+### Multi-Node Distributed Cluster
 
 ```
                         ┌──────────────────────────────┐
@@ -114,140 +482,166 @@ For production workloads exceeding single-node writer capacity, Spine instances 
  └─────────────────────────────┘ └───────────────────┘ └─────────────────────────────┘
 ```
 
-When any node processes an event that emits state, it publishes the update to the PubSub backplane (`pkg/engine/pubsub.go`), instantly synchronizing WebSockets across all connected cluster instances. Outbound webhooks are persisted to the shared primary DB outbox table (`_spine_outbox`), allowing pending retries to survive individual node crashes.
-
 ---
 
 ## Project Layout
 
 ```
-Spine/
+spine/
+├── cmd/spine/           # CLI binary (serve, emit, parse, version)
+│   └── main.go
 ├── pkg/
 │   ├── engine/          # Core runtime execution engine
-│   │   ├── bus.go       # Event dispatch, batch writer, table indexing
+│   │   ├── bus.go       # Event dispatch, sharded batch writer, SQL caching
 │   │   ├── engine.go    # HTTP server mux, graceful shutdown & health probes
-│   │   ├── hub.go       # WebSocket real-time state broadcasting hub
-│   │   ├── outbox.go    # DB-backed outbox retry queue (survives process/node crashes)
-│   │   ├── pubsub.go    # Local & distributed PubSub backplane interface (Redis/NATS)
-│   │   ├── optimizer.go # Self-improving adaptive latency tuner
+│   │   ├── hub.go       # Async WebSocket broadcasting hub
+│   │   ├── outbox.go    # Notification-driven outbox retry queue
+│   │   ├── pubsub.go    # Local & distributed PubSub backplane (Redis/NATS)
+│   │   ├── optimizer.go # Self-tuning adaptive batch size & interval optimizer
 │   │   ├── cond.go      # Dynamic condition evaluator (if: guards)
-│   │   ├── vars.go      # Templated variable token resolver ($now, $uuid, $event)
-│   │   ├── query.go     # Database table inspector & event audit query API
+│   │   ├── vars.go      # Template variable resolver ($now, $uuid, $event)
+│   │   ├── query.go     # Table inspector & event audit query API
 │   │   └── migrations.go# Versioned schema migration tracker
-│   │
 │   ├── manifest/        # Declarative .spine language parser & AST
-│   │   ├── parser.go    # Hardened multi-file manifest parser with validation
+│   │   ├── parser.go    # Multi-file manifest parser with validation
 │   │   ├── registry.go  # Lock-free atomic route & node registry
 │   │   └── schema.go    # AST struct definitions
-│   │
 │   └── middleware/      # Security & access control middleware
 │       ├── auth.go      # Timing-safe API key & Bearer token verification
-│       └── ratelimit.go # Token-bucket rate limiter with auto-eviction
-│
-├── web/                 # Minimalist developer web dashboard (Vite + React + TS)
-├── tests/               # End-to-end test suites (24 tests across 11 files)
-│   ├── parser_test.go   # 14 parser validation & edge case tests
-│   ├── benchmark_test.go# Performance benchmarks (parse, emit, registry)
-│   └── ...              # Bus, conditions, optimizer, plugins, queries, etc.
-├── examples/            # Example .spine manifest files
-├── spine.go             # Public top-level Go library API facade
-└── README.md            # Master project documentation
+│       └── ratelimit.go # 64-shard token-bucket rate limiter
+├── examples/
+│   └── app.spine        # Full example manifest
+├── tests/               # 24 tests across 11 files
+├── web/                 # Developer web dashboard
+├── spine.go             # Public Go library API facade
+├── Dockerfile           # Multi-stage Docker build
+├── go.mod
+└── README.md
 ```
 
 ---
 
-## Quick Start
+## Configuration Reference
+
+### CLI
 
 ```bash
-# 1. Clone & Build
-git clone https://github.com/AmritRai1234/spine.git
-cd spine
-go build -o spine ./cmd/spine/
-
-# 2. Validate your manifest
-./spine parse examples/app.spine
-
-# 3. Start the server
-./spine serve examples/app.spine --port 8080
-
-# 4. Emit an event (from another terminal)
-./spine emit SUBMIT_LEAD --payload '{"email":"test@dev.com","name":"Jane"}'
-```
-
-### Docker
-
-```bash
-# Build
-docker build -t spine .
-
-# Run
-docker run -p 8080:8080 -v $(pwd)/examples:/app spine serve /app/app.spine
-```
-
-### CLI Reference
-
-```bash
-spine serve <manifest.spine> [--port 8080] [--db spine.db] [--api-key KEY] [--rate-limit 1000]
-spine emit  <EVENT_NAME>     [--payload '{}'] [--server http://localhost:8080] [--api-key KEY]
+spine serve <manifest.spine> [flags]
+spine emit  <EVENT_NAME>     [flags]
 spine parse <manifest.spine> [--json]
 spine version
 ```
 
-Environment variables: `SPINE_PORT`, `SPINE_DB`, `SPINE_API_KEY`
+| Flag | Default | Description |
+|---|---|---|
+| `--port` | `8080` | HTTP server port |
+| `--db` | `spine.db` | SQLite database path or Turso URL |
+| `--api-key` | — | API key for authenticated endpoints |
+| `--rate-limit` | — | Requests per second (enables rate limiting) |
+
+### Environment Variables
+
+| Variable | Description |
+|---|---|
+| `SPINE_PORT` | Server port (overrides `--port`) |
+| `SPINE_DB` | Database path (overrides `--db`) |
+| `SPINE_API_KEY` | API key (overrides `--api-key`) |
+
+### Database Drivers
+
+| Connection String | Driver |
+|---|---|
+| `spine.db` | SQLite (local, WAL mode) |
+| `libsql://your-db.turso.io` | Turso / libSQL (cloud) |
+| `turso://your-db.turso.io` | Turso / libSQL (cloud) |
+
+### SQLite Performance Pragmas
+
+Spine automatically applies these pragmas for optimal write throughput:
+
+| Pragma | Value | Purpose |
+|---|---|---|
+| `journal_mode` | `WAL` | Write-ahead logging for concurrent reads |
+| `synchronous` | `NORMAL` | Balanced durability vs speed |
+| `cache_size` | `-64000` | 64MB page cache |
+| `temp_store` | `MEMORY` | In-memory temp tables |
+| `mmap_size` | `0` | Regular I/O (avoids TLB shootdown overhead) |
+| `page_size` | `8192` | 8KB pages for SSD-aligned I/O |
+| `wal_autocheckpoint` | `10000` | Delay WAL checkpoints for throughput |
+
+---
+
+## Optimization & High-Throughput Engine
+
+### Write Pipeline
+
+```
+Emit() → Contract Validation → Route Steps → Sharded Writer → Batch Flush → SQLite WAL
+                                                    │
+                                            ┌───────┴───────┐
+                                        Shard 0         Shard 7
+                                        (FNV hash)      (FNV hash)
+                                            └───────┬───────┘
+                                                    │
+                                          Single Batch Writer
+                                          (tx + stmt cache)
+```
+
+### Key Optimizations
+
+| Optimization | Impact | Description |
+|---|---|---|
+| **Sharded Write Channels** | Critical | 8 input channels distribute producer contention via FNV hash routing |
+| **SQL Template Caching** | Critical | SQL strings cached per table+columns fingerprint (sync.Map) |
+| **Deterministic Key Ordering** | High | Sorted payload keys enable SQL caching with consistent fingerprints |
+| **Prepared Statement Cache** | High | Reuses `sqlite3_prepare_v2` within batch transactions |
+| **Async WS Broadcast** | High | Buffered channel decouples Emit path from WebSocket fan-out |
+| **Regular I/O (no mmap)** | High | Avoids TLB shootdowns and page fault overhead on write-heavy workloads |
+| **Shared HTTP Client** | Medium | Connection pooling for webhook steps (100 idle conns) |
+| **64-Shard Rate Limiter** | Medium | Eliminates global mutex contention under high concurrency |
+| **Notification-Driven Outbox** | Medium | Immediate wakeup on enqueue instead of 5-second polling |
+| **Lock-Free Registry** | High | `atomic.LoadPointer` for zero-contention route lookups (~70ns) |
+| **Object Pooling** | Medium | `sync.Pool` for emit requests, byte buffers, and sorted key slices |
+| **Adaptive Optimizer** | Medium | Self-tuning batch size and flush interval based on load |
 
 ---
 
 ## Security & Governance
 
-1. **Timing-Safe API Key Verification**:
-   - Gatekeep endpoints using `SetAPIKey(key)` or `SPINE_API_KEY`.
-   - Accepts headers: `Authorization: Bearer <KEY>` or `X-API-Key: <KEY>`.
-   - Uses `crypto/subtle.ConstantTimeCompare` to prevent timing side-channel attacks.
+1. **Timing-Safe API Key Verification**: Uses `crypto/subtle.ConstantTimeCompare` to prevent timing side-channel attacks.
 
-2. **WebSocket Authentication**:
-   - WebSocket connections (`/ws`) require API key validation **before** upgrading the connection.
-   - Supports authentication via `?token=<KEY>` query parameter or standard auth headers.
+2. **WebSocket Authentication**: WS connections require API key validation **before** upgrading. Supports `?token=KEY` query parameter or standard auth headers.
 
-3. **Request Body Size Limits**:
-   - All request bodies are capped at **1 MB** via `io.LimitReader` to prevent memory exhaustion attacks.
+3. **Request Body Size Limits**: All request bodies capped at **1 MB** via `io.LimitReader` to prevent memory exhaustion.
 
-4. **SQL Injection Protection**:
-   - All table/column identifiers are sanitized via `sanitizeIdent()` (alphanumeric + underscore only).
-   - `db.delete` uses **parameterized queries** (`WHERE id = ?`) instead of string interpolation.
+4. **SQL Injection Protection**: All table/column identifiers sanitized via `sanitizeIdent()` (alphanumeric + underscore only). All queries use parameterized values.
 
-5. **Trusted Proxy Rate Limiting**:
-   - Token-bucket rate limiting with automatic **stale entry eviction** (>5min idle entries cleaned every 60s).
-   - Parses `X-Forwarded-For` and `X-Real-IP` headers **only** from configured trusted proxy IPs.
+5. **Trusted Proxy Rate Limiting**: Token-bucket rate limiting with 64-shard lock distribution. Parses `X-Forwarded-For` and `X-Real-IP` headers **only** from configured trusted proxy IPs. Stale entries auto-evicted every 60 seconds.
 
-6. **Graceful Shutdown**:
-   - Handles `SIGINT` / `SIGTERM` with a 10-second drain timeout via `http.Server.Shutdown()`.
-   - Ensures in-flight requests complete and the batch writer flushes before exit.
+6. **Graceful Shutdown**: Handles `SIGINT` / `SIGTERM` with 10-second drain timeout. Ensures in-flight requests complete and batch writer flushes before exit.
 
-7. **Durable Outbox Queue Resilience**:
-   - Outbound webhooks and action retries are stored in the primary database (`_spine_outbox` table). Pending retries are automatically processed by a background goroutine every 5 seconds.
+7. **Durable Outbox Queue**: Outbound webhooks stored in `_spine_outbox` table. Pending retries survive process crashes and are automatically retried on restart.
 
 ---
 
 ## Performance & Benchmarks
 
-| Benchmark | Result |
-|---|---|
-| **EmitSingle** (full pipeline) | 7.9μs / 44 allocs / 1,587 B |
-| **EmitWithValidation** (typed payload) | 9.6μs / 57 allocs / 2,223 B |
-| **EmitParallel** (multi-goroutine) | 9.2μs / 57 allocs |
-| **RegistryLookup** (lock-free) | 70ns / 1 alloc / 7 B |
-| **ParseSmallManifest** (3 nodes) | 14μs / 86 allocs |
-| **ParseLargeManifest** (20 nodes) | 52μs / 586 allocs |
+Measured on AMD Ryzen 7 5825U (16 threads):
 
-### Key Optimizations
-- **ensureTable fast-path**: Skips all SQL for known table+column combos (sync.Map cache)
-- **Pre-sized slices**: All hot-path slices pre-allocated to payload length (zero reallocs)
-- **strings.Builder SQL**: Single-allocation SQL construction instead of fmt.Sprintf + strings.Join
-- **Pooled emittedStates**: sync.Pool for emitted state slices (reduced GC pressure)
-- **Dynamic batch writer**: Ticker auto-resets when adaptive optimizer changes mode
-- **Lock-free registry**: atomic.LoadPointer for zero-contention route lookups
-- **Object pooling**: sync.Pool for emitRequest structs and bytes.Buffer on HTTP hot path
-- **SQLite WAL tuning**: Aggressive pragma configuration (WAL, NORMAL sync, 256MB mmap)
+| Benchmark | ops/sec | ns/op | B/op | allocs/op |
+|---|---|---|---|---|
+| **EmitSingle** (full pipeline) | 420,000 | 2,765 | 1,207 | 25 |
+| **EmitParallel** (16 goroutines) | 333,000 | 3,474 | 1,339 | 25 |
+| **EmitWithValidation** (typed) | 370,000 | 3,069 | 1,456 | 29 |
+| **RegistryLookup** (lock-free) | 17,000,000 | 70 | 7 | 1 |
+| **ParseSmallManifest** (3 nodes) | 78,000 | 15,310 | 8,265 | 86 |
+| **ParseLargeManifest** (20 nodes) | 20,000 | 58,609 | 44,740 | 586 |
+
+Run benchmarks yourself:
+
+```bash
+go test ./tests/ -bench=. -benchmem -count=3
+```
 
 ---
 
@@ -270,7 +664,11 @@ Environment variables: `SPINE_PORT`, `SPINE_DB`, `SPINE_API_KEY`
 | `vars_test.go` | Template variable resolution |
 
 ```bash
-go test ./... -v
+# Run all tests
+go test ./tests/ -v
+
+# Run with race detector
+go test ./tests/ -race -count=1
 ```
 
 ---

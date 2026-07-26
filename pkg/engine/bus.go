@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -23,11 +24,120 @@ type dbTask struct {
 	params []interface{}
 }
 
+// numWriteShards controls how many input channels the batch writer drains.
+// Sharding eliminates producer contention on a single channel under high concurrency.
+const numWriteShards = 8
+
+// shardedWriter distributes write tasks across multiple channels to reduce contention,
+// while a single goroutine drains all shards (SQLite serializes writes anyway).
+type shardedWriter struct {
+	shards [numWriteShards]chan dbTask
+	closed uint32 // atomic: 1 = closed
+}
+
+func newShardedWriter(bufSize int) *shardedWriter {
+	sw := &shardedWriter{}
+	perShard := bufSize / numWriteShards
+	if perShard < 1024 {
+		perShard = 1024
+	}
+	for i := range sw.shards {
+		sw.shards[i] = make(chan dbTask, perShard)
+	}
+	return sw
+}
+
+// submit routes a task to a shard based on the table name hash.
+// Returns false if the shard is full or the writer is closed.
+func (sw *shardedWriter) submit(table string, task dbTask) (ok bool) {
+	if atomic.LoadUint32(&sw.closed) != 0 {
+		return false
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			ok = false // send on closed channel
+		}
+	}()
+	h := fnvHash(table)
+	shard := h % numWriteShards
+	select {
+	case sw.shards[shard] <- task:
+		return true
+	default:
+		return false
+	}
+}
+
+// submitAny routes a task to the least-loaded shard (for non-table tasks like audit).
+// Returns false if all shards are full or the writer is closed.
+func (sw *shardedWriter) submitAny(task dbTask) (ok bool) {
+	if atomic.LoadUint32(&sw.closed) != 0 {
+		return false
+	}
+	defer func() {
+		if r := recover(); r != nil {
+			ok = false
+		}
+	}()
+	// Try each shard starting from 0, pick first with space
+	for i := range sw.shards {
+		select {
+		case sw.shards[i] <- task:
+			return true
+		default:
+		}
+	}
+	return false
+}
+
+func (sw *shardedWriter) closeAll() {
+	atomic.StoreUint32(&sw.closed, 1)
+	for i := range sw.shards {
+		close(sw.shards[i])
+	}
+}
+
+// fnvHash is a fast non-cryptographic hash for shard routing.
+func fnvHash(s string) uint32 {
+	h := uint32(2166136261)
+	for i := 0; i < len(s); i++ {
+		h ^= uint32(s[i])
+		h *= 16777619
+	}
+	return h
+}
+
 // Pool for emitted states slices to reduce allocs on the hot path
 var statesPool = sync.Pool{
 	New: func() interface{} {
 		s := make([]string, 0, 4)
 		return &s
+	},
+}
+
+// Pool for sorted key slices — avoids alloc on every insert/update
+var sortedKeysPool = sync.Pool{
+	New: func() interface{} {
+		s := make([]string, 0, 16)
+		return &s
+	},
+}
+
+// sqlTemplate holds a pre-built SQL string and the deterministic column order.
+// Cached per table+columns fingerprint to eliminate per-call string building.
+type sqlTemplate struct {
+	sql      string   // e.g. INSERT INTO "x" ("a", "b") VALUES (?, ?)
+	colOrder []string // sanitized column names in sorted order
+	colDefs  []string // column definitions for ensureTable
+}
+
+// Shared HTTP client for webhook steps — enables TCP/TLS connection reuse
+var sharedHTTPClient = &http.Client{
+	Timeout: 5 * time.Second,
+	Transport: &http.Transport{
+		MaxIdleConns:        100,
+		MaxIdleConnsPerHost: 10,
+		IdleConnTimeout:     90 * time.Second,
 	},
 }
 
@@ -39,19 +149,24 @@ type Bus struct {
 	db       *sql.DB
 	hub      *Hub
 
-	// Performance: lock-free known tables + identifier cache
-	knownTable sync.Map
-	identCache sync.Map // sanitizeIdent result cache
+	// Performance: lock-free known tables + identifier cache + SQL template cache
+	knownTable    sync.Map
+	identCache    sync.Map // sanitizeIdent result cache
+	insertSQLCache sync.Map // "table|col1,col2" → *sqlTemplate
+	updateSQLCache sync.Map // "table|whereKey|col1,col2" → *sqlTemplate
 
 	// In-memory RAM State Cache
 	stateMu    sync.RWMutex
 	stateCache map[string]map[string]interface{}
 
-	// High-throughput batch writer & Adaptive Optimizer
-	writeChan     chan dbTask
+	// High-throughput sharded batch writer & Adaptive Optimizer
+	writer        *shardedWriter
 	wg            sync.WaitGroup
 	optimizer     *AdaptiveOptimizer
 	customActions sync.Map
+
+	// Notification channel for outbox processor immediate wakeup
+	outboxNotify chan struct{}
 }
 
 // NewBus creates a Bus wired to a Registry, SQLite/Turso database, and WS hub.
@@ -84,7 +199,8 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 			"PRAGMA synchronous=NORMAL",
 			"PRAGMA cache_size=-64000",
 			"PRAGMA temp_store=MEMORY",
-			"PRAGMA mmap_size=268435456",
+			"PRAGMA mmap_size=0",              // Regular I/O — avoids TLB shootdown & page faults on write-heavy workloads
+			"PRAGMA page_size=8192",           // 8KB pages — better I/O alignment for modern SSDs
 			"PRAGMA wal_autocheckpoint=10000",
 		}
 		for _, p := range pragmas {
@@ -93,11 +209,12 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 	}
 
 	bus := &Bus{
-		db:         db,
-		hub:        hub,
-		stateCache: make(map[string]map[string]interface{}),
-		writeChan:  make(chan dbTask, 500000),
-		optimizer:  NewAdaptiveOptimizer(),
+		db:           db,
+		hub:          hub,
+		stateCache:   make(map[string]map[string]interface{}),
+		writer:       newShardedWriter(500000),
+		optimizer:    NewAdaptiveOptimizer(),
+		outboxNotify: make(chan struct{}, 1),
 	}
 	atomic.StorePointer(&bus.registry, unsafe.Pointer(reg))
 	bus.startBatchWriter()
@@ -187,29 +304,49 @@ func (b *Bus) startBatchWriter() {
 			batch = batch[:0]
 		}
 
+		// drainShards does a non-blocking round-robin drain of all shard channels
+		drainShards := func(targetSize int) bool {
+			drained := false
+			for i := range b.writer.shards {
+				for len(batch) < targetSize {
+					select {
+					case t, ok := <-b.writer.shards[i]:
+						if !ok {
+							// This shard is closed, move to next
+							break
+						}
+						batch = append(batch, t)
+						drained = true
+						continue
+					default:
+					}
+					break // default or closed: move to next shard
+				}
+				if len(batch) >= targetSize {
+					return true
+				}
+			}
+			return drained
+		}
+
+		// Block on shard[0] to avoid busy-wait, then drain all shards
 		for {
 			select {
-			case task, ok := <-b.writeChan:
+			case task, ok := <-b.writer.shards[0]:
 				if !ok {
+					// Channel closed — drain remaining shards and exit
+					for i := 1; i < numWriteShards; i++ {
+						for t := range b.writer.shards[i] {
+							batch = append(batch, t)
+						}
+					}
 					flush()
 					return
 				}
 				batch = append(batch, task)
 				targetBatchSize := b.optimizer.GetBatchSize()
-				// Opportunistic non-blocking drain loop
-				for len(batch) < targetBatchSize {
-					select {
-					case t, ok := <-b.writeChan:
-						if !ok {
-							flush()
-							return
-						}
-						batch = append(batch, t)
-					default:
-						goto FLUSH
-					}
-				}
-			FLUSH:
+				// Drain all shards opportunistically
+				drainShards(targetBatchSize)
 				flush()
 
 				// Dynamically adjust ticker when optimizer changes mode
@@ -219,6 +356,8 @@ func (b *Bus) startBatchWriter() {
 					curInterval = newInterval
 				}
 			case <-ticker.C:
+				// Periodic flush — drain all shards
+				drainShards(b.optimizer.GetBatchSize())
 				flush()
 			}
 		}
@@ -230,7 +369,7 @@ func (b *Bus) Close() error {
 	if b.optimizer != nil {
 		b.optimizer.Close()
 	}
-	close(b.writeChan)
+	b.writer.closeAll()
 	b.wg.Wait()
 	return b.db.Close()
 }
@@ -458,7 +597,9 @@ func (b *Bus) ensureTable(table string, colDefs []string) error {
 		return nil
 	}
 
-	createSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (id INTEGER PRIMARY KEY AUTOINCREMENT, %s)`,
+	// Use _spine_id as the internal auto-increment PK to avoid colliding
+	// with user payload fields named "id" (which would cause datatype mismatch).
+	createSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (_spine_id INTEGER PRIMARY KEY AUTOINCREMENT, %s)`,
 		table, strings.Join(colDefs, ", "))
 	if _, err := b.db.Exec(createSQL); err != nil {
 		return fmt.Errorf("create table failed: %w", err)
@@ -468,12 +609,12 @@ func (b *Bus) ensureTable(table string, colDefs []string) error {
 		parts := strings.Fields(colDef)
 		if len(parts) > 0 {
 			colName := strings.Trim(parts[0], `"`)
-			if colName != "id" {
+			if colName != "_spine_id" {
 				alterSQL := fmt.Sprintf(`ALTER TABLE "%s" ADD COLUMN %s`, table, colDef)
 				_, _ = b.db.Exec(alterSQL)
 			}
 
-			if strings.HasSuffix(colName, "_id") || colName == "email" || colName == "status" || colName == "state" {
+			if strings.HasSuffix(colName, "_id") || colName == "id" || colName == "email" || colName == "status" || colName == "state" {
 				idxSQL := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS "idx_%s_%s" ON "%s"("%s")`,
 					table, colName, table, colName)
 				_, _ = b.db.Exec(idxSQL)
@@ -493,58 +634,99 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 
 	table = b.sanitizeIdentCached(table)
 
-	// Pre-size all slices to payload length — eliminates append reallocation
-	colDefs := make([]string, 0, n)
-	colNames := make([]string, 0, n)
-	placeholders := make([]string, 0, n)
-	values := make([]interface{}, 0, n)
+	// Deterministic key ordering: sort payload keys for stable SQL + caching
+	keysPtr := sortedKeysPool.Get().(*[]string)
+	keys := (*keysPtr)[:0]
+	for k := range payload {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 
-	for k, v := range payload {
+	// Build cache fingerprint from sorted sanitized column names
+	var fpBuf strings.Builder
+	fpBuf.Grow(len(table) + n*10)
+	fpBuf.WriteString(table)
+	fpBuf.WriteByte('|')
+	sanitizedKeys := make([]string, n)
+	for i, k := range keys {
 		safe := b.sanitizeIdentCached(k)
-		colDefs = append(colDefs, fmt.Sprintf(`"%s" TEXT`, safe))
-		colNames = append(colNames, `"`+safe+`"`)
-		placeholders = append(placeholders, "?")
+		sanitizedKeys[i] = safe
+		if i > 0 {
+			fpBuf.WriteByte(',')
+		}
+		fpBuf.WriteString(safe)
+	}
+	fingerprint := fpBuf.String()
 
-		// Support template values in string fields
+	// Lookup or build the SQL template
+	var tmpl *sqlTemplate
+	if cached, ok := b.insertSQLCache.Load(fingerprint); ok {
+		tmpl = cached.(*sqlTemplate)
+	} else {
+		// Build column definitions without fmt.Sprintf
+		colDefs := make([]string, n)
+		for i, safe := range sanitizedKeys {
+			colDefs[i] = `"` + safe + `" TEXT`
+		}
+
+		// Ensure table exists (only on first encounter of this fingerprint)
+		if err := b.ensureTable(table, colDefs); err != nil {
+			*keysPtr = keys
+			sortedKeysPool.Put(keysPtr)
+			return err
+		}
+
+		// Build SQL string once
+		var sb strings.Builder
+		sb.Grow(64 + len(table) + n*12)
+		sb.WriteString(`INSERT INTO "`)
+		sb.WriteString(table)
+		sb.WriteString(`" (`)
+		for i, safe := range sanitizedKeys {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteByte('"')
+			sb.WriteString(safe)
+			sb.WriteByte('"')
+		}
+		sb.WriteString(") VALUES (")
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteByte('?')
+		}
+		sb.WriteByte(')')
+
+		tmpl = &sqlTemplate{
+			sql:      sb.String(),
+			colOrder: sanitizedKeys,
+			colDefs:  colDefs,
+		}
+		b.insertSQLCache.Store(fingerprint, tmpl)
+	}
+
+	// Build values in deterministic column order
+	values := make([]interface{}, n)
+	for i, k := range keys {
+		v := payload[k]
 		if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
-			values = append(values, ResolveVariables(strVal, eventName, payload))
+			values[i] = ResolveVariables(strVal, eventName, payload)
 		} else {
-			values = append(values, v)
+			values[i] = v
 		}
 	}
 
-	if err := b.ensureTable(table, colDefs); err != nil {
-		return err
-	}
+	// Return sorted keys to pool
+	*keysPtr = keys
+	sortedKeysPool.Put(keysPtr)
 
-	// Build SQL with strings.Builder — single allocation
-	var sb strings.Builder
-	sb.Grow(64 + len(table) + n*12)
-	sb.WriteString(`INSERT INTO "`)
-	sb.WriteString(table)
-	sb.WriteString(`" (`)
-	for i, c := range colNames {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteString(c)
-	}
-	sb.WriteString(") VALUES (")
-	for i := range placeholders {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteByte('?')
-	}
-	sb.WriteByte(')')
-
-	select {
-	case b.writeChan <- dbTask{query: sb.String(), params: values}:
-	default:
-		// Channel buffer backup queue
+	if !b.writer.submit(table, dbTask{query: tmpl.sql, params: values}) {
+		// All shards full — async overflow
 		go func(t dbTask) {
-			b.writeChan <- t
-		}(dbTask{query: sb.String(), params: values})
+			b.writer.submit(table, t)
+		}(dbTask{query: tmpl.sql, params: values})
 	}
 
 	return nil
@@ -558,60 +740,115 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 
 	table = b.sanitizeIdentCached(table)
 
+	// Deterministic where-key: use "id" if present, otherwise alphabetically first key
 	whereKey := ""
 	if _, ok := payload["id"]; ok {
 		whereKey = "id"
-	} else {
-		for k := range payload {
-			whereKey = k
-			break
-		}
 	}
 
-	// Pre-size slices
-	colDefs := make([]string, 0, n)
-	setClauses := make([]string, 0, n-1)
-	params := make([]interface{}, 0, n)
+	// Deterministic key ordering: sort payload keys for stable SQL + caching
+	keysPtr := sortedKeysPool.Get().(*[]string)
+	keys := (*keysPtr)[:0]
+	for k := range payload {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 
-	for k, v := range payload {
+	// If no "id", use alphabetically first key as deterministic where-key
+	if whereKey == "" {
+		whereKey = keys[0]
+	}
+
+	safeWhereKey := b.sanitizeIdentCached(whereKey)
+
+	// Build cache fingerprint from table + whereKey + sorted sanitized column names
+	var fpBuf strings.Builder
+	fpBuf.Grow(len(table) + len(safeWhereKey) + n*10)
+	fpBuf.WriteString(table)
+	fpBuf.WriteByte('|')
+	fpBuf.WriteString(safeWhereKey)
+	fpBuf.WriteByte('|')
+	sanitizedKeys := make([]string, n)
+	for i, k := range keys {
 		safe := b.sanitizeIdentCached(k)
-		colDefs = append(colDefs, fmt.Sprintf(`"%s" TEXT`, safe))
-		if k != whereKey {
-			setClauses = append(setClauses, `"`+safe+`" = ?`)
-			if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
-				params = append(params, ResolveVariables(strVal, eventName, payload))
-			} else {
-				params = append(params, v)
+		sanitizedKeys[i] = safe
+		if i > 0 {
+			fpBuf.WriteByte(',')
+		}
+		fpBuf.WriteString(safe)
+	}
+	fingerprint := fpBuf.String()
+
+	// Lookup or build the SQL template
+	var tmpl *sqlTemplate
+	if cached, ok := b.updateSQLCache.Load(fingerprint); ok {
+		tmpl = cached.(*sqlTemplate)
+	} else {
+		// Build column definitions without fmt.Sprintf
+		colDefs := make([]string, n)
+		for i, safe := range sanitizedKeys {
+			colDefs[i] = `"` + safe + `" TEXT`
+		}
+
+		// Ensure table exists (only on first encounter of this fingerprint)
+		if err := b.ensureTable(table, colDefs); err != nil {
+			*keysPtr = keys
+			sortedKeysPool.Put(keysPtr)
+			return err
+		}
+
+		// Build SQL string once: UPDATE "table" SET "col1" = ?, "col2" = ? WHERE "whereKey" = ?
+		var sb strings.Builder
+		sb.Grow(64 + len(table) + n*12)
+		sb.WriteString(`UPDATE "`)
+		sb.WriteString(table)
+		sb.WriteString(`" SET `)
+		first := true
+		for _, safe := range sanitizedKeys {
+			if safe == safeWhereKey {
+				continue
 			}
+			if !first {
+				sb.WriteString(", ")
+			}
+			sb.WriteByte('"')
+			sb.WriteString(safe)
+			sb.WriteString(`" = ?`)
+			first = false
+		}
+		sb.WriteString(` WHERE "`)
+		sb.WriteString(safeWhereKey)
+		sb.WriteString(`" = ?`)
+
+		tmpl = &sqlTemplate{
+			sql:      sb.String(),
+			colOrder: sanitizedKeys,
+			colDefs:  colDefs,
+		}
+		b.updateSQLCache.Store(fingerprint, tmpl)
+	}
+
+	// Build params in deterministic column order (SET values first, then WHERE value)
+	params := make([]interface{}, 0, n)
+	for _, k := range keys {
+		if k == whereKey {
+			continue
+		}
+		v := payload[k]
+		if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
+			params = append(params, ResolveVariables(strVal, eventName, payload))
+		} else {
+			params = append(params, v)
 		}
 	}
 	params = append(params, payload[whereKey])
 
-	if err := b.ensureTable(table, colDefs); err != nil {
-		return err
-	}
+	// Return sorted keys to pool
+	*keysPtr = keys
+	sortedKeysPool.Put(keysPtr)
 
-	// Build SQL with strings.Builder
-	safeWhereKey := b.sanitizeIdentCached(whereKey)
-	var sb strings.Builder
-	sb.Grow(64 + len(table) + n*12)
-	sb.WriteString(`UPDATE "`)
-	sb.WriteString(table)
-	sb.WriteString(`" SET `)
-	for i, c := range setClauses {
-		if i > 0 {
-			sb.WriteString(", ")
-		}
-		sb.WriteString(c)
-	}
-	sb.WriteString(` WHERE "`)
-	sb.WriteString(safeWhereKey)
-	sb.WriteString(`" = ?`)
-
-	select {
-	case b.writeChan <- dbTask{query: sb.String(), params: params}:
-	default:
-		if _, err := b.db.Exec(sb.String(), params...); err != nil {
+	if !b.writer.submit(table, dbTask{query: tmpl.sql, params: params}) {
+		if _, err := b.db.Exec(tmpl.sql, params...); err != nil {
 			return fmt.Errorf("update failed: %w", err)
 		}
 	}
@@ -628,7 +865,7 @@ func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload
 	if whereExpr == "" {
 		if idVal, ok := payload["id"]; ok {
 			// Parameterized query prevents SQL injection via payload values
-			deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE id = ?`, table)
+			deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE "id" = ?`, table)
 			params = []interface{}{idVal}
 		} else {
 			return fmt.Errorf("db.delete requires 'where' condition or 'id' in payload")
@@ -638,9 +875,7 @@ func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload
 		deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE %s`, table, whereExpr)
 	}
 
-	select {
-	case b.writeChan <- dbTask{query: deleteSQL, params: params}:
-	default:
+	if !b.writer.submit(table, dbTask{query: deleteSQL, params: params}) {
 		if _, err := b.db.Exec(deleteSQL, params...); err != nil {
 			return fmt.Errorf("delete failed: %w", err)
 		}
@@ -667,8 +902,7 @@ func (b *Bus) httpPost(step *manifest.RouteStep, eventName string, payload map[s
 		}
 	}
 
-	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Post(targetURL, "application/json", bytes.NewReader(bodyBytes))
+	resp, err := sharedHTTPClient.Post(targetURL, "application/json", bytes.NewReader(bodyBytes))
 	if err != nil {
 		return fmt.Errorf("http.post request to '%s' failed: %w", targetURL, err)
 	}
