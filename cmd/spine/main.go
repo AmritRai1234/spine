@@ -12,7 +12,7 @@ import (
 	"github.com/AmritRai1234/spine/pkg/manifest"
 )
 
-const version = "2.2.0"
+var version = spine.Version
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `Spine — Declarative Event-Driven Backend Engine (v%s)

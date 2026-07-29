@@ -141,10 +141,25 @@ func (e *Engine) HTTPHandler() http.Handler {
 }
 
 func (e *Engine) wrapMiddleware(handler http.HandlerFunc) http.HandlerFunc {
+	// Base handler wrapped with Auth and RateLimiting
 	h := middleware.AuthMiddleware(e.APIKey, handler)
 	if e.rateLimiter != nil {
 		h = e.rateLimiter.Middleware(h)
 	}
+
+	// Body size limiter for payload protection
+	h = middleware.BodyLimitMiddleware(maxRequestBodySize, h)
+
+	// Security headers & CORS
+	h = middleware.SecurityHeadersMiddleware(h)
+	h = middleware.CORSMiddleware(middleware.DefaultCORSOptions(), h)
+
+	// Logging & Request ID tracing
+	h = middleware.LoggingMiddleware(h)
+
+	// Outer panic recovery handler
+	h = middleware.RecoveryMiddleware(h)
+
 	return h
 }
 
