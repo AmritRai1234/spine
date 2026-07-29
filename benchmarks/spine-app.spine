@@ -1,0 +1,49 @@
+# spine-app.spine
+spine_version: 1
+
+database:
+  tables:
+    - leads
+    - status_updates
+    - items
+
+nodes:
+  BenchmarkNode:
+    owns_files:
+      - frontend/src/App.tsx
+    emits:
+      - event: SUBMIT_LEAD
+        payload:
+          email: string
+          name: string
+      - event: UPDATE_ITEM
+        payload:
+          id: string
+          value: string
+    listens:
+      - state: LEAD_STATUS
+        payload:
+          status: string
+          email: string
+      - state: ITEM_UPDATED
+        payload:
+          id: string
+          value: string
+
+routes:
+  - on: SUBMIT_LEAD
+    parallel: true
+    steps:
+      - action: db.insert
+        table: leads
+        input: "$event.payload"
+      - action: log.write
+        message: "[SPINE BENCHMARK] Lead received for $event.payload.email"
+    emit: LEAD_STATUS
+
+  - on: UPDATE_ITEM
+    steps:
+      - action: db.insert
+        table: items
+        input: "$event.payload"
+    emit: ITEM_UPDATED

@@ -1,0 +1,25 @@
+{
+  "name": "spine-vs-traditional-benchmarks",
+  "version": "1.0.0",
+  "description": "TypeScript performance benchmark suite comparing Spine vs Traditional REST Backend",
+  "main": "run-benchmarks.ts",
+  "scripts": {
+    "start:traditional": "ts-node traditional-server.ts",
+    "benchmark": "ts-node run-benchmarks.ts"
+  },
+  "dependencies": {
+    "autocannon": "^7.15.0",
+    "axios": "^1.7.2",
+    "express": "^4.19.2",
+    "ws": "^8.18.0"
+  },
+  "devDependencies": {
+    "@types/autocannon": "^7.12.5",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.14.9",
+    "@types/ws": "^8.5.10",
+    "playwright": "^1.45.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.5.2"
+  }
+}
