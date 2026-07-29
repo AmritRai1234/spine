@@ -59,21 +59,34 @@ Client Event → Load Balancer → Spine Node (Auth & Rate Limit) → Event Bus 
 
 ## Installation
 
-### From Source
+### 1. One-Line Universal Shell Installer (Linux / macOS)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/AmritRai1234/spine/main/install.sh | bash
+```
+
+### 2. Via `go install`
+
+```bash
+go install github.com/AmritRai1234/spine/cmd/spine@latest
+```
+
+### 3. Via Makefile (Source Build)
 
 ```bash
 git clone https://github.com/AmritRai1234/spine.git
 cd spine
-go build -o spine ./cmd/spine/
+make install
 ```
 
-### As a Go Module
+### 4. Python Client SDK (`pip`)
 
 ```bash
-go get github.com/AmritRai1234/spine@latest
+# Install Python Client SDK from repository
+pip install sdk/python/
 ```
 
-### Docker
+### 5. Docker
 
 ```bash
 docker build -t spine .
