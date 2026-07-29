@@ -125,3 +125,44 @@ func TestBodyLimitMiddleware(t *testing.T) {
 		t.Errorf("Expected 413 Payload Too Large, got %d", rec.Code)
 	}
 }
+
+func TestCustomContextMiddleware(t *testing.T) {
+	mgr := NewCustomContextManager()
+	mgr.SetStaticAttribute("region", "us-west-2")
+
+	// Custom extractor for location and temperature headers
+	mgr.AddExtractor(func(r *http.Request) map[string]interface{} {
+		return map[string]interface{}{
+			"location":    r.Header.Get("X-Location"),
+			"temperature": r.Header.Get("X-Device-Temp"),
+		}
+	})
+
+	dummyHandler := func(w http.ResponseWriter, r *http.Request) {
+		payload := map[string]interface{}{"user": "alice"}
+		merged := MergeCustomContextIntoPayload(r.Context(), payload)
+
+		if merged["location"] != "San Francisco, CA" {
+			t.Errorf("Expected location 'San Francisco, CA', got %v", merged["location"])
+		}
+		if merged["temperature"] != "72F" {
+			t.Errorf("Expected temperature '72F', got %v", merged["temperature"])
+		}
+		if merged["region"] != "us-west-2" {
+			t.Errorf("Expected region 'us-west-2', got %v", merged["region"])
+		}
+		w.WriteHeader(http.StatusOK)
+	}
+
+	handler := mgr.Middleware(dummyHandler)
+	req := httptest.NewRequest(http.MethodPost, "/emit", nil)
+	req.Header.Set("X-Location", "San Francisco, CA")
+	req.Header.Set("X-Device-Temp", "72F")
+
+	rec := httptest.NewRecorder()
+	handler(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Errorf("Expected status 200, got %d", rec.Code)
+	}
+}

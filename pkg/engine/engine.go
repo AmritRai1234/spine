@@ -43,17 +43,28 @@ var emitReqPool = sync.Pool{
 
 // Engine is the top-level Spine runtime combining Bus, Hub, and Server.
 type Engine struct {
-	Bus         *Bus
-	Hub         *Hub
-	Schema      *manifest.SpineSchema
-	APIKey      string
-	rateLimiter *middleware.RateLimitManager
-	spineFile   string
+	Bus           *Bus
+	Hub           *Hub
+	Schema        *manifest.SpineSchema
+	APIKey        string
+	rateLimiter   *middleware.RateLimitManager
+	customContext *middleware.CustomContextManager
+	spineFile     string
 }
 
 // SetRateLimit enables IP-based token bucket rate limiting on public endpoints.
 func (e *Engine) SetRateLimit(rps, burst float64) {
 	e.rateLimiter = middleware.NewRateLimitManager(rps, burst)
+}
+
+// RegisterCustomExtractor registers a function to dynamically extract custom attributes (e.g. location, temperature, device info) from HTTP requests.
+func (e *Engine) RegisterCustomExtractor(fn middleware.CustomExtractorFunc) {
+	e.customContext.AddExtractor(fn)
+}
+
+// SetStaticContext registers a static key-value attribute into request context (e.g. region="us-west-2", environment="production").
+func (e *Engine) SetStaticContext(key string, value interface{}) {
+	e.customContext.SetStaticAttribute(key, value)
 }
 
 // New creates a fully wired Engine from a parsed schema.
@@ -65,7 +76,12 @@ func New(schema *manifest.SpineSchema, dbPath string) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{Bus: bus, Hub: hub, Schema: schema}, nil
+	return &Engine{
+		Bus:           bus,
+		Hub:           hub,
+		Schema:        schema,
+		customContext: middleware.NewCustomContextManager(),
+	}, nil
 }
 
 // NewFromFile parses a manifest and creates an Engine.
@@ -153,6 +169,11 @@ func (e *Engine) wrapMiddleware(handler http.HandlerFunc) http.HandlerFunc {
 	// Security headers & CORS
 	h = middleware.SecurityHeadersMiddleware(h)
 	h = middleware.CORSMiddleware(middleware.DefaultCORSOptions(), h)
+
+	// Custom Context Extractor (Location, Temperature, Custom Metadata)
+	if e.customContext != nil {
+		h = e.customContext.Middleware(h)
+	}
 
 	// Logging & Request ID tracing
 	h = middleware.LoggingMiddleware(h)
@@ -242,6 +263,9 @@ func (e *Engine) buildMux() *http.ServeMux {
 		if body.Payload == nil {
 			body.Payload = make(map[string]interface{})
 		}
+
+		// Merge custom context attributes (e.g. location, temperature, device, custom fields)
+		body.Payload = middleware.MergeCustomContextIntoPayload(r.Context(), body.Payload)
 
 		result, emitErr := e.Bus.Emit(body.Event, body.Payload)
 
