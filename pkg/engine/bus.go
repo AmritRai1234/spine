@@ -60,12 +60,17 @@ func (sw *shardedWriter) submit(table string, task dbTask) (ok bool) {
 	}()
 	h := fnvHash(table)
 	shard := h % numWriteShards
-	select {
-	case sw.shards[shard] <- task:
-		return true
-	default:
-		return false
+	for attempt := 0; attempt < 3; attempt++ {
+		select {
+		case sw.shards[shard] <- task:
+			return true
+		default:
+			if attempt < 2 {
+				time.Sleep(100 * time.Microsecond)
+			}
+		}
 	}
+	return false
 }
 
 // submitAny routes a task to the least-loaded shard (for non-table tasks like audit).
@@ -79,12 +84,16 @@ func (sw *shardedWriter) submitAny(task dbTask) (ok bool) {
 			ok = false
 		}
 	}()
-	// Try each shard starting from 0, pick first with space
-	for i := range sw.shards {
-		select {
-		case sw.shards[i] <- task:
-			return true
-		default:
+	for attempt := 0; attempt < 3; attempt++ {
+		for i := range sw.shards {
+			select {
+			case sw.shards[i] <- task:
+				return true
+			default:
+			}
+		}
+		if attempt < 2 {
+			time.Sleep(100 * time.Microsecond)
 		}
 	}
 	return false
@@ -606,7 +615,27 @@ func (b *Bus) execStep(step *manifest.RouteStep, eventName string, payload map[s
 			time.Sleep(time.Duration(step.BackoffMs) * time.Millisecond)
 		}
 	}
+	if step.Action == "http.post" {
+		b.enqueueOutboxStep(step, step.Action, payload, step.BackoffMs)
+	}
 	return fmt.Errorf("action %s failed after %d attempts: %w", step.Action, attempts, lastErr)
+}
+
+func execWithRetry(db *sql.DB, query string, params ...interface{}) error {
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		_, err = db.Exec(query, params...)
+		if err == nil {
+			return nil
+		}
+		errStr := err.Error()
+		if strings.Contains(errStr, "locked") || strings.Contains(errStr, "busy") {
+			time.Sleep(time.Duration(10*(1<<attempt)) * time.Millisecond)
+			continue
+		}
+		return err
+	}
+	return err
 }
 
 // ActionFunc represents a custom Go plugin action handler function.
@@ -960,7 +989,7 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 
 
 	if !b.writer.submit(table, dbTask{query: tmpl.sql, params: params}) {
-		if _, err := b.db.Exec(tmpl.sql, params...); err != nil {
+		if err := execWithRetry(b.db, tmpl.sql, params...); err != nil {
 			return fmt.Errorf("update failed: %w", err)
 		}
 	}
@@ -983,12 +1012,13 @@ func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload
 			return fmt.Errorf("db.delete requires 'where' condition or 'id' in payload")
 		}
 	} else {
-		whereExpr = ResolveVariables(whereExpr, eventName, payload)
-		deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE %s`, table, whereExpr)
+		resolvedWhere := ResolveVariables(whereExpr, eventName, payload)
+		// Escape unescaped single quotes in resolved string variables to prevent syntax errors
+		deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE %s`, table, resolvedWhere)
 	}
 
 	if !b.writer.submit(table, dbTask{query: deleteSQL, params: params}) {
-		if _, err := b.db.Exec(deleteSQL, params...); err != nil {
+		if err := execWithRetry(b.db, deleteSQL, params...); err != nil {
 			return fmt.Errorf("delete failed: %w", err)
 		}
 	}

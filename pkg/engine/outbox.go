@@ -14,6 +14,7 @@ func (b *Bus) initOutboxTable() {
 		id INTEGER PRIMARY KEY AUTOINCREMENT,
 		action TEXT NOT NULL,
 		payload TEXT NOT NULL,
+		step_data TEXT DEFAULT '',
 		attempts INTEGER DEFAULT 0,
 		status TEXT DEFAULT 'pending',
 		next_retry_at TEXT NOT NULL,
@@ -21,11 +22,18 @@ func (b *Bus) initOutboxTable() {
 	);
 	CREATE INDEX IF NOT EXISTS "idx_spine_outbox_status" ON "_spine_outbox"("status", "next_retry_at");`
 	b.db.Exec(query)
+	// Ensure step_data column exists on upgraded schemas
+	b.db.Exec(`ALTER TABLE "_spine_outbox" ADD COLUMN step_data TEXT DEFAULT ''`)
 }
 
 // enqueueOutbox persistent retry task into _spine_outbox table.
-// Signals the processor to wake up immediately via outboxNotify.
 func (b *Bus) enqueueOutbox(action string, payload map[string]interface{}, backoffMs int) {
+	b.enqueueOutboxStep(nil, action, payload, backoffMs)
+}
+
+// enqueueOutboxStep persistent retry task into _spine_outbox table with full RouteStep context.
+// Signals the processor to wake up immediately via outboxNotify.
+func (b *Bus) enqueueOutboxStep(step *manifest.RouteStep, action string, payload map[string]interface{}, backoffMs int) {
 	if backoffMs <= 0 {
 		if reg := b.GetRegistry(); reg != nil && reg.GetSchema() != nil && reg.GetSchema().Database.Outbox.BackoffMs > 0 {
 			backoffMs = reg.GetSchema().Database.Outbox.BackoffMs
@@ -34,12 +42,22 @@ func (b *Bus) enqueueOutbox(action string, payload map[string]interface{}, backo
 		}
 	}
 
+	if action == "" && step != nil {
+		action = step.Action
+	}
+
 	payloadBytes, _ := json.Marshal(payload)
+	var stepDataStr string
+	if step != nil {
+		stepBytes, _ := json.Marshal(step)
+		stepDataStr = string(stepBytes)
+	}
+
 	now := time.Now().UTC()
 	nextRetry := now.Add(time.Duration(backoffMs) * time.Millisecond).Format(time.RFC3339)
 
-	insertSQL := `INSERT INTO "_spine_outbox" (action, payload, attempts, status, next_retry_at, created_at) VALUES (?, ?, 1, 'pending', ?, ?)`
-	params := []interface{}{action, string(payloadBytes), nextRetry, now.Format(time.RFC3339)}
+	insertSQL := `INSERT INTO "_spine_outbox" (action, payload, step_data, attempts, status, next_retry_at, created_at) VALUES (?, ?, ?, 1, 'pending', ?, ?)`
+	params := []interface{}{action, string(payloadBytes), stepDataStr, nextRetry, now.Format(time.RFC3339)}
 
 	b.writer.submitAny(dbTask{query: insertSQL, params: params})
 
@@ -80,7 +98,7 @@ func (b *Bus) processOutboxQueue() {
 		maxWorkers, maxRetries, backoffMs := getOutboxConfig()
 		nowStr := time.Now().UTC().Format(time.RFC3339)
 
-		rows, err := b.db.Query(`SELECT id, action, payload, attempts FROM "_spine_outbox" WHERE status = 'pending' AND next_retry_at <= ? ORDER BY id ASC LIMIT 50`, nowStr)
+		rows, err := b.db.Query(`SELECT id, action, payload, COALESCE(step_data, ''), attempts FROM "_spine_outbox" WHERE status = 'pending' AND next_retry_at <= ? ORDER BY id ASC LIMIT 50`, nowStr)
 		if err != nil {
 			return
 		}
@@ -89,12 +107,13 @@ func (b *Bus) processOutboxQueue() {
 			id       int64
 			action   string
 			payload  string
+			stepData string
 			attempts int
 		}
 		var pending []outboxTask
 		for rows.Next() {
 			var task outboxTask
-			if err := rows.Scan(&task.id, &task.action, &task.payload, &task.attempts); err == nil {
+			if err := rows.Scan(&task.id, &task.action, &task.payload, &task.stepData, &task.attempts); err == nil {
 				pending = append(pending, task)
 			}
 		}
@@ -122,6 +141,9 @@ func (b *Bus) processOutboxQueue() {
 
 				step := &manifest.RouteStep{
 					Action: t.action,
+				}
+				if t.stepData != "" {
+					_ = json.Unmarshal([]byte(t.stepData), step)
 				}
 
 				err := b.execStep(step, "_spine_outbox_retry", payload)

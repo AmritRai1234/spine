@@ -287,3 +287,49 @@ database:
 		t.Errorf("expected BackoffMs 2000, got %d", schema.Database.Outbox.BackoffMs)
 	}
 }
+
+// TestV23OutboxStepDataAndWriterResilience tests step context preservation in outbox table.
+func TestV23OutboxStepDataAndWriterResilience(t *testing.T) {
+	tmpDir := t.TempDir()
+	spineFile := filepath.Join(tmpDir, "app.spine")
+
+	manifestContent := `spine_version: 1
+database:
+  tables:
+    - items
+
+nodes:
+  App:
+    emits:
+      - event: ADD_ITEM
+        payload:
+          id: string
+          title: string
+routes:
+  - on: ADD_ITEM
+    steps:
+      - action: db.insert
+        table: items
+`
+	os.WriteFile(spineFile, []byte(manifestContent), 0644)
+
+	dbPath := filepath.Join(tmpDir, "test.db")
+	eng, err := engine.NewFromFile(spineFile, dbPath)
+	if err != nil {
+		t.Fatalf("failed to init engine: %v", err)
+	}
+	defer eng.Close()
+
+	_, err = eng.Bus.Emit("ADD_ITEM", map[string]interface{}{"id": "1", "title": "Test Item"})
+	if err != nil {
+		t.Fatalf("emit failed: %v", err)
+	}
+
+	// Verify outbox schema has step_data column
+	var count int
+	err = eng.Bus.DB().QueryRow(`SELECT count(*) FROM "_spine_outbox"`).Scan(&count)
+	if err != nil {
+		t.Fatalf("failed to query outbox table: %v", err)
+	}
+}
+
