@@ -497,14 +497,21 @@ Options:
 
 func cmdInit(args []string) {
 	targetDir := "."
+	templateName := "default"
+
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--help", "-h":
-			fmt.Fprintf(os.Stderr, `Usage: spine init [directory]
+			fmt.Fprintf(os.Stderr, `Usage: spine init [directory] [--template chat|dashboard|iot]
 
-Scaffolds a new Spine project with starter manifest, DB schema, and .env configuration.
+Scaffolds a new Spine project with starter manifest, DB schema, and starter template.
 `)
 			return
+		case "--template":
+			i++
+			if i < len(args) {
+				templateName = args[i]
+			}
 		default:
 			if !strings.HasPrefix(args[i], "-") {
 				targetDir = args[i]
@@ -519,7 +526,78 @@ Scaffolds a new Spine project with starter manifest, DB schema, and .env configu
 		}
 	}
 
-	manifestContent := `spine_version: 1
+	var manifestContent string
+
+	switch templateName {
+	case "chat":
+		manifestContent = `spine_version: 1
+database:
+  tables:
+    - messages
+    - rooms
+
+nodes:
+  ChatNode:
+    emits:
+      - event: SEND_MESSAGE
+        payload:
+          room_id: string
+          sender: string
+          content: string
+
+routes:
+  - on: SEND_MESSAGE
+    steps:
+      - action: db.insert
+        table: messages
+    emit: MESSAGE_BROADCAST
+`
+	case "dashboard":
+		manifestContent = `spine_version: 1
+database:
+  tables:
+    - metrics_log
+    - alerts
+
+nodes:
+  AnalyticsNode:
+    emits:
+      - event: RECORD_METRIC
+        payload:
+          metric_name: string
+          value: number
+
+routes:
+  - on: RECORD_METRIC
+    steps:
+      - action: db.insert
+        table: metrics_log
+    emit: METRICS_UPDATED
+`
+	case "iot":
+		manifestContent = `spine_version: 1
+database:
+  tables:
+    - sensor_telemetry
+    - device_status
+
+nodes:
+  SensorNode:
+    emits:
+      - event: TELEMETRY_READING
+        payload:
+          device_id: string
+          temperature: number
+
+routes:
+  - on: TELEMETRY_READING
+    steps:
+      - action: db.insert
+        table: sensor_telemetry
+    emit: TELEMETRY_BROADCAST
+`
+	default:
+		manifestContent = `spine_version: 1
 
 access:
   - role: admin
@@ -549,6 +627,7 @@ routes:
         table: users
     emit: SIGNUP_COMPLETED
 `
+	}
 
 	manifestPath := filepath.Join(targetDir, "app.spine")
 	if err := os.WriteFile(manifestPath, []byte(manifestContent), 0644); err != nil {
