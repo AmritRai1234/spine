@@ -9,6 +9,7 @@ export class SpineClient {
   private ws: WebSocket | null = null;
   private subscriptions: Map<string, Set<StateCallback>> = new Map();
   private isConnected: boolean = false;
+  private lastSeenID: number = 0;
 
   constructor(options: SpineClientOptions) {
     this.baseUrl = options.baseUrl.replace(/\/$/, '');
@@ -38,9 +39,15 @@ export class SpineClient {
         this.ws = new WebSocket(url);
 
         this.ws.onopen = () => {
+          const isReconnection = this.isConnected === false && this.lastSeenID > 0;
           this.isConnected = true;
+
           if (this.apiKey) {
             this.ws?.send(JSON.stringify({ type: 'auth', token: this.apiKey }));
+          }
+
+          if (isReconnection) {
+            this.ws?.send(JSON.stringify({ type: 'reconnect', last_seen_id: this.lastSeenID }));
           }
           resolve();
         };
@@ -48,7 +55,18 @@ export class SpineClient {
         this.ws.onmessage = (event) => {
           try {
             const data = JSON.parse(event.data);
-            if (data.state && data.payload) {
+            if (data.id && typeof data.id === 'number') {
+              this.lastSeenID = Math.max(this.lastSeenID, data.id);
+            }
+
+            if (data.type === 'reconnect_ack' && Array.isArray(data.missed_events)) {
+              for (const evt of data.missed_events) {
+                if (evt.state && evt.payload) {
+                  const callbacks = this.subscriptions.get(evt.state);
+                  if (callbacks) callbacks.forEach((cb) => cb(evt.state, evt.payload));
+                }
+              }
+            } else if (data.state && data.payload) {
               const callbacks = this.subscriptions.get(data.state);
               if (callbacks) {
                 callbacks.forEach((cb) => cb(data.state, data.payload));

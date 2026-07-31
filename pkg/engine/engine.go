@@ -588,6 +588,35 @@ func (e *Engine) buildMux() *http.ServeMux {
 					continue
 				}
 
+				// Handle WebSocket reconnect handshake with event log replay
+				if msgType, _ := raw["type"].(string); msgType == "reconnect" {
+					lastSeenIDFloat, _ := raw["last_seen_id"].(float64)
+					lastSeenID := int64(lastSeenIDFloat)
+
+					logs, err := e.Bus.GetEventLogs("", 100, 0)
+					var missedEvents []map[string]interface{}
+					if err == nil {
+						for _, logItem := range logs {
+							if id, ok := logItem["id"].(int64); ok && id > lastSeenID {
+								missedEvents = append(missedEvents, logItem)
+							}
+						}
+					}
+
+					ack := map[string]interface{}{
+						"type":          "reconnect_ack",
+						"status":        "ok",
+						"replayed":      len(missedEvents),
+						"missed_events": missedEvents,
+					}
+					ackBytes, _ := json.Marshal(ack)
+					select {
+					case client.Send <- ackBytes:
+					default:
+					}
+					continue
+				}
+
 				// Handle event emit request
 				var req struct {
 					Event   string                 `json:"event"`
