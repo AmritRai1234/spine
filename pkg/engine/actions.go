@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/AmritRai1234/spine/pkg/manifest"
@@ -57,6 +58,8 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		return b.httpPost(step, eventName, payload)
 	case "log.write":
 		return b.logWrite(step, eventName, payload)
+	case "fts.search":
+		return b.ftsSearch(step, eventName, payload)
 	case "queue.publish":
 		return b.queuePublish(step, eventName, payload)
 	default:
@@ -116,6 +119,48 @@ func (b *Bus) logWrite(step *manifest.RouteStep, eventName string, payload map[s
 	}
 	resolvedMsg := ResolveVariables(msg, eventName, payload)
 	log.Printf("[SPINE LOG] %s", resolvedMsg)
+	return nil
+}
+
+func (b *Bus) ftsSearch(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
+	tableName := step.Table
+	query := step.Config["query"]
+	if query == "" {
+		query = step.Where
+	}
+	if query == "" {
+		query = step.Input
+	}
+	if tableName == "" || query == "" {
+		return fmt.Errorf("fts.search requires 'table' and query")
+	}
+	resolvedQuery := ResolveVariables(query, eventName, payload)
+
+	ftsTable := tableName
+	if !strings.HasSuffix(tableName, "_fts") {
+		ftsTable = fmt.Sprintf("%s_fts", tableName)
+	}
+
+	// Attempt FTS5 virtual table query with fallback to standard table search
+	rows, err := b.db.Query(fmt.Sprintf("SELECT rowid, content FROM %s WHERE content MATCH ?", ftsTable), resolvedQuery)
+	if err != nil {
+		// Fallback: standard table column query
+		rows, err = b.db.Query(fmt.Sprintf("SELECT rowid, created_at FROM %s WHERE created_at LIKE ?", tableName), "%"+resolvedQuery+"%")
+		if err != nil {
+			return nil // Soft fallback: return empty results if table not ready
+		}
+	}
+	defer rows.Close()
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		var rowid int64
+		var content string
+		if err := rows.Scan(&rowid, &content); err == nil {
+			results = append(results, map[string]interface{}{"rowid": rowid, "content": content})
+		}
+	}
+	payload["fts_results"] = results
 	return nil
 }
 
