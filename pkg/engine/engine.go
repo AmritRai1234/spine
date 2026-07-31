@@ -302,6 +302,51 @@ func (e *Engine) buildMux() *http.ServeMux {
 		w.Write([]byte(`{"status":"ready"}`))
 	})
 
+	mux.HandleFunc("/webhook/", e.wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.Method != http.MethodPost {
+			w.WriteHeader(405)
+			w.Write([]byte(`{"status":"error","error":"method_not_allowed"}`))
+			return
+		}
+
+		provider := strings.TrimPrefix(r.URL.Path, "/webhook/")
+		if provider == "" {
+			w.WriteHeader(400)
+			w.Write([]byte(`{"status":"error","error":"missing_webhook_provider"}`))
+			return
+		}
+
+		body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBodySize))
+		if err != nil {
+			w.WriteHeader(400)
+			w.Write([]byte(`{"status":"error","error":"cannot_read_body"}`))
+			return
+		}
+
+		var payload map[string]interface{}
+		if err := json.Unmarshal(body, &payload); err != nil {
+			payload = map[string]interface{}{"raw_body": string(body)}
+		}
+
+		eventName := fmt.Sprintf("WEBHOOK_%s", strings.ToUpper(provider))
+		payload["_provider"] = provider
+
+		res, err := e.Bus.Emit(eventName, payload)
+		if err != nil {
+			w.WriteHeader(500)
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": err.Error()})
+			return
+		}
+
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"status":   "ok",
+			"provider": provider,
+			"event":    eventName,
+			"result":   res,
+		})
+	}))
+
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		opt := e.Bus.GetOptimizer()
