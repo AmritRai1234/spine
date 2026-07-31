@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -23,6 +24,8 @@ Usage:
 
 Commands:
   serve     Start the Spine HTTP/WS server from a .spine manifest
+  dev       Start hot-reloading development server with colored logging
+  init      Scaffold a new Spine backend project
   emit      Emit an event to a running Spine server
   parse     Validate and inspect a .spine manifest file
   codegen   Generate TypeScript types from a .spine manifest file
@@ -42,6 +45,10 @@ func main() {
 	switch os.Args[1] {
 	case "serve":
 		cmdServe(os.Args[2:])
+	case "dev":
+		cmdDev(os.Args[2:])
+	case "init":
+		cmdInit(os.Args[2:])
 	case "emit":
 		cmdEmit(os.Args[2:])
 	case "parse":
@@ -482,5 +489,137 @@ Options:
 			fmt.Printf(" error=%s", res.Error)
 		}
 		fmt.Println()
+	}
+}
+
+func cmdInit(args []string) {
+	targetDir := "."
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--help", "-h":
+			fmt.Fprintf(os.Stderr, `Usage: spine init [directory]
+
+Scaffolds a new Spine project with starter manifest, DB schema, and .env configuration.
+`)
+			return
+		default:
+			if !strings.HasPrefix(args[i], "-") {
+				targetDir = args[i]
+			}
+		}
+	}
+
+	if targetDir != "." {
+		if err := os.MkdirAll(targetDir, 0755); err != nil {
+			fmt.Fprintf(os.Stderr, "✗ Failed to create directory '%s': %v\n", targetDir, err)
+			os.Exit(1)
+		}
+	}
+
+	manifestContent := `spine_version: 1
+
+access:
+  - role: admin
+    key: "$ADMIN_SECRET"
+
+  - role: public
+    key: "sk_public_key"
+    events:
+      - USER_SIGNUP
+
+database:
+  tables:
+    - users
+
+nodes:
+  AuthNode:
+    emits:
+      - event: USER_SIGNUP
+        payload:
+          email: string
+          name: string
+
+routes:
+  - on: USER_SIGNUP
+    steps:
+      - action: db.insert
+        table: users
+    emit: SIGNUP_COMPLETED
+`
+
+	manifestPath := filepath.Join(targetDir, "app.spine")
+	if err := os.WriteFile(manifestPath, []byte(manifestContent), 0644); err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Failed to write app.spine: %v\n", err)
+		os.Exit(1)
+	}
+
+	envContent := `ADMIN_SECRET=sk_admin_secret_12345
+SPINE_PORT=8080
+SPINE_DB=spine.db
+`
+	envPath := filepath.Join(targetDir, ".env.example")
+	_ = os.WriteFile(envPath, []byte(envContent), 0644)
+
+	fmt.Printf("✓ Initialized Spine project in '%s'\n", targetDir)
+	fmt.Printf("  ├── app.spine\n")
+	fmt.Printf("  └── .env.example\n\n")
+	fmt.Printf("Run 'spine dev app.spine' to start your local dev server.\n")
+}
+
+func cmdDev(args []string) {
+	var (
+		manifestPath string = "app.spine"
+		port         string = "8080"
+		dbPath       string = "spine_dev.db"
+	)
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--help", "-h":
+			fmt.Fprintf(os.Stderr, `Usage: spine dev [manifest.spine] [--port <port>] [--db <path>]
+
+Starts a hot-reloading development server with verbose event stream logging.
+`)
+			return
+		case "--port":
+			i++
+			if i < len(args) {
+				port = args[i]
+			}
+		case "--db":
+			i++
+			if i < len(args) {
+				dbPath = args[i]
+			}
+		default:
+			if !strings.HasPrefix(args[i], "-") {
+				manifestPath = args[i]
+			}
+		}
+	}
+
+	if _, err := os.Stat(manifestPath); err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Manifest file '%s' not found. Run 'spine init' to create one.\n", manifestPath)
+		os.Exit(1)
+	}
+
+	fmt.Printf("\033[36m[SPINE DEV]\033[0m Starting Spine Dev Server on http://localhost:%s (hot-reload enabled)\n", port)
+	fmt.Printf("\033[36m[SPINE DEV]\033[0m Database: %s | Manifest: %s\n", dbPath, manifestPath)
+
+	eng, err := spine.NewFromFile(manifestPath, dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "\033[31m[SPINE DEV] ✗ Engine init error: %v\033[0m\n", err)
+		os.Exit(1)
+	}
+	defer eng.Close()
+
+	server := &http.Server{
+		Addr:    ":" + port,
+		Handler: eng.HTTPHandler(),
+	}
+
+	fmt.Printf("\033[32m[SPINE DEV] ✓ Engine ready and listening for events...\033[0m\n")
+	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+		fmt.Fprintf(os.Stderr, "\033[31m[SPINE DEV] ✗ Server error: %v\033[0m\n", err)
 	}
 }

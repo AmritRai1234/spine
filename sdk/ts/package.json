@@ -1,0 +1,20 @@
+{
+  "name": "@spine/client",
+  "version": "1.0.0",
+  "description": "First-class reactive TypeScript SDK for Spine event-driven backends",
+  "main": "dist/index.js",
+  "module": "dist/index.mjs",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc"
+  },
+  "keywords": [
+    "spine",
+    "realtime",
+    "event-driven",
+    "websocket",
+    "reactive"
+  ],
+  "author": "Spine Team",
+  "license": "MIT"
+}
