@@ -309,6 +309,23 @@ spine_optimizer_mode{mode="%s"} 1
 		w.Write([]byte(metrics))
 	})
 
+	mux.HandleFunc("/admin/usage", e.wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		opt := e.Bus.GetOptimizer()
+		rps := 0.0
+		if opt != nil {
+			rps = opt.GetRPS()
+		}
+
+		usage := map[string]interface{}{
+			"status":            "ok",
+			"events_per_second": rps,
+			"ws_connections":    e.Hub.ClientCount(),
+			"timestamp":         time.Now().Format(time.RFC3339),
+		}
+		json.NewEncoder(w).Encode(usage)
+	}))
+
 	mux.HandleFunc("/schema", e.wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(e.Bus.GetRegistry().GetSchema())

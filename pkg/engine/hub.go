@@ -45,6 +45,12 @@ func NewHub() *Hub {
 	}
 }
 
+func (h *Hub) ClientCount() int {
+	h.mu.RLock()
+	defer h.mu.RUnlock()
+	return len(h.clients)
+}
+
 func (h *Hub) Run() {
 	// Start the async broadcast drainer
 	go h.broadcastLoop()
@@ -114,10 +120,4 @@ func (h *Hub) BroadcastState(stateName, eventName string, payload map[string]int
 	default:
 		// Broadcast channel full — drop to protect Emit throughput
 	}
-}
-
-func (h *Hub) ClientCount() int {
-	h.mu.RLock()
-	defer h.mu.RUnlock()
-	return len(h.clients)
 }
