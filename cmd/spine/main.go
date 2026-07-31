@@ -27,6 +27,7 @@ Commands:
   dev       Start hot-reloading development server with colored logging
   init      Scaffold a new Spine backend project
   test      Execute manifest-defined test assertions against a manifest
+  deploy    Deploy Spine engine application to cloud providers (Fly.io/Railway/Render)
   emit      Emit an event to a running Spine server
   parse     Validate and inspect a .spine manifest file
   codegen   Generate TypeScript types from a .spine manifest file
@@ -52,6 +53,8 @@ func main() {
 		cmdInit(os.Args[2:])
 	case "test":
 		cmdTest(os.Args[2:])
+	case "deploy":
+		cmdDeploy(os.Args[2:])
 	case "emit":
 		cmdEmit(os.Args[2:])
 	case "parse":
@@ -751,4 +754,64 @@ Runs manifest integration suite: parses manifest, validates route topologies, an
 	fmt.Printf("✓ Declared routes: %d\n", len(schema.Routes))
 	fmt.Printf("✓ Declared tables: %d\n", len(schema.DbTables))
 	fmt.Printf("\n\033[32m✓ All manifest test assertions passed!\033[0m\n")
+}
+
+func cmdDeploy(args []string) {
+	target := "fly"
+	if len(args) > 0 && !strings.HasPrefix(args[0], "-") {
+		target = args[0]
+	}
+
+	switch target {
+	case "fly", "fly.io":
+		flytoml := `app = "spine-app"
+primary_region = "iad"
+
+[build]
+  builder = "paketobuildpacks/builder:base"
+
+[env]
+  SPINE_ENV = "prod"
+  PORT = "8080"
+
+[[services]]
+  internal_port = 8080
+  protocol = "tcp"
+  [services.concurrency]
+    hard_limit = 25
+    soft_limit = 20
+
+  [[services.ports]]
+    handlers = ["http"]
+    port = 80
+
+  [[services.ports]]
+    handlers = ["tls", "http"]
+    port = 443
+`
+		_ = os.WriteFile("fly.toml", []byte(flytoml), 0644)
+		fmt.Printf("✓ Generated fly.toml for Fly.io deployment\n")
+		fmt.Printf("Run 'fly deploy' to launch your Spine application on Fly.io.\n")
+
+	case "railway":
+		dockerfile := `FROM golang:1.24-alpine AS builder
+WORKDIR /app
+COPY . .
+RUN go build -o spine ./cmd/spine
+
+FROM alpine:latest
+WORKDIR /app
+COPY --from=builder /app/spine /usr/local/bin/spine
+COPY app.spine .
+EXPOSE 8080
+CMD ["spine", "serve", "app.spine", "--port", "8080"]
+`
+		_ = os.WriteFile("Dockerfile", []byte(dockerfile), 0644)
+		fmt.Printf("✓ Generated Dockerfile for Railway / Render deployment\n")
+		fmt.Printf("Run 'railway up' or push to GitHub for automatic deployment.\n")
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown deployment target: %s (expected: fly, railway, render)\n", target)
+		os.Exit(1)
+	}
 }
