@@ -205,9 +205,14 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				continue
 			}
 
-			// Unknown top-level key detection
+			// Unknown top-level key detection with "did you mean?" suggestion
 			if strings.Contains(trimmed, ":") {
 				key := strings.TrimSpace(trimmed[:strings.Index(trimmed, ":")])
+				validKeys := []string{"spine_version", "includes", "database", "access", "nodes", "routes"}
+				suggestion := suggestSimilarKey(key, validKeys)
+				if suggestion != "" {
+					return nil, parseError(manifestPath, lineno, "unknown top-level key '%s'. Did you mean '%s'?", key, suggestion)
+				}
 				return nil, parseError(manifestPath, lineno, "unknown top-level key '%s' (expected: spine_version, includes, database, access, nodes, routes)", key)
 			}
 		}
@@ -693,10 +698,61 @@ func validateSchema(file string, schema *SpineSchema) error {
 				}
 			}
 			if !isChainedState {
+				var declaredList []string
+				for ev := range knownEvents {
+					declaredList = append(declaredList, ev)
+				}
+				suggestion := suggestSimilarKey(route.OnEvent, declaredList)
+				if suggestion != "" {
+					return parseError(file, 0, "route references event '%s' which is not declared in any node's emits. Did you mean '%s'?", route.OnEvent, suggestion)
+				}
 				return parseError(file, 0, "route references event '%s' which is not declared in any node's emits (possible typo?)", route.OnEvent)
 			}
 		}
 	}
 
 	return nil
+}
+
+func suggestSimilarKey(input string, validKeys []string) string {
+	bestMatch := ""
+	minDist := 3
+
+	for _, k := range validKeys {
+		dist := levDistance(strings.ToLower(input), strings.ToLower(k))
+		if dist < minDist {
+			minDist = dist
+			bestMatch = k
+		}
+	}
+	return bestMatch
+}
+
+func levDistance(a, b string) int {
+	la, lb := len(a), len(b)
+	if la == 0 {
+		return lb
+	}
+	if lb == 0 {
+		return la
+	}
+	v0 := make([]int, lb+1)
+	v1 := make([]int, lb+1)
+	for i := 0; i <= lb; i++ {
+		v0[i] = i
+	}
+	for i := 0; i < la; i++ {
+		v1[0] = i + 1
+		for j := 0; j < lb; j++ {
+			cost := 0
+			if a[i] != b[j] {
+				cost = 1
+			}
+			v1[j+1] = min(v0[j+1]+1, min(v1[j]+1, v0[j]+cost))
+		}
+		for j := 0; j <= lb; j++ {
+			v0[j] = v1[j]
+		}
+	}
+	return v0[lb]
 }

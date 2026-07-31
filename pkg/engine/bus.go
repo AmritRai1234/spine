@@ -110,7 +110,30 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 		_ = bus.ensureTable(tbl, []string{"created_at TEXT"})
 	}
 
+	// Adaptive WAL Checkpointing worker (Year 1 Performance):
+	// Runs passive/truncate WAL checkpoints during low traffic windows (RPS < 10) to avoid write stalls
+	if driver == "sqlite3" {
+		bus.startAdaptiveCheckpointing()
+	}
+
 	return bus, nil
+}
+
+func (b *Bus) startAdaptiveCheckpointing() {
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		ticker := time.NewTicker(5 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			// Check if we are in low-traffic mode (RPS < 10)
+			if b.optimizer != nil && b.optimizer.GetRPS() < 10.0 {
+				// Run PASSIVE checkpoint (does not block active concurrent writers)
+				_, _ = b.db.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+			}
+		}
+	}()
 }
 
 // GetOptimizer returns the active latency optimizer.

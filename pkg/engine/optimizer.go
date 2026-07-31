@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"math"
 	"sync/atomic"
 	"time"
 )
@@ -10,6 +11,7 @@ import (
 type AdaptiveOptimizer struct {
 	reqCount          uint64
 	lastReqCount      uint64
+	currentRps        uint64 // atomic math.Float64bits
 	lastCheck         time.Time
 
 	batchSize         uint32
@@ -70,6 +72,12 @@ func (o *AdaptiveOptimizer) GetFlushInterval() time.Duration {
 	return time.Duration(atomic.LoadInt64(&o.flushIntervalNano))
 }
 
+// GetRPS returns the current calculated requests per second.
+func (o *AdaptiveOptimizer) GetRPS() float64 {
+	bits := atomic.LoadUint64(&o.currentRps)
+	return math.Float64frombits(bits)
+}
+
 // GetMode returns the current active optimization mode name.
 func (o *AdaptiveOptimizer) GetMode() string {
 	return o.mode.Load()
@@ -94,6 +102,7 @@ func (o *AdaptiveOptimizer) tuneLoop() {
 
 			delta := currentReqs - o.lastReqCount
 			rps := float64(delta) / elapsed
+			atomic.StoreUint64(&o.currentRps, math.Float64bits(rps))
 
 			o.lastReqCount = currentReqs
 			o.lastCheck = now
