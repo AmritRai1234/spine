@@ -298,18 +298,88 @@ function SchemaInspector({ schema }: { schema: Schema | null }) {
   )
 }
 
+/* ===== Component: Table Browser ===== */
+function TableBrowser({ tables }: { tables: string[] }) {
+  const [selectedTable, setSelectedTable] = useState<string>(tables[0] ?? '')
+  const [rows, setRows] = useState<Record<string, unknown>[]>([])
+  const [loading, setLoading] = useState(false)
+
+  useEffect(() => {
+    if (tables.length > 0 && !selectedTable) {
+      setSelectedTable(tables[0])
+    }
+  }, [tables])
+
+  useEffect(() => {
+    if (!selectedTable) return
+    setLoading(true)
+    fetch(`/tables/${selectedTable}`)
+      .then(r => r.json())
+      .then(data => {
+        if (data.rows) setRows(data.rows)
+        else setRows([])
+      })
+      .catch(() => setRows([]))
+      .finally(() => setLoading(false))
+  }, [selectedTable])
+
+  const columns = rows.length > 0 ? Object.keys(rows[0]) : []
+
+  return (
+    <div className="panel" style={{ flex: 1, marginTop: 16 }}>
+      <div className="panel-header">
+        <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+          <span className="panel-title">DATABASE BROWSER</span>
+          <select className="select-control" value={selectedTable} onChange={e => setSelectedTable(e.target.value)}>
+            {tables.length === 0 && <option value="">(No tables)</option>}
+            {tables.map(t => <option key={t} value={t}>{t}</option>)}
+          </select>
+        </div>
+        <span className="panel-tag">{rows.length} rows</span>
+      </div>
+      <div className="feed-stream" style={{ overflowX: 'auto' }}>
+        {loading ? (
+          <div className="empty-state">Loading table data...</div>
+        ) : rows.length === 0 ? (
+          <div className="empty-state">No rows in table '{selectedTable}'</div>
+        ) : (
+          <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: '12px', fontFamily: 'var(--font-mono)' }}>
+            <thead>
+              <tr style={{ borderBottom: '1px solid var(--border)', textAlign: 'left', color: 'var(--text-muted)' }}>
+                {columns.map(col => (
+                  <th key={col} style={{ padding: '8px 12px' }}>{col}</th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {rows.map((row, idx) => (
+                <tr key={idx} style={{ borderBottom: '1px solid var(--border-muted)' }}>
+                  {columns.map(col => (
+                    <td key={col} style={{ padding: '8px 12px', color: 'var(--text)' }}>
+                      {typeof row[col] === 'object' ? JSON.stringify(row[col]) : String(row[col] ?? '')}
+                    </td>
+                  ))}
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
+      </div>
+    </div>
+  )
+}
+
 /* ===== Main App ===== */
 export default function App() {
   const [feed, setFeed] = useState<FeedItem[]>([])
   const [emitCount, setEmitCount] = useState(0)
   const [stateCount, setStateCount] = useState(0)
-  const [errorCount, setErrorCount] = useState(0)
+  const [activeTab, setActiveTab] = useState<'stream' | 'tables'>('stream')
 
   const addItem = useCallback((item: FeedItem) => {
     setFeed(prev => [item, ...prev].slice(0, 300))
     if (item.type === 'state') setStateCount(c => c + 1)
     else if (item.type === 'emit') setEmitCount(c => c + 1)
-    else if (item.type === 'error') setErrorCount(c => c + 1)
   }, [])
 
   const connected = useSpineWS(addItem)
@@ -320,7 +390,7 @@ export default function App() {
       <header className="header">
         <div className="brand">
           <span className="logo-text">SPINE // ENGINE</span>
-          <span className="brand-badge">v2.0.0</span>
+          <span className="brand-badge">v2.3.0</span>
         </div>
         <div className="status-pill">
           <div className={`status-dot ${connected ? 'active' : 'inactive'}`} />
@@ -347,13 +417,22 @@ export default function App() {
         </div>
       </div>
 
+      <div className="tab-group" style={{ marginBottom: 16 }}>
+        <button className={`tab-btn ${activeTab === 'stream' ? 'active' : ''}`} onClick={() => setActiveTab('stream')}>LIVE STREAM</button>
+        <button className={`tab-btn ${activeTab === 'tables' ? 'active' : ''}`} onClick={() => setActiveTab('tables')}>DATABASE TABLES</button>
+      </div>
+
       <div className="grid-layout">
         <div className="col-sidebar">
           <EmitConsole schema={schema} onEmit={addItem} />
           <SchemaInspector schema={schema} />
         </div>
         <div className="col-main">
-          <EventStream items={feed} onClear={() => setFeed([])} />
+          {activeTab === 'stream' ? (
+            <EventStream items={feed} onClear={() => setFeed([])} />
+          ) : (
+            <TableBrowser tables={schema?.db_tables ?? []} />
+          )}
         </div>
       </div>
     </div>
