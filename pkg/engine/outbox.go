@@ -26,6 +26,19 @@ func (b *Bus) initOutboxTable() {
 	b.db.Exec(`ALTER TABLE "_spine_outbox" ADD COLUMN step_data TEXT DEFAULT ''`)
 }
 
+// EnqueueOutboxStep enqueues a persistent retry task into _spine_outbox table with full RouteStep context.
+func (b *Bus) EnqueueOutboxStep(step *manifest.RouteStep, action string, payload map[string]interface{}, backoffMs int) {
+	b.enqueueOutboxStep(step, action, payload, backoffMs)
+}
+
+// NotifyOutbox signals the background outbox worker pool to process pending retries immediately.
+func (b *Bus) NotifyOutbox() {
+	select {
+	case b.outboxNotify <- struct{}{}:
+	default:
+	}
+}
+
 // enqueueOutbox persistent retry task into _spine_outbox table.
 func (b *Bus) enqueueOutbox(action string, payload map[string]interface{}, backoffMs int) {
 	b.enqueueOutboxStep(nil, action, payload, backoffMs)

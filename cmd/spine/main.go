@@ -9,6 +9,7 @@ import (
 	"time"
 
 	spine "github.com/AmritRai1234/spine"
+	"github.com/AmritRai1234/spine/pkg/codegen"
 	"github.com/AmritRai1234/spine/pkg/manifest"
 )
 
@@ -21,10 +22,11 @@ Usage:
   spine <command> [options]
 
 Commands:
-  serve   Start the Spine HTTP/WS server from a .spine manifest
-  emit    Emit an event to a running Spine server
-  parse   Validate and inspect a .spine manifest file
-  version Print the current version
+  serve     Start the Spine HTTP/WS server from a .spine manifest
+  emit      Emit an event to a running Spine server
+  parse     Validate and inspect a .spine manifest file
+  codegen   Generate TypeScript types from a .spine manifest file
+  version   Print the current version
 
 Run 'spine <command> --help' for command-specific usage.
 `, version)
@@ -43,6 +45,8 @@ func main() {
 		cmdEmit(os.Args[2:])
 	case "parse":
 		cmdParse(os.Args[2:])
+	case "codegen":
+		cmdCodegen(os.Args[2:])
 	case "version":
 		fmt.Printf("spine v%s (go runtime)\n", version)
 	case "--help", "-h", "help":
@@ -337,5 +341,65 @@ Examples:
 		for _, inc := range schema.Includes {
 			fmt.Printf("    - %s\n", inc)
 		}
+	}
+}
+
+// ─── codegen ─────────────────────────────────────────────────────────────────
+
+func cmdCodegen(args []string) {
+	var (
+		manifestPath string
+		outputPath   string
+	)
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--help", "-h":
+			fmt.Fprintf(os.Stderr, `Usage: spine codegen <manifest.spine> [--out <file.ts>]
+
+Options:
+  --out <file.ts>   Output TypeScript file path (default: stdout)
+  -h, --help        Show this help
+
+Examples:
+  spine codegen app.spine
+  spine codegen app.spine --out src/spine-types.ts
+`)
+			return
+		case "--out", "-o":
+			i++
+			if i < len(args) {
+				outputPath = args[i]
+			}
+		default:
+			if !strings.HasPrefix(args[i], "-") && manifestPath == "" {
+				manifestPath = args[i]
+			}
+		}
+	}
+
+	if manifestPath == "" {
+		fmt.Fprintln(os.Stderr, "Error: manifest file path required")
+		fmt.Fprintln(os.Stderr, "Usage: spine codegen <manifest.spine> [--out <file.ts>]")
+		os.Exit(1)
+	}
+
+	schema, err := manifest.ParseManifest(manifestPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Parse error: %v\n", err)
+		os.Exit(1)
+	}
+
+	tsCode := codegen.GenerateTypeScript(schema)
+
+	if outputPath != "" {
+		err := os.WriteFile(outputPath, []byte(tsCode), 0644)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "✗ Failed to write output file '%s': %v\n", outputPath, err)
+			os.Exit(1)
+		}
+		fmt.Printf("✓ Generated TypeScript types -> %s\n", outputPath)
+	} else {
+		fmt.Print(tsCode)
 	}
 }
