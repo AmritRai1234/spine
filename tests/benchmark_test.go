@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	spine "github.com/AmritRai1234/spine"
 	"github.com/AmritRai1234/spine/pkg/manifest"
@@ -395,3 +396,75 @@ func BenchmarkRegistryLookup(b *testing.B) {
 		reg.GetRoutes(key)
 	}
 }
+
+// ============================================================
+// E2E Latency & Percentile Benchmarks (WAL fsync + HTTP)
+// ============================================================
+
+// BenchmarkEmitE2ELatency measures end-to-end emit latency including DB write and reports p50/p95/p99.
+func BenchmarkEmitE2ELatency(b *testing.B) {
+	dir := b.TempDir()
+	content := `spine_version: 1
+database:
+  tables:
+    - latency_table
+nodes:
+  LatNode:
+    emits:
+      - event: LAT_EVENT
+        payload:
+          data: string
+routes:
+  - on: LAT_EVENT
+    steps:
+      - action: db.insert
+        table: latency_table
+`
+	mPath := filepath.Join(dir, "lat.spine")
+	os.WriteFile(mPath, []byte(content), 0644)
+	dbPath := filepath.Join(dir, "lat.db")
+
+	eng, err := spine.NewFromFile(mPath, dbPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer eng.Close()
+
+	payload := map[string]interface{}{"data": "latency_sample"}
+	latencies := make([]time.Duration, 0, b.N)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		start := time.Now()
+		_, err := eng.Bus.Emit("LAT_EVENT", payload)
+		dur := time.Since(start)
+		if err != nil {
+			b.Fatal(err)
+		}
+		latencies = append(latencies, dur)
+	}
+	b.StopTimer()
+
+	if len(latencies) > 0 {
+		sortDurations(latencies)
+		p50 := latencies[len(latencies)*50/100]
+		p95 := latencies[len(latencies)*95/100]
+		p99 := latencies[len(latencies)*99/100]
+
+		b.ReportMetric(float64(p50.Nanoseconds())/1e6, "p50_ms")
+		b.ReportMetric(float64(p95.Nanoseconds())/1e6, "p95_ms")
+		b.ReportMetric(float64(p99.Nanoseconds())/1e6, "p99_ms")
+	}
+}
+
+func sortDurations(d []time.Duration) {
+	for i := 0; i < len(d); i++ {
+		for j := i + 1; j < len(d); j++ {
+			if d[i] > d[j] {
+				d[i], d[j] = d[j], d[i]
+			}
+		}
+	}
+}
+

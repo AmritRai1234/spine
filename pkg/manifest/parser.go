@@ -583,6 +583,10 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 					curStep.OnFailure = unquote(v)
 					continue
 				}
+				if v, ok := kvValue(trimmed, "compensate"); ok {
+					curStep.Compensate = unquote(v)
+					continue
+				}
 				if v, ok := kvValue(trimmed, "on_error"); ok {
 					curStep.OnFailure = unquote(v)
 					continue

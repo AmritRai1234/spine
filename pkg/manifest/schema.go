@@ -82,5 +82,6 @@ type RouteStep struct {
 	MaxAttempts int               `json:"max_attempts,omitempty"`
 	BackoffMs   int               `json:"backoff_ms,omitempty"`
 	OnFailure   string            `json:"on_failure,omitempty"`
+	Compensate  string            `json:"compensate,omitempty"` // Action to run on saga rollback (e.g. db.delete, http.post)
 	Config      map[string]string `json:"config,omitempty"`
 }

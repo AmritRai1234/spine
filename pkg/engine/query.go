@@ -211,6 +211,98 @@ func (b *Bus) QueryWhereWithAccess(table, column, value string, limit, offset in
 	return b.queryRows(query, value, val)
 }
 
+// GetTableRowsCursor returns rows from a table using keyset cursor pagination (`_spine_id < cursor`).
+// Prevents offset drift under concurrent inserts.
+func (b *Bus) GetTableRowsCursor(table string, lastID int64, limit int, accessFilter string) ([]map[string]interface{}, int64, error) {
+	table = sanitizeIdent(table)
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+
+	var query string
+	var args []interface{}
+
+	if accessFilter != "" {
+		col, op, val, err := parseWhereCondition(accessFilter, "", nil)
+		if err != nil {
+			return nil, 0, fmt.Errorf("invalid access filter '%s': %w", accessFilter, err)
+		}
+		safeFilterCol := b.sanitizeIdentCached(col)
+		if lastID > 0 {
+			query = fmt.Sprintf(`SELECT * FROM "%s" WHERE _spine_id < ? AND "%s" %s ? ORDER BY _spine_id DESC LIMIT %d`, table, safeFilterCol, op, limit)
+			args = []interface{}{lastID, val}
+		} else {
+			query = fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" %s ? ORDER BY _spine_id DESC LIMIT %d`, table, safeFilterCol, op, limit)
+			args = []interface{}{val}
+		}
+	} else {
+		if lastID > 0 {
+			query = fmt.Sprintf(`SELECT * FROM "%s" WHERE _spine_id < ? ORDER BY _spine_id DESC LIMIT %d`, table, limit)
+			args = []interface{}{lastID}
+		} else {
+			query = fmt.Sprintf(`SELECT * FROM "%s" ORDER BY _spine_id DESC LIMIT %d`, table, limit)
+		}
+	}
+
+	rows, err := b.queryRows(query, args...)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	var nextCursor int64 = 0
+	if len(rows) > 0 {
+		lastRow := rows[len(rows)-1]
+		if idVal, ok := lastRow["_spine_id"]; ok {
+			switch v := idVal.(type) {
+			case int64:
+				nextCursor = v
+			case float64:
+				nextCursor = int64(v)
+			}
+		}
+	}
+
+	return rows, nextCursor, nil
+}
+
+// QueryMultiWhere queries a table matching multiple column=value filter conditions.
+func (b *Bus) QueryMultiWhere(table string, filters map[string]string, limit, offset int, accessFilter string) ([]map[string]interface{}, error) {
+	table = sanitizeIdent(table)
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	var whereClauses []string
+	var args []interface{}
+
+	for col, val := range filters {
+		safeCol := sanitizeIdent(col)
+		whereClauses = append(whereClauses, fmt.Sprintf(`"%s" = ?`, safeCol))
+		args = append(args, val)
+	}
+
+	if accessFilter != "" {
+		col, op, val, err := parseWhereCondition(accessFilter, "", nil)
+		if err != nil {
+			return nil, fmt.Errorf("invalid access filter '%s': %w", accessFilter, err)
+		}
+		safeFilterCol := b.sanitizeIdentCached(col)
+		whereClauses = append(whereClauses, fmt.Sprintf(`"%s" %s ?`, safeFilterCol, op))
+		args = append(args, val)
+	}
+
+	whereStmt := ""
+	if len(whereClauses) > 0 {
+		whereStmt = "WHERE " + strings.Join(whereClauses, " AND ")
+	}
+
+	query := fmt.Sprintf(`SELECT * FROM "%s" %s ORDER BY _spine_id DESC LIMIT %d OFFSET %d`, table, whereStmt, limit, offset)
+	return b.queryRows(query, args...)
+}
+
 // queryRows is a helper that executes a query and scans all result rows into maps.
 func (b *Bus) queryRows(query string, args ...interface{}) ([]map[string]interface{}, error) {
 	rows, err := b.db.Query(query, args...)

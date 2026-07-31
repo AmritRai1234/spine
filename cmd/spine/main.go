@@ -26,6 +26,7 @@ Commands:
   emit      Emit an event to a running Spine server
   parse     Validate and inspect a .spine manifest file
   codegen   Generate TypeScript types from a .spine manifest file
+  replay    Replay historical events from database audit log
   version   Print the current version
 
 Run 'spine <command> --help' for command-specific usage.
@@ -47,6 +48,8 @@ func main() {
 		cmdParse(os.Args[2:])
 	case "codegen":
 		cmdCodegen(os.Args[2:])
+	case "replay":
+		cmdReplay(os.Args[2:])
 	case "version":
 		fmt.Printf("spine v%s (go runtime)\n", version)
 	case "--help", "-h", "help":
@@ -401,5 +404,83 @@ Examples:
 		fmt.Printf("✓ Generated TypeScript types -> %s\n", outputPath)
 	} else {
 		fmt.Print(tsCode)
+	}
+}
+
+func cmdReplay(args []string) {
+	var (
+		manifestPath string
+		dbPath       string = "spine.db"
+		eventName    string
+		limit        int = 100
+		dryRun       bool
+	)
+
+	for i := 0; i < len(args); i++ {
+		switch args[i] {
+		case "--help", "-h":
+			fmt.Fprintf(os.Stderr, `Usage: spine replay <manifest.spine> [--db <spine.db>] [--event <NAME>] [--limit <N>] [--dry-run]
+
+Options:
+  --db <path>     Database path (default: spine.db)
+  --event <NAME>  Filter by specific event name
+  --limit <N>     Maximum events to replay (default: 100)
+  --dry-run       Preview events to replay without re-executing routes
+  -h, --help      Show this help
+`)
+			return
+		case "--db":
+			i++
+			if i < len(args) {
+				dbPath = args[i]
+			}
+		case "--event":
+			i++
+			if i < len(args) {
+				eventName = args[i]
+			}
+		case "--limit":
+			i++
+			if i < len(args) {
+				fmt.Sscanf(args[i], "%d", &limit)
+			}
+		case "--dry-run":
+			dryRun = true
+		default:
+			if !strings.HasPrefix(args[i], "-") && manifestPath == "" {
+				manifestPath = args[i]
+			}
+		}
+	}
+
+	if manifestPath == "" {
+		fmt.Fprintln(os.Stderr, "Error: manifest file path required")
+		os.Exit(1)
+	}
+
+	eng, err := spine.NewFromFile(manifestPath, dbPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Engine initialization failed: %v\n", err)
+		os.Exit(1)
+	}
+	defer eng.Close()
+
+	results, err := eng.Bus.ReplayEvents(spine.ReplayFilter{
+		EventName: eventName,
+		Limit:     limit,
+		DryRun:    dryRun,
+	})
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Replay failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("✓ Replay completed: %d events processed (dry_run: %t)\n", len(results), dryRun)
+	for _, res := range results {
+		fmt.Printf("  [%d] event=%s status=%s", res.EventID, res.EventName, res.Status)
+		if res.Error != "" {
+			fmt.Printf(" error=%s", res.Error)
+		}
+		fmt.Println()
 	}
 }

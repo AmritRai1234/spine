@@ -203,6 +203,9 @@ func (e *Engine) wrapMiddleware(handler http.HandlerFunc) http.HandlerFunc {
 	// Body size limiter for payload protection
 	h = middleware.BodyLimitMiddleware(maxRequestBodySize, h)
 
+	// Payload nesting depth limiter (max 32 levels) to prevent JSON bomb DOS attacks
+	h = middleware.DepthLimitMiddleware(32, h)
+
 	// Security headers & CORS
 	h = middleware.SecurityHeadersMiddleware(h)
 	h = middleware.CORSMiddleware(middleware.DefaultCORSOptions(), h)
@@ -408,8 +411,44 @@ func (e *Engine) buildMux() *http.ServeMux {
 			accessFilter = ac.Filter
 		}
 
+		cursorStr := r.URL.Query().Get("cursor")
+		whereParams := r.URL.Query()["where"]
+
+		if cursorStr != "" {
+			var lastID int64
+			if id, err := strconv.ParseInt(cursorStr, 10, 64); err == nil {
+				lastID = id
+			}
+			rows, nextCursor, err := e.Bus.GetTableRowsCursor(tableName, lastID, limit, accessFilter)
+			if err != nil {
+				w.WriteHeader(400)
+				json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": err.Error()})
+				return
+			}
+			resp := map[string]interface{}{
+				"status": "ok",
+				"table":  tableName,
+				"count":  len(rows),
+				"rows":   rows,
+			}
+			if nextCursor > 0 {
+				resp["next_cursor"] = nextCursor
+			}
+			json.NewEncoder(w).Encode(resp)
+			return
+		}
+
 		rows, err := func() ([]map[string]interface{}, error) {
-			if whereParam := r.URL.Query().Get("where"); whereParam != "" {
+			if len(whereParams) > 1 {
+				filters := make(map[string]string)
+				for _, wp := range whereParams {
+					if idx := strings.Index(wp, ":"); idx > 0 {
+						filters[wp[:idx]] = wp[idx+1:]
+					}
+				}
+				return e.Bus.QueryMultiWhere(tableName, filters, limit, offset, accessFilter)
+			} else if len(whereParams) == 1 {
+				whereParam := whereParams[0]
 				// Format: ?where=column:value
 				if idx := strings.Index(whereParam, ":"); idx > 0 {
 					col := whereParam[:idx]
@@ -617,7 +656,17 @@ func (e *Engine) startHotReload() {
 					log.Printf("[spine] ✗ hot-reload failed: %v", err)
 					continue
 				}
+
+				if e.Schema != nil {
+					diff := DiffManifests(e.Schema, s)
+					log.Printf("[spine] manifest diff: %s", diff.Summary())
+				}
+
+				e.Schema = s
 				e.Bus.UpdateRegistry(manifest.NewRegistry(s))
+				if len(s.Access) > 0 {
+					e.access = NewAccessResolver(s.Access)
+				}
 				log.Printf("[spine] ✓ reloaded: %d nodes, %d routes", len(s.Nodes), len(s.Routes))
 			}
 		}

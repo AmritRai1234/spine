@@ -364,9 +364,13 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 				return nil, fmt.Errorf("parallel step execution failed: %w", stepErr)
 			}
 		} else {
+			var succeededSteps []manifest.RouteStep
 			for i, step := range route.Steps {
 				if err := b.execStep(&step, event, payload); err != nil {
 					execErr := fmt.Errorf("step execution failed (action=%s, table=%s): %w", step.Action, step.Table, err)
+					// Saga Compensation: rollback all succeeded steps in reverse order
+					b.rollbackCompensation(succeededSteps, event, payload)
+
 					onFailure := step.OnFailure
 					if onFailure == "" {
 						onFailure = route.OnFailure
@@ -376,6 +380,7 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 					}
 					return nil, execErr
 				}
+				succeededSteps = append(succeededSteps, step)
 			}
 		}
 
@@ -500,4 +505,27 @@ func (b *Bus) execStep(step *manifest.RouteStep, eventName string, payload map[s
 		b.enqueueOutboxStep(step, step.Action, payload, step.BackoffMs)
 	}
 	return fmt.Errorf("action %s failed after %d attempts: %w", step.Action, attempts, lastErr)
+}
+
+// rollbackCompensation executes compensation actions for previously succeeded steps in reverse order (Saga pattern).
+func (b *Bus) rollbackCompensation(succeededSteps []manifest.RouteStep, eventName string, payload map[string]interface{}) {
+	for i := len(succeededSteps) - 1; i >= 0; i-- {
+		step := succeededSteps[i]
+		if step.Compensate == "" {
+			continue
+		}
+		compStep := step
+		compStep.Action = step.Compensate
+
+		// If config contains compensate_url, substitute for URL
+		if compURL, ok := step.Config["compensate_url"]; ok {
+			compStep.URL = compURL
+		}
+		// If config contains compensate_where, substitute for Where
+		if compWhere, ok := step.Config["compensate_where"]; ok {
+			compStep.Where = compWhere
+		}
+
+		_ = b.dispatchAction(&compStep, eventName, payload)
+	}
 }

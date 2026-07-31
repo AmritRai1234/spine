@@ -397,11 +397,18 @@ func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload
 
 	if whereExpr == "" {
 		if idVal, ok := payload["id"]; ok {
-			// Parameterized query prevents SQL injection via payload values
 			deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE "id" = ?`, table)
 			params = []interface{}{idVal}
+		} else if len(payload) > 0 {
+			// Fallback: use first payload key as delete condition
+			for k, v := range payload {
+				safeK := b.sanitizeIdentCached(k)
+				deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE "%s" = ?`, table, safeK)
+				params = []interface{}{v}
+				break
+			}
 		} else {
-			return fmt.Errorf("db.delete requires 'where' condition or 'id' in payload")
+			return fmt.Errorf("db.delete requires 'where' condition or non-empty payload")
 		}
 	} else {
 		// Parse where expression into column/operator/value and use parameterized query
