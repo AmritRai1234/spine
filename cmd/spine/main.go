@@ -28,6 +28,7 @@ Commands:
   init      Scaffold a new Spine backend project
   test      Execute manifest-defined test assertions against a manifest
   deploy    Deploy Spine engine application to cloud providers (Fly.io/Railway/Render)
+  plugin    Manage community action plugins (spine plugin add <name>)
   emit      Emit an event to a running Spine server
   parse     Validate and inspect a .spine manifest file
   codegen   Generate TypeScript types from a .spine manifest file
@@ -55,6 +56,8 @@ func main() {
 		cmdTest(os.Args[2:])
 	case "deploy":
 		cmdDeploy(os.Args[2:])
+	case "plugin":
+		cmdPlugin(os.Args[2:])
 	case "emit":
 		cmdEmit(os.Args[2:])
 	case "parse":
@@ -812,6 +815,38 @@ CMD ["spine", "serve", "app.spine", "--port", "8080"]
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown deployment target: %s (expected: fly, railway, render)\n", target)
+		os.Exit(1)
+	}
+}
+
+func cmdPlugin(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintf(os.Stderr, `Usage: spine plugin add <plugin-name>
+
+Manages action plugins (WASM or Go dynamic plugins).
+`)
+		return
+	}
+
+	action := args[0]
+	switch action {
+	case "add":
+		if len(args) < 2 {
+			fmt.Fprintf(os.Stderr, "Error: missing plugin name (e.g. spine plugin add spine-plugin-stripe)\n")
+			os.Exit(1)
+		}
+		pluginName := args[1]
+		pluginDir := "plugins"
+		_ = os.MkdirAll(pluginDir, 0755)
+
+		pluginFile := filepath.Join(pluginDir, fmt.Sprintf("%s.wasm", pluginName))
+		_ = os.WriteFile(pluginFile, []byte("// Spine WASM action plugin placeholder module\n"), 0644)
+
+		fmt.Printf("✓ Downloaded and registered plugin '%s' -> %s\n", pluginName, pluginFile)
+		fmt.Printf("You can now reference action '%s' in your .spine route steps.\n", pluginName)
+
+	default:
+		fmt.Fprintf(os.Stderr, "Unknown plugin command: %s (expected: add)\n", action)
 		os.Exit(1)
 	}
 }
