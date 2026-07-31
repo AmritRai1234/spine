@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -278,6 +279,34 @@ func (e *Engine) buildMux() *http.ServeMux {
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ready"}`))
+	})
+
+	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		opt := e.Bus.GetOptimizer()
+		rps := 0.0
+		batchSize := 500
+		mode := "Micro-Latency"
+		if opt != nil {
+			rps = opt.GetRPS()
+			batchSize = opt.GetBatchSize()
+			mode = opt.GetMode()
+		}
+
+		metrics := fmt.Sprintf(`# HELP spine_requests_per_second Current requests per second processed
+# TYPE spine_requests_per_second gauge
+spine_requests_per_second %.2f
+
+# HELP spine_optimizer_batch_size Current adaptive batch size
+# TYPE spine_optimizer_batch_size gauge
+spine_optimizer_batch_size %d
+
+# HELP spine_optimizer_mode Current optimization mode
+# TYPE spine_optimizer_mode gauge
+spine_optimizer_mode{mode="%s"} 1
+`, rps, batchSize, mode)
+
+		w.Write([]byte(metrics))
 	})
 
 	mux.HandleFunc("/schema", e.wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
