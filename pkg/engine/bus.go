@@ -50,6 +50,10 @@ type Bus struct {
 
 	// Notification channel for outbox processor immediate wakeup
 	outboxNotify chan struct{}
+
+	// Idempotency key cache (Year 3 Distributed Reliability):
+	// Prevents duplicate execution when the same idempotency key is re-emitted
+	idempotencyCache sync.Map // idempotencyKey string -> map[string]interface{} (cached result)
 }
 
 // NewBus creates a Bus wired to a Registry, SQLite/Turso database, and WS hub.
@@ -310,6 +314,21 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 
 	b.optimizer.RecordRequest()
 
+	// Idempotency Key Dedup Check (Year 3 Feature)
+	var idempotencyKey string
+	if ik, ok := payload["_idempotency_key"].(string); ok && ik != "" {
+		idempotencyKey = ik
+		if cached, found := b.idempotencyCache.Load(idempotencyKey); found {
+			res := cached.(map[string]interface{})
+			resCopy := make(map[string]interface{}, len(res))
+			for k, v := range res {
+				resCopy[k] = v
+			}
+			resCopy["idempotent_hit"] = true
+			return resCopy, nil
+		}
+	}
+
 	reg := b.GetRegistry()
 
 	// Validate payload only on initial emission (depth 0)
@@ -433,12 +452,18 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 	resStates := make([]string, len(emittedStates))
 	copy(resStates, emittedStates)
 
-	return map[string]interface{}{
+	res := map[string]interface{}{
 		"status":         "ok",
 		"event":          event,
 		"routes_matched": len(routes),
 		"emitted_states": resStates,
-	}, nil
+	}
+
+	if idempotencyKey != "" {
+		b.idempotencyCache.Store(idempotencyKey, res)
+	}
+
+	return res, nil
 }
 
 func (b *Bus) handleRouteFailure(onFailureState string, event string, currentPayload map[string]interface{}, origPayload map[string]interface{}, step *manifest.RouteStep, stepIdx int, stepErr error, depth int, emittedStates *[]string) (map[string]interface{}, error) {
