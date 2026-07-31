@@ -21,6 +21,12 @@ import (
 	"github.com/gorilla/websocket"
 )
 
+// contextKey is a private type for context value keys to avoid collisions.
+type contextKey string
+
+// accessContextKey is the context key for storing the resolved AccessContext.
+const accessContextKey contextKey = "spine_access"
+
 // maxRequestBodySize is the maximum allowed request body size (1 MB).
 const maxRequestBodySize = 1 << 20 // 1 MB
 
@@ -47,7 +53,8 @@ type Engine struct {
 	Bus           *Bus
 	Hub           *Hub
 	Schema        *manifest.SpineSchema
-	APIKey        string
+	APIKey        string           // Legacy single-key auth (backward compat)
+	access        *AccessResolver  // Multi-key role-based access control
 	rateLimiter   *middleware.RateLimitManager
 	customContext *middleware.CustomContextManager
 	spineFile     string
@@ -77,12 +84,19 @@ func New(schema *manifest.SpineSchema, dbPath string) (*Engine, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &Engine{
+	eng := &Engine{
 		Bus:           bus,
 		Hub:           hub,
 		Schema:        schema,
 		customContext: middleware.NewCustomContextManager(),
-	}, nil
+	}
+
+	// Wire access resolver if manifest defines access rules
+	if len(schema.Access) > 0 {
+		eng.access = NewAccessResolver(schema.Access)
+	}
+
+	return eng, nil
 }
 
 // NewFromFile parses a manifest and creates an Engine.
@@ -158,8 +172,30 @@ func (e *Engine) HTTPHandler() http.Handler {
 }
 
 func (e *Engine) wrapMiddleware(handler http.HandlerFunc) http.HandlerFunc {
-	// Base handler wrapped with Auth and RateLimiting
-	h := middleware.AuthMiddleware(e.APIKey, handler)
+	var h http.HandlerFunc
+
+	if e.access != nil && e.access.HasRules() {
+		// Multi-key role-based auth: resolve key → AccessContext, inject into context
+		h = func(w http.ResponseWriter, r *http.Request) {
+			clientKey := extractAPIKey(r.Header.Get("X-API-Key"), r.Header.Get("Authorization"))
+			ac := e.access.Resolve(clientKey)
+			if ac == nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				json.NewEncoder(w).Encode(map[string]string{
+					"status": "error",
+					"error":  "unauthorized: invalid or missing API key",
+				})
+				return
+			}
+			ctx := context.WithValue(r.Context(), accessContextKey, ac)
+			handler(w, r.WithContext(ctx))
+		}
+	} else {
+		// Legacy single-key auth
+		h = middleware.AuthMiddleware(e.APIKey, handler)
+	}
+
 	if e.rateLimiter != nil {
 		h = e.rateLimiter.Middleware(h)
 	}
@@ -185,29 +221,42 @@ func (e *Engine) wrapMiddleware(handler http.HandlerFunc) http.HandlerFunc {
 	return h
 }
 
+// getAccessContext extracts the resolved AccessContext from the request context.
+// Returns nil if no access rules are configured (legacy mode).
+func getAccessContext(r *http.Request) *AccessContext {
+	ac, _ := r.Context().Value(accessContextKey).(*AccessContext)
+	return ac
+}
+
 // wsAuthCheck validates the API key for WebSocket connections.
 // Accepts key via query param ?token= or X-API-Key header.
-func (e *Engine) wsAuthCheck(r *http.Request) bool {
-	if e.APIKey == "" {
-		return true
-	}
-
-	// Check query parameter
-	// Constant-time comparison prevents timing side-channel attacks
-	if token := r.URL.Query().Get("token"); token != "" {
-		return subtle.ConstantTimeCompare([]byte(token), []byte(e.APIKey)) == 1
-	}
-
-	// Check headers (same logic as AuthMiddleware)
-	clientKey := r.Header.Get("X-API-Key")
-	if clientKey == "" {
-		authHeader := r.Header.Get("Authorization")
-		if strings.HasPrefix(authHeader, "Bearer ") {
-			clientKey = strings.TrimPrefix(authHeader, "Bearer ")
+// Returns (authenticated, accessContext). accessContext may be nil in legacy mode.
+func (e *Engine) wsAuthCheck(r *http.Request) (bool, *AccessContext) {
+	// Multi-key access mode
+	if e.access != nil && e.access.HasRules() {
+		var key string
+		if token := r.URL.Query().Get("token"); token != "" {
+			key = token
+		} else {
+			key = extractAPIKey(r.Header.Get("X-API-Key"), r.Header.Get("Authorization"))
 		}
+		ac := e.access.Resolve(key)
+		return ac != nil, ac
 	}
 
-	return subtle.ConstantTimeCompare([]byte(clientKey), []byte(e.APIKey)) == 1
+	// Legacy single-key mode
+	if e.APIKey == "" {
+		return true, nil
+	}
+
+	var clientKey string
+	if token := r.URL.Query().Get("token"); token != "" {
+		clientKey = token
+	} else {
+		clientKey = extractAPIKey(r.Header.Get("X-API-Key"), r.Header.Get("Authorization"))
+	}
+
+	return subtle.ConstantTimeCompare([]byte(clientKey), []byte(e.APIKey)) == 1, nil
 }
 
 func (e *Engine) buildMux() *http.ServeMux {
@@ -264,6 +313,19 @@ func (e *Engine) buildMux() *http.ServeMux {
 		}
 		if body.Payload == nil {
 			body.Payload = make(map[string]interface{})
+		}
+
+		// Access control: check emit permissions
+		if ac := getAccessContext(r); ac != nil {
+			if !ac.CanEmit(body.Event) {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusForbidden)
+				json.NewEncoder(w).Encode(map[string]string{
+					"status": "error",
+					"error":  "forbidden: role '" + ac.Role + "' cannot emit event '" + body.Event + "'",
+				})
+				return
+			}
 		}
 
 		// Merge custom context attributes (e.g. location, temperature, device, custom fields)
@@ -340,14 +402,23 @@ func (e *Engine) buildMux() *http.ServeMux {
 			}
 		}
 
+		// Resolve access filter for this role
+		var accessFilter string
+		if ac := getAccessContext(r); ac != nil {
+			accessFilter = ac.Filter
+		}
+
 		rows, err := func() ([]map[string]interface{}, error) {
 			if whereParam := r.URL.Query().Get("where"); whereParam != "" {
 				// Format: ?where=column:value
 				if idx := strings.Index(whereParam, ":"); idx > 0 {
 					col := whereParam[:idx]
 					val := whereParam[idx+1:]
-					return e.Bus.QueryWhere(tableName, col, val, limit, offset)
+					return e.Bus.QueryWhereWithAccess(tableName, col, val, limit, offset, accessFilter)
 				}
+			}
+			if accessFilter != "" {
+				return e.Bus.GetTableRowsWithFilter(tableName, limit, offset, accessFilter)
 			}
 			return e.Bus.GetTableRows(tableName, limit, offset)
 		}()
@@ -395,7 +466,7 @@ func (e *Engine) buildMux() *http.ServeMux {
 
 	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
 		// WebSocket auth check — upfront header/query param check
-		authenticated := e.wsAuthCheck(r)
+		authenticated, wsAccess := e.wsAuthCheck(r)
 
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
@@ -439,12 +510,29 @@ func (e *Engine) buildMux() *http.ServeMux {
 				// Handle in-band WS authentication handshake (for browser clients)
 				if msgType, _ := raw["type"].(string); msgType == "auth" {
 					token, _ := raw["token"].(string)
-					if e.APIKey == "" || subtle.ConstantTimeCompare([]byte(token), []byte(e.APIKey)) == 1 {
+
+					var authOk bool
+					if e.access != nil && e.access.HasRules() {
+						// Multi-key mode: resolve token to access context
+						ac := e.access.Resolve(token)
+						authOk = ac != nil
+						if authOk {
+							wsAccess = ac
+						}
+					} else {
+						// Legacy single-key mode
+						authOk = e.APIKey == "" || subtle.ConstantTimeCompare([]byte(token), []byte(e.APIKey)) == 1
+					}
+
+					if authOk {
 						if !authenticated {
 							authenticated = true
 							e.Hub.Register <- client
 						}
 						ack := map[string]interface{}{"type": "auth_ack", "status": "ok"}
+						if wsAccess != nil {
+							ack["role"] = wsAccess.Role
+						}
 						ackBytes, _ := json.Marshal(ack)
 						select {
 						case client.Send <- ackBytes:
@@ -471,6 +559,9 @@ func (e *Engine) buildMux() *http.ServeMux {
 					if !authenticated {
 						ack["status"] = "error"
 						ack["error"] = "unauthorized: authentication required"
+					} else if wsAccess != nil && !wsAccess.CanEmit(req.Event) {
+						ack["status"] = "error"
+						ack["error"] = "forbidden: role '" + wsAccess.Role + "' cannot emit event '" + req.Event + "'"
 					} else {
 						if req.Payload == nil {
 							req.Payload = make(map[string]interface{})

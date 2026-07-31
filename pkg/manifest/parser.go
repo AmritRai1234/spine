@@ -17,6 +17,9 @@ const (
 	sDatabase
 	sDbTables
 	sDbOutbox
+	sAccess
+	sAccessEntry
+	sAccessEvents
 	sNodes
 	sNodeBody
 	sNodeOwnFiles
@@ -139,10 +142,12 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 	var curListen *Listen
 	var curRoute *Route
 	var curStep *RouteStep
+	var curAccess *AccessRule
 
 	// Duplicate tracking
 	seenNodes := make(map[string]int)  // node name → first line number
 	seenTables := make(map[string]bool) // table name deduplication
+	seenRoles := make(map[string]int)   // role name → first line number
 
 	scanner := bufio.NewScanner(f)
 	lineno := 0
@@ -195,11 +200,15 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				state = sRoutes
 				continue
 			}
+			if trimmed == "access:" {
+				state = sAccess
+				continue
+			}
 
 			// Unknown top-level key detection
 			if strings.Contains(trimmed, ":") {
 				key := strings.TrimSpace(trimmed[:strings.Index(trimmed, ":")])
-				return nil, parseError(manifestPath, lineno, "unknown top-level key '%s' (expected: spine_version, includes, database, nodes, routes)", key)
+				return nil, parseError(manifestPath, lineno, "unknown top-level key '%s' (expected: spine_version, includes, database, access, nodes, routes)", key)
 			}
 		}
 
@@ -263,6 +272,75 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 			}
 			if indent <= 1 {
 				state = sTop
+			}
+		}
+
+		// ===== ACCESS =====
+		if state >= sAccess && state <= sAccessEvents {
+			// New access entry: "- role: <name>"
+			if indent == 1 {
+				if v, ok := listKvValue(trimmed, "role"); ok {
+					roleName := unquote(v)
+					if roleName == "" {
+						return nil, parseError(manifestPath, lineno, "access role name cannot be empty")
+					}
+					if prevLine, exists := seenRoles[roleName]; exists {
+						return nil, parseError(manifestPath, lineno, "duplicate access role '%s' (first defined on line %d)", roleName, prevLine)
+					}
+					seenRoles[roleName] = lineno
+					schema.Access = append(schema.Access, AccessRule{Role: roleName})
+					curAccess = &schema.Access[len(schema.Access)-1]
+					state = sAccessEntry
+					continue
+				}
+			}
+
+			// Access entry fields (indent=2)
+			if state == sAccessEntry || state == sAccessEvents {
+				if indent == 2 && curAccess != nil {
+					if v, ok := kvValue(trimmed, "key"); ok {
+						keyVal := unquote(v)
+						// Expand $ENV_VAR references
+						if strings.HasPrefix(keyVal, "$") {
+							envName := keyVal[1:]
+							keyVal = os.Getenv(envName)
+						}
+						curAccess.Key = keyVal
+						state = sAccessEntry
+						continue
+					}
+					if v, ok := kvValue(trimmed, "read_only"); ok {
+						curAccess.ReadOnly = (v == "true")
+						state = sAccessEntry
+						continue
+					}
+					if v, ok := kvValue(trimmed, "filter"); ok {
+						curAccess.Filter = unquote(v)
+						state = sAccessEntry
+						continue
+					}
+					if trimmed == "events:" {
+						state = sAccessEvents
+						continue
+					}
+				}
+			}
+
+			// Access events whitelist (indent=3)
+			if state == sAccessEvents {
+				if indent == 3 && isListItem(trimmed) && curAccess != nil {
+					curAccess.Events = append(curAccess.Events, unquote(trimmed[2:]))
+					continue
+				}
+				if indent <= 2 {
+					state = sAccessEntry
+					// Fall through to re-evaluate
+				}
+			}
+
+			if indent == 0 {
+				state = sTop
+				curAccess = nil
 			}
 		}
 

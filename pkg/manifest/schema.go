@@ -6,8 +6,19 @@ type SpineSchema struct {
 	Includes     []string       `json:"includes,omitempty"`
 	DbTables     []string       `json:"db_tables"`
 	Database     DatabaseConfig `json:"database,omitempty"`
+	Access       []AccessRule   `json:"access,omitempty"`
 	Nodes        []Node         `json:"nodes"`
 	Routes       []Route        `json:"routes"`
+}
+
+// AccessRule defines a role-based access policy with optional row-level filtering.
+// When no Access rules are defined, the engine falls back to single APIKey auth.
+type AccessRule struct {
+	Role     string   `json:"role"`
+	Key      string   `json:"-"`        // Never serialized — resolved from manifest or env var
+	ReadOnly bool     `json:"read_only,omitempty"`
+	Filter   string   `json:"filter,omitempty"`   // WHERE clause injected on table queries
+	Events   []string `json:"events,omitempty"`   // Whitelist of emittable events (nil = all)
 }
 
 // OutboxConfig holds configuration for durable outbox worker pool retries.

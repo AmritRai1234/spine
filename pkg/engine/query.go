@@ -162,6 +162,98 @@ func (b *Bus) QueryWhere(table, column, value string, limit, offset int) ([]map[
 	return results, nil
 }
 
+// GetTableRowsWithFilter returns rows with an access-level row filter applied.
+// The accessFilter is parsed into a parameterized WHERE clause for safety.
+func (b *Bus) GetTableRowsWithFilter(table string, limit, offset int, accessFilter string) ([]map[string]interface{}, error) {
+	table = sanitizeIdent(table)
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	col, op, val, err := parseWhereCondition(accessFilter, "", nil)
+	if err != nil {
+		return nil, fmt.Errorf("invalid access filter '%s': %w", accessFilter, err)
+	}
+	safeCol := b.sanitizeIdentCached(col)
+
+	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" %s ? ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
+		table, safeCol, op, limit, offset)
+	return b.queryRows(query, val)
+}
+
+// QueryWhereWithAccess returns rows filtered by both a user WHERE param and an access filter.
+func (b *Bus) QueryWhereWithAccess(table, column, value string, limit, offset int, accessFilter string) ([]map[string]interface{}, error) {
+	table = sanitizeIdent(table)
+	column = sanitizeIdent(column)
+	if limit <= 0 || limit > 500 {
+		limit = 50
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	if accessFilter == "" {
+		// No access filter — delegate to standard QueryWhere
+		return b.QueryWhere(table, column, value, limit, offset)
+	}
+
+	col, op, val, err := parseWhereCondition(accessFilter, "", nil)
+	if err != nil {
+		return nil, fmt.Errorf("invalid access filter '%s': %w", accessFilter, err)
+	}
+	safeFilterCol := b.sanitizeIdentCached(col)
+
+	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" = ? AND "%s" %s ? ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
+		table, column, safeFilterCol, op, limit, offset)
+	return b.queryRows(query, value, val)
+}
+
+// queryRows is a helper that executes a query and scans all result rows into maps.
+func (b *Bus) queryRows(query string, args ...interface{}) ([]map[string]interface{}, error) {
+	rows, err := b.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	cols, err := rows.Columns()
+	if err != nil {
+		return nil, err
+	}
+
+	var results []map[string]interface{}
+	for rows.Next() {
+		values := make([]interface{}, len(cols))
+		valuePtrs := make([]interface{}, len(cols))
+		for i := range values {
+			valuePtrs[i] = &values[i]
+		}
+
+		if err := rows.Scan(valuePtrs...); err != nil {
+			continue
+		}
+
+		rowMap := make(map[string]interface{})
+		for i, col := range cols {
+			val := values[i]
+			if bVal, ok := val.([]byte); ok {
+				rowMap[col] = string(bVal)
+			} else {
+				rowMap[col] = val
+			}
+		}
+		results = append(results, rowMap)
+	}
+
+	if results == nil {
+		results = []map[string]interface{}{}
+	}
+	return results, nil
+}
+
 // GetEventLogs queries recent event audit records from the _spine_events table.
 func (b *Bus) GetEventLogs(eventName string, limit, offset int) ([]map[string]interface{}, error) {
 	if limit <= 0 || limit > 500 {
