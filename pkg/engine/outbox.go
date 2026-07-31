@@ -182,7 +182,7 @@ func (b *Bus) processOutboxQueue() {
 
 	for {
 		select {
-		case <-b.optimizer.stopCh:
+		case <-b.stopCh:
 			return
 		case <-b.outboxNotify:
 			process()

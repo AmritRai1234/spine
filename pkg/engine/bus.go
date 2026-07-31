@@ -112,7 +112,11 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 	bus.startBatchWriter()
 	bus.initEventTable()
 	bus.initOutboxTable()
-	go bus.processOutboxQueue()
+	bus.wg.Add(1)
+	go func() {
+		defer bus.wg.Done()
+		bus.processOutboxQueue()
+	}()
 
 	// Pre-create tables declared in manifest (including imported sub-manifests)
 	for _, tbl := range reg.GetSchema().DbTables {
