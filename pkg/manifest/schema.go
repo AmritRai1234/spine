@@ -63,6 +63,7 @@ type PayloadField struct {
 // Route maps an event to a sequence of steps and an optional state emission.
 type Route struct {
 	OnEvent     string      `json:"on_event"`
+	Cron        string      `json:"cron,omitempty"` // Scheduled route execution (Year 5 feature)
 	IfCondition string      `json:"if_condition,omitempty"`
 	Parallel    bool        `json:"parallel,omitempty"`
 	Steps       []RouteStep `json:"steps"`

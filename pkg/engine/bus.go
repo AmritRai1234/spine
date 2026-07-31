@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"fmt"
 	"log"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -120,6 +121,10 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 		bus.startAdaptiveCheckpointing()
 	}
 
+	// Scheduled Cron Worker (Year 5 Feature):
+	// Triggers routes matching cron: "interval_sec" declarations on schedule
+	bus.startScheduledCronWorker()
+
 	return bus, nil
 }
 
@@ -135,6 +140,42 @@ func (b *Bus) startAdaptiveCheckpointing() {
 			if b.optimizer != nil && b.optimizer.GetRPS() < 10.0 {
 				// Run PASSIVE checkpoint (does not block active concurrent writers)
 				_, _ = b.db.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+			}
+		}
+	}()
+}
+
+func (b *Bus) startScheduledCronWorker() {
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		ticker := time.NewTicker(1 * time.Second)
+		defer ticker.Stop()
+
+		for range ticker.C {
+			reg := b.GetRegistry()
+			if reg == nil {
+				continue
+			}
+
+			for _, route := range reg.GetSchema().Routes {
+				if route.Cron != "" {
+					// Parse interval (seconds or duration string like '1s', '5s', '1m')
+					var intervalSec int = 60
+					if dur, err := time.ParseDuration(route.Cron); err == nil {
+						intervalSec = int(dur.Seconds())
+					} else if sec, err := strconv.Atoi(route.Cron); err == nil {
+						intervalSec = sec
+					}
+
+					if intervalSec > 0 && time.Now().Unix()%int64(intervalSec) == 0 {
+						payload := map[string]interface{}{
+							"scheduled_at": time.Now().Format(time.RFC3339),
+							"_cron":        route.Cron,
+						}
+						_, _ = b.Emit(route.OnEvent, payload)
+					}
+				}
 			}
 		}
 	}()

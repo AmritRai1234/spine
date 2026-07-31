@@ -516,6 +516,11 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 					state = sRouteBody
 					continue
 				}
+				if v, ok := kvValue(trimmed, "cron"); ok {
+					curRoute.Cron = unquote(v)
+					state = sRouteBody
+					continue
+				}
 				if v, ok := kvValue(trimmed, "parallel"); ok {
 					curRoute.Parallel = unquote(v) == "true"
 					state = sRouteBody
