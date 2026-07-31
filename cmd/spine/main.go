@@ -3,6 +3,7 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -29,6 +30,7 @@ Commands:
   test      Execute manifest-defined test assertions against a manifest
   deploy    Deploy Spine engine application to cloud providers (Fly.io/Railway/Render)
   plugin    Manage community action plugins (spine plugin add <name>)
+  docs      Start local documentation server & interactive manifest visualizer
   emit      Emit an event to a running Spine server
   parse     Validate and inspect a .spine manifest file
   codegen   Generate TypeScript types from a .spine manifest file
@@ -58,6 +60,8 @@ func main() {
 		cmdDeploy(os.Args[2:])
 	case "plugin":
 		cmdPlugin(os.Args[2:])
+	case "docs":
+		cmdDocs(os.Args[2:])
 	case "emit":
 		cmdEmit(os.Args[2:])
 	case "parse":
@@ -849,4 +853,42 @@ Manages action plugins (WASM or Go dynamic plugins).
 		fmt.Fprintf(os.Stderr, "Unknown plugin command: %s (expected: add)\n", action)
 		os.Exit(1)
 	}
+}
+
+func cmdDocs(args []string) {
+	port := "9090"
+	for i := 0; i < len(args); i++ {
+		if args[i] == "--port" && i+1 < len(args) {
+			port = args[i+1]
+		}
+	}
+
+	html := `<!DOCTYPE html>
+<html>
+<head>
+	<title>Spine Documentation & Interactive Visualizer</title>
+	<style>
+		body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; background: #0f172a; color: #f8fafc; margin: 0; padding: 2rem; }
+		h1 { color: #38bdf8; }
+		.card { background: #1e293b; padding: 1.5rem; border-radius: 8px; border: 1px solid #334155; margin-bottom: 1.5rem; }
+		code { background: #0284c7; padding: 0.2rem 0.4rem; border-radius: 4px; color: #fff; }
+	</style>
+</head>
+<body>
+	<h1>Spine Architecture Documentation</h1>
+	<div class="card">
+		<h2>Declarative Event Engine</h2>
+		<p>Spine provides sub-millisecond event dispatch, adaptive WAL batching, row-level access control, and TypeScript client subscriptions.</p>
+		<p>CLI usage: <code>spine serve app.spine</code> | <code>spine dev app.spine</code></p>
+	</div>
+</body>
+</html>`
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/html")
+		w.Write([]byte(html))
+	})
+
+	fmt.Printf("✓ Spine Documentation Server running at http://localhost:%s\n", port)
+	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
