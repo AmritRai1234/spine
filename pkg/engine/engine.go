@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -101,11 +102,31 @@ func New(schema *manifest.SpineSchema, dbPath string) (*Engine, error) {
 }
 
 // NewFromFile parses a manifest and creates an Engine.
+// Automatically checks and applies environment overlays (e.g. app.prod.spine) if present.
 func NewFromFile(spineFile, dbPath string) (*Engine, error) {
 	schema, err := manifest.ParseManifest(spineFile)
 	if err != nil {
 		return nil, err
 	}
+
+	// Environment Overlay Layering (Year 3 Feature)
+	envMode := os.Getenv("SPINE_ENV")
+	if envMode != "" {
+		ext := filepath.Ext(spineFile)
+		base := strings.TrimSuffix(spineFile, ext)
+		overlayFile := fmt.Sprintf("%s.%s%s", base, strings.ToLower(envMode), ext)
+		if _, statErr := os.Stat(overlayFile); statErr == nil {
+			overlaySchema, overlayErr := manifest.ParseManifest(overlayFile)
+			if overlayErr == nil {
+				// Merge routes & tables from overlay
+				schema.DbTables = append(schema.DbTables, overlaySchema.DbTables...)
+				schema.Routes = append(schema.Routes, overlaySchema.Routes...)
+				schema.Nodes = append(schema.Nodes, overlaySchema.Nodes...)
+				log.Printf("[overlay] Applied environment overlay '%s'", overlayFile)
+			}
+		}
+	}
+
 	eng, err := New(schema, dbPath)
 	if err != nil {
 		return nil, err
@@ -398,17 +419,6 @@ spine_optimizer_mode{mode="%s"} 1
 		}
 		w.Write(buf.Bytes())
 	}))
-
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
-		opt := e.Bus.GetOptimizer()
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]interface{}{
-			"status":            "ok",
-			"optimizer_mode":    opt.GetMode(),
-			"target_batch_size": opt.GetBatchSize(),
-			"flush_interval":    opt.GetFlushInterval().String(),
-		})
-	})
 
 	mux.HandleFunc("/tables", e.wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

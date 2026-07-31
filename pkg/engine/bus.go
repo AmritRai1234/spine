@@ -52,6 +52,9 @@ type Bus struct {
 	// Notification channel for outbox processor immediate wakeup
 	outboxNotify chan struct{}
 
+	// Background workers stop signal
+	stopCh chan struct{}
+
 	// Idempotency key cache (Year 3 Distributed Reliability):
 	// Prevents duplicate execution when the same idempotency key is re-emitted
 	idempotencyCache sync.Map // idempotencyKey string -> map[string]interface{} (cached result)
@@ -103,6 +106,7 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 		writer:       newShardedWriter(500000),
 		optimizer:    NewAdaptiveOptimizer(),
 		outboxNotify: make(chan struct{}, 1),
+		stopCh:       make(chan struct{}),
 	}
 	atomic.StorePointer(&bus.registry, unsafe.Pointer(reg))
 	bus.startBatchWriter()
@@ -135,11 +139,16 @@ func (b *Bus) startAdaptiveCheckpointing() {
 		ticker := time.NewTicker(5 * time.Second)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			// Check if we are in low-traffic mode (RPS < 10)
-			if b.optimizer != nil && b.optimizer.GetRPS() < 10.0 {
-				// Run PASSIVE checkpoint (does not block active concurrent writers)
-				_, _ = b.db.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+		for {
+			select {
+			case <-b.stopCh:
+				return
+			case <-ticker.C:
+				// Check if we are in low-traffic mode (RPS < 10)
+				if b.optimizer != nil && b.optimizer.GetRPS() < 10.0 {
+					// Run PASSIVE checkpoint (does not block active concurrent writers)
+					_, _ = b.db.Exec("PRAGMA wal_checkpoint(PASSIVE)")
+				}
 			}
 		}
 	}()
@@ -152,28 +161,33 @@ func (b *Bus) startScheduledCronWorker() {
 		ticker := time.NewTicker(1 * time.Second)
 		defer ticker.Stop()
 
-		for range ticker.C {
-			reg := b.GetRegistry()
-			if reg == nil {
-				continue
-			}
+		for {
+			select {
+			case <-b.stopCh:
+				return
+			case <-ticker.C:
+				reg := b.GetRegistry()
+				if reg == nil {
+					continue
+				}
 
-			for _, route := range reg.GetSchema().Routes {
-				if route.Cron != "" {
-					// Parse interval (seconds or duration string like '1s', '5s', '1m')
-					var intervalSec int = 60
-					if dur, err := time.ParseDuration(route.Cron); err == nil {
-						intervalSec = int(dur.Seconds())
-					} else if sec, err := strconv.Atoi(route.Cron); err == nil {
-						intervalSec = sec
-					}
-
-					if intervalSec > 0 && time.Now().Unix()%int64(intervalSec) == 0 {
-						payload := map[string]interface{}{
-							"scheduled_at": time.Now().Format(time.RFC3339),
-							"_cron":        route.Cron,
+				for _, route := range reg.GetSchema().Routes {
+					if route.Cron != "" {
+						// Parse interval (seconds or duration string like '1s', '5s', '1m')
+						var intervalSec int = 60
+						if dur, err := time.ParseDuration(route.Cron); err == nil {
+							intervalSec = int(dur.Seconds())
+						} else if sec, err := strconv.Atoi(route.Cron); err == nil {
+							intervalSec = sec
 						}
-						_, _ = b.Emit(route.OnEvent, payload)
+
+						if intervalSec > 0 && time.Now().Unix()%int64(intervalSec) == 0 {
+							payload := map[string]interface{}{
+								"scheduled_at": time.Now().Format(time.RFC3339),
+								"_cron":        route.Cron,
+							}
+							_, _ = b.Emit(route.OnEvent, payload)
+						}
 					}
 				}
 			}
@@ -283,6 +297,9 @@ func (b *Bus) startBatchWriter() {
 		// Block on shard[0] to avoid busy-wait, then drain all shards
 		for {
 			select {
+			case <-b.stopCh:
+				flush()
+				return
 			case task, ok := <-b.writer.shards[0]:
 				if !ok {
 					// Channel closed — drain remaining shards and exit
@@ -317,6 +334,12 @@ func (b *Bus) startBatchWriter() {
 
 // Close shuts down batch writer and the database connection.
 func (b *Bus) Close() error {
+	select {
+	case <-b.stopCh:
+	default:
+		close(b.stopCh)
+	}
+
 	if b.optimizer != nil {
 		b.optimizer.Close()
 	}
