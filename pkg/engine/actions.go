@@ -60,6 +60,8 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		return b.logWrite(step, eventName, payload)
 	case "fts.search":
 		return b.ftsSearch(step, eventName, payload)
+	case "emit_to":
+		return b.emitToBridge(step, eventName, payload)
 	case "queue.publish":
 		return b.queuePublish(step, eventName, payload)
 	default:
@@ -161,6 +163,19 @@ func (b *Bus) ftsSearch(step *manifest.RouteStep, eventName string, payload map[
 		}
 	}
 	payload["fts_results"] = results
+	return nil
+}
+
+func (b *Bus) emitToBridge(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
+	targetStream := step.Config["stream"]
+	if targetStream == "" {
+		targetStream = step.Table
+	}
+	if targetStream == "" {
+		targetStream = "external_stream"
+	}
+	log.Printf("[STREAM BRIDGE] Emitted event '%s' to external stream '%s'", eventName, targetStream)
+	b.hub.BroadcastState(targetStream, eventName, payload)
 	return nil
 }
 

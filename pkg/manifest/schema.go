@@ -3,6 +3,7 @@ package manifest
 // SpineSchema holds the full parsed manifest.
 type SpineSchema struct {
 	SpineVersion int            `json:"spine_version"`
+	Tenant       string         `json:"tenant,omitempty"` // Multi-tenancy isolation (Year 3 feature)
 	Includes     []string       `json:"includes,omitempty"`
 	DbTables     []string       `json:"db_tables"`
 	Database     DatabaseConfig `json:"database,omitempty"`
@@ -16,6 +17,7 @@ type SpineSchema struct {
 type AccessRule struct {
 	Role     string   `json:"role"`
 	Key      string   `json:"-"`        // Never serialized — resolved from manifest or env var
+	Tenant   string   `json:"tenant,omitempty"`   // Tenant ID scoping
 	ReadOnly bool     `json:"read_only,omitempty"`
 	Filter   string   `json:"filter,omitempty"`   // WHERE clause injected on table queries
 	Events   []string `json:"events,omitempty"`   // Whitelist of emittable events (nil = all)

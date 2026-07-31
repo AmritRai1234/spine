@@ -10,6 +10,7 @@ import (
 // AccessContext holds the resolved permissions for an authenticated request.
 type AccessContext struct {
 	Role     string
+	Tenant   string // Tenant isolation context
 	ReadOnly bool
 	Filter   string   // WHERE clause to inject on table queries
 	Events   []string // nil = all events allowed
@@ -58,17 +59,26 @@ func (ar *AccessResolver) Resolve(apiKey string) *AccessContext {
 	}
 
 	apiKeyBytes := []byte(apiKey)
-	for _, rule := range ar.rules {
-		if subtle.ConstantTimeCompare(apiKeyBytes, []byte(rule.Key)) == 1 {
-			return &AccessContext{
-				Role:     rule.Role,
-				ReadOnly: rule.ReadOnly,
-				Filter:   rule.Filter,
-				Events:   rule.Events,
-			}
+	var matched *manifest.AccessRule
+
+	for i := range ar.rules {
+		keyBytes := []byte(ar.rules[i].Key)
+		if len(apiKeyBytes) == len(keyBytes) && subtle.ConstantTimeCompare(apiKeyBytes, keyBytes) == 1 {
+			matched = &ar.rules[i]
 		}
 	}
-	return nil
+
+	if matched == nil {
+		return nil
+	}
+
+	return &AccessContext{
+		Role:     matched.Role,
+		Tenant:   matched.Tenant,
+		ReadOnly: matched.ReadOnly,
+		Filter:   matched.Filter,
+		Events:   matched.Events,
+	}
 }
 
 // extractAPIKey extracts the API key from standard HTTP auth headers.

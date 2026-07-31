@@ -135,6 +135,11 @@ func NewFromFile(spineFile, dbPath string) (*Engine, error) {
 	return eng, nil
 }
 
+// Access returns the engine's AccessResolver.
+func (e *Engine) Access() *AccessResolver {
+	return e.access
+}
+
 // SetAPIKey configures the API key requirement for protected HTTP endpoints.
 func (e *Engine) SetAPIKey(key string) {
 	e.APIKey = key

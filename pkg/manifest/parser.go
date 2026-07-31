@@ -138,6 +138,7 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 	state := sTop
 
 	var curNode *Node
+
 	var curEmit *Emit
 	var curListen *Listen
 	var curRoute *Route
@@ -205,10 +206,15 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				continue
 			}
 
+			if v, ok := kvValue(trimmed, "tenant"); ok {
+				schema.Tenant = unquote(v)
+				continue
+			}
+
 			// Unknown top-level key detection with "did you mean?" suggestion
 			if strings.Contains(trimmed, ":") {
 				key := strings.TrimSpace(trimmed[:strings.Index(trimmed, ":")])
-				validKeys := []string{"spine_version", "includes", "database", "access", "nodes", "routes"}
+				validKeys := []string{"spine_version", "tenant", "includes", "database", "access", "nodes", "routes"}
 				suggestion := suggestSimilarKey(key, validKeys)
 				if suggestion != "" {
 					return nil, parseError(manifestPath, lineno, "unknown top-level key '%s'. Did you mean '%s'?", key, suggestion)
@@ -311,6 +317,11 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 							keyVal = os.Getenv(envName)
 						}
 						curAccess.Key = keyVal
+						state = sAccessEntry
+						continue
+					}
+					if v, ok := kvValue(trimmed, "tenant"); ok {
+						curAccess.Tenant = unquote(v)
 						state = sAccessEntry
 						continue
 					}
