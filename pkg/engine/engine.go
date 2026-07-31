@@ -3,6 +3,7 @@ package engine
 import (
 	"bytes"
 	"context"
+	"crypto/subtle"
 	"encoding/json"
 	"io"
 	"log"
@@ -192,8 +193,9 @@ func (e *Engine) wsAuthCheck(r *http.Request) bool {
 	}
 
 	// Check query parameter
+	// Constant-time comparison prevents timing side-channel attacks
 	if token := r.URL.Query().Get("token"); token != "" {
-		return token == e.APIKey
+		return subtle.ConstantTimeCompare([]byte(token), []byte(e.APIKey)) == 1
 	}
 
 	// Check headers (same logic as AuthMiddleware)
@@ -205,7 +207,7 @@ func (e *Engine) wsAuthCheck(r *http.Request) bool {
 		}
 	}
 
-	return clientKey == e.APIKey
+	return subtle.ConstantTimeCompare([]byte(clientKey), []byte(e.APIKey)) == 1
 }
 
 func (e *Engine) buildMux() *http.ServeMux {
@@ -437,7 +439,7 @@ func (e *Engine) buildMux() *http.ServeMux {
 				// Handle in-band WS authentication handshake (for browser clients)
 				if msgType, _ := raw["type"].(string); msgType == "auth" {
 					token, _ := raw["token"].(string)
-					if e.APIKey == "" || token == e.APIKey {
+					if e.APIKey == "" || subtle.ConstantTimeCompare([]byte(token), []byte(e.APIKey)) == 1 {
 						if !authenticated {
 							authenticated = true
 							e.Hub.Register <- client

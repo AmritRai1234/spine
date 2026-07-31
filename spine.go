@@ -3,7 +3,6 @@ package spine
 import (
 	"github.com/AmritRai1234/spine/pkg/engine"
 	"github.com/AmritRai1234/spine/pkg/manifest"
-	"github.com/AmritRai1234/spine/pkg/gpu"
 )
 
 // Version represents the current release version of Spine.
@@ -17,10 +16,6 @@ type SpineSchema = manifest.SpineSchema
 type RouteStep = manifest.RouteStep
 type Route = manifest.Route
 type Node = manifest.Node
-
-// Type aliases for hardware acceleration engines.
-type GPUBuffer = gpu.GPUBuffer
-type GPUComputeEngine = gpu.GPUComputeEngine
 
 // New creates a fully wired Engine from a parsed schema.
 func New(schema *manifest.SpineSchema, dbPath string) (*engine.Engine, error) {

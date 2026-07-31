@@ -26,7 +26,6 @@ type DatabaseConfig struct {
 // Node represents a UI page or backend service declared in the manifest.
 type Node struct {
 	Name      string   `json:"name"`
-	Compute   string   `json:"compute,omitempty"` // Compute hardware policy: "auto", "apu", "gpu", "cpu"
 	OwnsFiles []string `json:"owns_files,omitempty"`
 	Emits     []Emit   `json:"emits,omitempty"`
 	Listens   []Listen `json:"listens,omitempty"`
