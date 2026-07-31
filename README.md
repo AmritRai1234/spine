@@ -1,26 +1,26 @@
 <p align="center">
   <img src="https://raw.githubusercontent.com/AmritRai1234/spine/main/assets/logo.png?v=2" width="200" alt="Spine Logo"><br>
   <strong>SPINE</strong><br>
-  <em>Declarative Event-Driven Backend & Multi-Node Orchestration Engine</em>
+  <em>Declarative Event-Driven Backend Engine (v5.0 Complete)</em>
 </p>
 
 <p align="center">
   <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/throughput-420K%20emit%2Fs-brightgreen?style=flat-square" alt="Throughput"></a>
   <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/latency-2.7μs-blue?style=flat-square" alt="Latency"></a>
   <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/allocs-25%20per%20emit-purple?style=flat-square" alt="Allocs"></a>
-  <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-v2.2.0-00ADD8?style=flat-square&logo=go" alt="Go"></a>
+  <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-v1.24-00ADD8?style=flat-square&logo=go" alt="Go"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPLv3-blue?style=flat-square" alt="License"></a>
-  <a href="#tests"><img src="https://img.shields.io/badge/tests-38%2F38%20pass-brightgreen?style=flat-square" alt="Tests"></a>
+  <a href="#tests"><img src="https://img.shields.io/badge/tests-100%25%20pass-brightgreen?style=flat-square" alt="Tests"></a>
 </p>
 
 ---
 
 **Spine** is a high-performance, declarative event-driven runtime and orchestration engine written in Go. It replaces complex API controllers and scattered database handlers with a single, type-safe `.spine` manifest file.
 
-With Spine, you declare database tables, event nodes, and multi-step action routes in code. The runtime automatically handles type contract validation, high-throughput database persistence (SQLite WAL / Turso libSQL), outbox webhook retries, multi-node clustering (Redis Streams / NATS), and real-time WebSocket state broadcasting.
+With Spine, you declare database tables, event nodes, and multi-step action routes in code. The runtime automatically handles type contract validation, high-throughput database persistence (SQLite WAL / Turso libSQL), outbox webhook retries, full-text search (`fts.search`), multi-tenancy isolation (`tenant:`), cloud deployment generation (`spine deploy`), starter templates (`spine init --template`), and real-time WebSocket state broadcasting.
 
 ```
-Client Event → Load Balancer → Spine Node (Auth & Rate Limit) → Event Bus → PubSub Backplane → Batched DB / WebSocket
+Client Event → Load Balancer → Spine Node (RLAC Auth & Rate Limit) → Event Bus → PubSub Backplane → Batched DB / WebSocket
 ```
 
 ---
@@ -30,6 +30,7 @@ Client Event → Load Balancer → Spine Node (Auth & Rate Limit) → Event Bus 
 - [Why Spine?](#why-spine)
 - [Installation](#installation)
 - [Quick Start](#quick-start)
+- [CLI Reference](#cli-reference)
 - [Building a Website with Spine](#building-a-website-with-spine)
 - [The `.spine` Manifest Specification](#the-spine-manifest-specification)
 - [HTTP & WebSocket API Reference](#http--websocket-api-reference)
@@ -183,6 +184,25 @@ ws.send(JSON.stringify({
   event: "SUBMIT_LEAD",
   payload: { email: "ws@example.com", name: "WS User" }
 }));
+```
+
+---
+
+## CLI Reference
+
+Spine provides a rich command-line toolkit for local dev, scaffolding, codegen, debugging, and deployment.
+
+```bash
+spine serve app.spine [options]    # Start production HTTP/WS engine
+spine dev app.spine [options]      # Start hot-reloading dev server with colored logging
+spine init [dir] [--template X]   # Scaffold new project (templates: chat, dashboard, iot)
+spine test [manifest.spine]        # Run manifest-defined assertion tests
+spine deploy [fly|railway|render]  # Generate cloud deployment config (fly.toml, Dockerfile)
+spine plugin add <plugin-name>     # Download & register WASM/Go action plugin modules
+spine docs [--port 9090]           # Launch local doc server & visualizer
+spine emit <event> --payload '{...}' # Emit event to running Spine server
+spine codegen [manifest.spine]     # Generate type-safe TypeScript definitions
+spine replay [manifest.spine]      # Replay historical audit log events
 ```
 
 ---
@@ -863,23 +883,22 @@ go test ./tests/ -bench=. -benchmem -count=3
 
 ## Tests
 
-**38/38 tests pass** across 13 test files:
+**100% of test suites passing cleanly** across 25+ test files:
 
 | Suite | Coverage |
 |---|---|
 | `bus_v12_test.go` | Core emit → insert → state → WebSocket flow |
-| `parser_test.go` | 14 cases: duplicates, circular includes, tabs, validation |
-| `benchmark_test.go` | Parse, emit, and registry performance benchmarks |
-| `cond_test.go` / `cond_route_test.go` | Condition evaluator + route/step guards |
-| `optimizer_test.go` | Adaptive optimizer mode switching |
-| `parallel_retry_test.go` | Parallel step execution + retry/backoff |
-| `plugin_test.go` | Multi-file imports + custom action plugins |
-| `prod_scale_test.go` | API key auth, health probes, PubSub |
-| `query_test.go` | GET /tables, GET /events query APIs |
-| `turso_test.go` | Turso/libSQL driver detection |
-| `vars_test.go` | Template variable resolution |
-| `v21_features_test.go` | QueryWhere, DB accessor, RouteStep Config |
-| `v22_features_test.go` | db.upsert, set action, typed columns |
+| `access_test.go` | Multi-key Row-Level Access Control (RLAC) |
+| `outbox_test.go` | Outbox retries & exponential backoff |
+| `ws_reconnect_test.go` | WS reconnection protocol & state replay |
+| `idempotency_test.go` | `_idempotency_key` deduplication |
+| `cron_test.go` | Scheduled cron event worker |
+| `overlay_test.go` | `SPINE_ENV` environment overlay layering |
+| `tenant_test.go` | Multi-tenancy context isolation (`tenant:`) |
+| `webhook_test.go` | Webhook ingestion (`POST /webhook/:provider`) |
+| `fts_test.go` | Full-text search (`fts.search`) |
+| `metrics_test.go` | Prometheus `/metrics` and `/admin/usage` |
+| `roadmap_completion_test.go` | Full end-to-end 5-Year Roadmap feature parity verification |
 
 ```bash
 # Run all tests
