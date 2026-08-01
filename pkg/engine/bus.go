@@ -16,6 +16,12 @@ import (
 	_ "turso.tech/database/tursogo"
 )
 
+// idempotencyEntry wraps a cached result with a timestamp for TTL eviction.
+type idempotencyEntry struct {
+	result    map[string]interface{}
+	createdAt time.Time
+}
+
 // Pool for emitted states slices to reduce allocs on the hot path
 var statesPool = sync.Pool{
 	New: func() interface{} {
@@ -39,9 +45,9 @@ type Bus struct {
 	updateSQLCache sync.Map // "table|whereKey|col1,col2" → *sqlTemplate
 	upsertSQLCache sync.Map // "table|conflictKey|col1,col2" → *sqlTemplate
 
-	// In-memory RAM State Cache
-	stateMu    sync.RWMutex
-	stateCache map[string]map[string]interface{}
+	// In-memory RAM State Cache — lock-free sync.Map eliminates RWMutex convoys
+	// under concurrent parallel-route Emit calls
+	stateCache sync.Map // stateName string -> map[string]interface{}
 
 	// High-throughput sharded batch writer & Adaptive Optimizer
 	writer        *shardedWriter
@@ -55,9 +61,10 @@ type Bus struct {
 	// Background workers stop signal
 	stopCh chan struct{}
 
-	// Idempotency key cache (Year 3 Distributed Reliability):
-	// Prevents duplicate execution when the same idempotency key is re-emitted
-	idempotencyCache sync.Map // idempotencyKey string -> map[string]interface{} (cached result)
+	// Idempotency key cache with TTL eviction (Year 3 Distributed Reliability):
+	// Prevents duplicate execution when the same idempotency key is re-emitted.
+	// Entries are evicted after 5 minutes to prevent unbounded memory growth.
+	idempotencyCache sync.Map // idempotencyKey string -> *idempotencyEntry
 }
 
 // NewBus creates a Bus wired to a Registry, SQLite/Turso database, and WS hub.
@@ -102,7 +109,6 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 	bus := &Bus{
 		db:           db,
 		hub:          hub,
-		stateCache:   make(map[string]map[string]interface{}),
 		writer:       newShardedWriter(500000),
 		optimizer:    NewAdaptiveOptimizer(),
 		outboxNotify: make(chan struct{}, 1),
@@ -132,6 +138,9 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 	// Scheduled Cron Worker (Year 5 Feature):
 	// Triggers routes matching cron: "interval_sec" declarations on schedule
 	bus.startScheduledCronWorker()
+
+	// Idempotency cache TTL eviction: sweeps entries older than 5 minutes
+	bus.startIdempotencyCacheEvictor()
 
 	return bus, nil
 }
@@ -199,26 +208,60 @@ func (b *Bus) startScheduledCronWorker() {
 	}()
 }
 
+// startIdempotencyCacheEvictor runs a background sweep every 60 seconds,
+// removing idempotency cache entries older than 5 minutes.
+// Prevents unbounded memory growth under long-running deployments.
+func (b *Bus) startIdempotencyCacheEvictor() {
+	b.wg.Add(1)
+	go func() {
+		defer b.wg.Done()
+		ticker := time.NewTicker(60 * time.Second)
+		defer ticker.Stop()
+
+		const ttl = 5 * time.Minute
+
+		for {
+			select {
+			case <-b.stopCh:
+				return
+			case now := <-ticker.C:
+				b.idempotencyCache.Range(func(key, value interface{}) bool {
+					entry, ok := value.(*idempotencyEntry)
+					if ok && now.Sub(entry.createdAt) > ttl {
+						b.idempotencyCache.Delete(key)
+					}
+					return true
+				})
+			}
+		}
+	}()
+}
+
 // GetOptimizer returns the active latency optimizer.
 func (b *Bus) GetOptimizer() *AdaptiveOptimizer {
 	return b.optimizer
 }
 
 // GetState retrieves a cached state payload from RAM in sub-microsecond time.
+// Lock-free via sync.Map — zero contention under concurrent reads.
 func (b *Bus) GetState(stateName string) (map[string]interface{}, bool) {
-	b.stateMu.RLock()
-	defer b.stateMu.RUnlock()
-	val, ok := b.stateCache[stateName]
-	return val, ok
+	val, ok := b.stateCache.Load(stateName)
+	if !ok {
+		return nil, false
+	}
+	return val.(map[string]interface{}), true
 }
 
-// SetState caches the state payload in RAM.
+// SetState caches the state payload in RAM. Lock-free via sync.Map.
 func (b *Bus) SetState(stateName string, payload map[string]interface{}) {
-	b.stateMu.Lock()
-	b.stateCache[stateName] = payload
-	b.stateMu.Unlock()
+	b.stateCache.Store(stateName, payload)
 }
 
+// startBatchWriter starts a single writer goroutine that drains all shards.
+// A single writer avoids SQLite WAL lock contention from concurrent transactions,
+// while the sharded input channels still eliminate producer contention.
+// Batch accumulation: drains all shards non-blocking before flushing, avoiding
+// the old flush-per-receive pattern that created micro-flushes of 1-2 items.
 func (b *Bus) startBatchWriter() {
 	b.wg.Add(1)
 	go func() {
@@ -273,35 +316,47 @@ func (b *Bus) startBatchWriter() {
 			batch = batch[:0]
 		}
 
-		// drainShards does a non-blocking round-robin drain of all shard channels
-		drainShards := func(targetSize int) bool {
-			drained := false
+		// drainAllShards does a non-blocking round-robin drain of all shard channels,
+		// accumulating up to targetSize tasks before returning.
+		drainAllShards := func(targetSize int) {
 			for i := range b.writer.shards {
 				for len(batch) < targetSize {
 					select {
 					case t, ok := <-b.writer.shards[i]:
 						if !ok {
-							// This shard is closed, move to next
 							break
 						}
 						batch = append(batch, t)
-						drained = true
 						continue
 					default:
 					}
-					break // default or closed: move to next shard
+					break
 				}
 				if len(batch) >= targetSize {
-					return true
+					return
 				}
 			}
-			return drained
 		}
 
 		// Block on shard[0] to avoid busy-wait, then drain all shards
 		for {
 			select {
 			case <-b.stopCh:
+				// Drain all shards before exit
+				for i := range b.writer.shards {
+					for {
+						select {
+						case t, ok := <-b.writer.shards[i]:
+							if !ok {
+								break
+							}
+							batch = append(batch, t)
+							continue
+						default:
+						}
+						break
+					}
+				}
 				flush()
 				return
 			case task, ok := <-b.writer.shards[0]:
@@ -317,8 +372,8 @@ func (b *Bus) startBatchWriter() {
 				}
 				batch = append(batch, task)
 				targetBatchSize := b.optimizer.GetBatchSize()
-				// Drain all shards opportunistically
-				drainShards(targetBatchSize)
+				// Accumulate from all shards before flushing
+				drainAllShards(targetBatchSize)
 				flush()
 
 				// Dynamically adjust ticker when optimizer changes mode
@@ -329,7 +384,7 @@ func (b *Bus) startBatchWriter() {
 				}
 			case <-ticker.C:
 				// Periodic flush — drain all shards
-				drainShards(b.optimizer.GetBatchSize())
+				drainAllShards(b.optimizer.GetBatchSize())
 				flush()
 			}
 		}
@@ -387,9 +442,9 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 	if ik, ok := payload["_idempotency_key"].(string); ok && ik != "" {
 		idempotencyKey = ik
 		if cached, found := b.idempotencyCache.Load(idempotencyKey); found {
-			res := cached.(map[string]interface{})
-			resCopy := make(map[string]interface{}, len(res))
-			for k, v := range res {
+			entry := cached.(*idempotencyEntry)
+			resCopy := make(map[string]interface{}, len(entry.result))
+			for k, v := range entry.result {
 				resCopy[k] = v
 			}
 			resCopy["idempotent_hit"] = true
@@ -415,11 +470,9 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 		}, nil
 	}
 
-	// Capture initial trigger payload copy to guarantee preservation in on_failure handlers
-	origPayload := make(map[string]interface{}, len(payload))
-	for k, v := range payload {
-		origPayload[k] = v
-	}
+	// Lazy origPayload: only capture on failure (see handleRouteFailure).
+	// Most emits succeed, so this avoids a wasted allocation on the hot path.
+	var origPayload map[string]interface{}
 
 	// Pool the emittedStates slice to reduce GC pressure on high-throughput paths
 	statesPtr := statesPool.Get().(*[]string)
@@ -443,11 +496,9 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 
 			for i := range route.Steps {
 				wg.Add(1)
-				// Deep-copy payload map for each goroutine to prevent concurrent map write races
-				stepPayload := make(map[string]interface{}, len(payload))
-				for k, v := range payload {
-					stepPayload[k] = v
-				}
+				// Deep-copy payload for each goroutine to prevent concurrent map write races.
+				// Uses JSON round-trip to safely copy nested maps and slices.
+				stepPayload := deepCopyPayload(payload)
 				idx := i
 				go func(s *manifest.RouteStep, p map[string]interface{}, stepIndex int) {
 					defer wg.Done()
@@ -469,6 +520,13 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 					onFailure = failedStep.OnFailure
 				}
 				if onFailure != "" {
+					// Lazy origPayload: capture now since we actually need it
+					if origPayload == nil {
+						origPayload = make(map[string]interface{}, len(payload))
+						for k, v := range payload {
+							origPayload[k] = v
+						}
+					}
 					return b.handleRouteFailure(onFailure, event, payload, origPayload, failedStep, failedIdx, stepErr, depth, &emittedStates)
 				}
 				return nil, fmt.Errorf("parallel step execution failed: %w", stepErr)
@@ -486,6 +544,13 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 						onFailure = route.OnFailure
 					}
 					if onFailure != "" {
+						// Lazy origPayload: capture now since we actually need it
+						if origPayload == nil {
+							origPayload = make(map[string]interface{}, len(payload))
+							for k, v := range payload {
+								origPayload[k] = v
+							}
+						}
 						return b.handleRouteFailure(onFailure, event, payload, origPayload, &step, i, execErr, depth, &emittedStates)
 					}
 					return nil, execErr
@@ -528,7 +593,10 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 	}
 
 	if idempotencyKey != "" {
-		b.idempotencyCache.Store(idempotencyKey, res)
+		b.idempotencyCache.Store(idempotencyKey, &idempotencyEntry{
+			result:    res,
+			createdAt: time.Now(),
+		})
 	}
 
 	return res, nil

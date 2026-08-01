@@ -82,23 +82,31 @@ func (h *Hub) Run() {
 // This runs in its own goroutine so BroadcastState never blocks the Emit path.
 func (h *Hub) broadcastLoop() {
 	for msg := range h.broadcastCh {
+		// Collect slow clients under RLock (no goroutine spawns while holding lock)
+		var slowClients []*WsClient
+
 		h.mu.RLock()
 		for client := range h.clients {
 			select {
 			case client.Send <- msg.data:
 			default:
-				// Client can't keep up — schedule removal outside RLock
-				go func(c *WsClient) {
-					h.mu.Lock()
-					if _, ok := h.clients[c]; ok {
-						delete(h.clients, c)
-						c.closeOnce.Do(func() { close(c.Send) })
-					}
-					h.mu.Unlock()
-				}(client)
+				// Client can't keep up — mark for removal
+				slowClients = append(slowClients, client)
 			}
 		}
 		h.mu.RUnlock()
+
+		// Remove slow clients under write lock (outside RLock to prevent priority inversion)
+		if len(slowClients) > 0 {
+			h.mu.Lock()
+			for _, c := range slowClients {
+				if _, ok := h.clients[c]; ok {
+					delete(h.clients, c)
+					c.closeOnce.Do(func() { close(c.Send) })
+				}
+			}
+			h.mu.Unlock()
+		}
 	}
 }
 

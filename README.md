@@ -5,9 +5,9 @@
 </p>
 
 <p align="center">
-  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/throughput-420K%20emit%2Fs-brightgreen?style=flat-square" alt="Throughput"></a>
-  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/latency-2.7μs-blue?style=flat-square" alt="Latency"></a>
-  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/allocs-25%20per%20emit-purple?style=flat-square" alt="Allocs"></a>
+  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/throughput-277K%20emit%2Fs-brightgreen?style=flat-square" alt="Throughput"></a>
+  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/latency-3.6μs-blue?style=flat-square" alt="Latency"></a>
+  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/allocs-31%20per%20emit-purple?style=flat-square" alt="Allocs"></a>
   <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-v1.24-00ADD8?style=flat-square&logo=go" alt="Go"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPLv3-blue?style=flat-square" alt="License"></a>
   <a href="#tests"><img src="https://img.shields.io/badge/tests-100%25%20pass-brightgreen?style=flat-square" alt="Tests"></a>
@@ -866,12 +866,12 @@ Measured on AMD Ryzen 7 5825U (16 threads):
 
 | Benchmark | ops/sec | ns/op | B/op | allocs/op |
 |---|---|---|---|---|
-| **EmitSingle** (full pipeline) | 420,000 | 2,765 | 1,207 | 25 |
-| **EmitParallel** (16 goroutines) | 333,000 | 3,474 | 1,339 | 25 |
-| **EmitWithValidation** (typed) | 370,000 | 3,069 | 1,456 | 29 |
-| **RegistryLookup** (lock-free) | 17,000,000 | 70 | 7 | 1 |
-| **ParseSmallManifest** (3 nodes) | 78,000 | 15,310 | 8,265 | 86 |
-| **ParseLargeManifest** (20 nodes) | 20,000 | 58,609 | 44,740 | 586 |
+| **EmitSingle** (full pipeline) | 277,000 | 3,611 | 1,419 | 31 |
+| **EmitParallel** (16 goroutines) | 215,000 | 4,636 | 1,429 | 30 |
+| **EmitWithValidation** (typed) | 225,000 | 4,439 | 1,813 | 35 |
+| **RegistryLookup** (lock-free) | 17,700,000 | 66 | 7 | 1 |
+| **ParseSmallManifest** (3 nodes) | 75,900 | 15,348 | 8,966 | 89 |
+| **ParseLargeManifest** (20 nodes) | 20,400 | 56,400 | 50,900 | 592 |
 
 Run benchmarks yourself:
 

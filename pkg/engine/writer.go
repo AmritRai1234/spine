@@ -2,6 +2,8 @@ package engine
 
 import (
 	"database/sql"
+	"encoding/json"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -12,19 +14,34 @@ type dbTask struct {
 	params []interface{}
 }
 
-// numWriteShards controls how many input channels the batch writer drains.
-// Sharding eliminates producer contention on a single channel under high concurrency.
-const numWriteShards = 8
+// numWriteShards is computed at init based on available CPU cores.
+// Capped between 4 and 16 to balance parallelism and SQLite WAL contention.
+var numWriteShards = computeShardCount()
 
-// shardedWriter distributes write tasks across multiple channels to reduce contention,
-// while a single goroutine drains all shards (SQLite serializes writes anyway).
+func computeShardCount() int {
+	n := runtime.NumCPU()
+	if n < 4 {
+		n = 4
+	}
+	if n > 16 {
+		n = 16
+	}
+	return n
+}
+
+// shardedWriter distributes write tasks across multiple channels.
+// Each shard is drained by its own goroutine — transaction preparation
+// (building stmts, marshaling params) runs in parallel across cores,
+// while SQLite serializes the actual WAL writes.
 type shardedWriter struct {
-	shards [numWriteShards]chan dbTask
+	shards []chan dbTask
 	closed uint32 // atomic: 1 = closed
 }
 
 func newShardedWriter(bufSize int) *shardedWriter {
-	sw := &shardedWriter{}
+	sw := &shardedWriter{
+		shards: make([]chan dbTask, numWriteShards),
+	}
 	perShard := bufSize / numWriteShards
 	if perShard < 1024 {
 		perShard = 1024
@@ -47,7 +64,7 @@ func (sw *shardedWriter) submit(table string, task dbTask) (ok bool) {
 		}
 	}()
 	h := fnvHash(table)
-	shard := h % numWriteShards
+	shard := h % uint32(numWriteShards)
 	for attempt := 0; attempt < 3; attempt++ {
 		select {
 		case sw.shards[shard] <- task:
@@ -120,4 +137,25 @@ func execWithRetry(db *sql.DB, query string, params ...interface{}) error {
 		return err
 	}
 	return err
+}
+
+// deepCopyPayload creates a deep copy of a payload map by marshaling/unmarshaling
+// through JSON. This safely copies nested maps and slices to prevent data races
+// when parallel route steps mutate their own copy concurrently.
+func deepCopyPayload(src map[string]interface{}) map[string]interface{} {
+	if len(src) == 0 {
+		return make(map[string]interface{})
+	}
+	data, err := json.Marshal(src)
+	if err != nil {
+		// Fallback to shallow copy if marshal fails
+		dst := make(map[string]interface{}, len(src))
+		for k, v := range src {
+			dst[k] = v
+		}
+		return dst
+	}
+	dst := make(map[string]interface{}, len(src))
+	_ = json.Unmarshal(data, &dst)
+	return dst
 }

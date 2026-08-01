@@ -2,6 +2,7 @@ package engine
 
 import (
 	"math"
+	"runtime"
 	"sync/atomic"
 	"time"
 )
@@ -81,6 +82,19 @@ func (o *AdaptiveOptimizer) GetRPS() float64 {
 // GetMode returns the current active optimization mode name.
 func (o *AdaptiveOptimizer) GetMode() string {
 	return o.mode.Load()
+}
+
+// GetShardCount returns the number of write shards, which scales with runtime.NumCPU().
+// Capped between 4 and 16 to balance parallelism and SQLite WAL contention.
+func (o *AdaptiveOptimizer) GetShardCount() int {
+	n := runtime.NumCPU()
+	if n < 4 {
+		n = 4
+	}
+	if n > 16 {
+		n = 16
+	}
+	return n
 }
 
 func (o *AdaptiveOptimizer) tuneLoop() {

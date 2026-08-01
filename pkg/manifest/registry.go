@@ -14,6 +14,7 @@ type registryData struct {
 	nodes      map[string]*Node
 	routes     map[string][]*Route
 	eventEmits map[string][]PayloadField
+	fieldTypes map[string]map[string]string // pre-computed: event -> field -> type
 }
 
 // Registry holds the parsed schema indexed for fast event→route lookups.
@@ -29,6 +30,7 @@ func NewRegistry(schema *SpineSchema) *Registry {
 		nodes:      make(map[string]*Node),
 		routes:     make(map[string][]*Route),
 		eventEmits: make(map[string][]PayloadField),
+		fieldTypes: make(map[string]map[string]string),
 	}
 
 	for i := range schema.Nodes {
@@ -37,6 +39,12 @@ func NewRegistry(schema *SpineSchema) *Registry {
 		for _, e := range node.Emits {
 			if len(e.Fields) > 0 {
 				d.eventEmits[e.Event] = e.Fields
+				// Pre-compute field types map for this event
+				ft := make(map[string]string, len(e.Fields))
+				for _, f := range e.Fields {
+					ft[f.Name] = f.FieldType
+				}
+				d.fieldTypes[e.Event] = ft
 			}
 		}
 	}
@@ -118,15 +126,8 @@ func (r *Registry) GetNode(name string) (*Node, bool) {
 
 // GetFieldTypes returns a map of field name → declared type for an event.
 // Returns nil if the event has no declared fields. Lock-free.
+// The returned map is pre-computed and immutable — zero allocations per call.
 func (r *Registry) GetFieldTypes(event string) map[string]string {
 	d := r.load()
-	fields, ok := d.eventEmits[event]
-	if !ok {
-		return nil
-	}
-	result := make(map[string]string, len(fields))
-	for _, f := range fields {
-		result[f.Name] = f.FieldType
-	}
-	return result
+	return d.fieldTypes[event]
 }
