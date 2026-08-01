@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"bytes"
 	"encoding/json"
 	"log"
 	"sync"
@@ -8,6 +9,12 @@ import (
 
 	"github.com/gorilla/websocket"
 )
+
+// broadcastBufPool pools JSON encoding buffers for BroadcastState.
+// Avoids a fresh buffer allocation on every state broadcast.
+var broadcastBufPool = sync.Pool{
+	New: func() interface{} { return bytes.NewBuffer(make([]byte, 0, 512)) },
+}
 
 type StateBroadcast struct {
 	Type      string                 `json:"type"`
@@ -110,18 +117,32 @@ func (h *Hub) broadcastLoop() {
 	}
 }
 
-// BroadcastState marshals the payload and enqueues it to the async broadcast channel.
-// This is non-blocking — if the broadcast channel is full, the message is dropped
-// to prevent backpressure from slow WS clients from stalling the Emit pipeline.
+// BroadcastState marshals the payload using a pooled buffer and enqueues it to the
+// async broadcast channel. This is non-blocking — if the broadcast channel is full,
+// the message is dropped to prevent backpressure from slow WS clients from stalling
+// the Emit pipeline.
 func (h *Hub) BroadcastState(stateName, eventName string, payload map[string]interface{}) {
+	buf := broadcastBufPool.Get().(*bytes.Buffer)
+	buf.Reset()
+
 	msg := StateBroadcast{
 		Type: "state", State: stateName, Event: eventName,
 		Payload: payload, Timestamp: time.Now().UnixMilli(),
 	}
-	data, err := json.Marshal(msg)
-	if err != nil {
+	if err := json.NewEncoder(buf).Encode(msg); err != nil {
+		broadcastBufPool.Put(buf)
 		return
 	}
+
+	// Copy out the encoded bytes (strip trailing newline from Encode)
+	raw := buf.Bytes()
+	if len(raw) > 0 && raw[len(raw)-1] == '\n' {
+		raw = raw[:len(raw)-1]
+	}
+	data := make([]byte, len(raw))
+	copy(data, raw)
+	broadcastBufPool.Put(buf)
+
 	// Non-blocking enqueue to async broadcast channel
 	select {
 	case h.broadcastCh <- broadcastMsg{data: data}:

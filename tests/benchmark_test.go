@@ -468,3 +468,165 @@ func sortDurations(d []time.Duration) {
 	}
 }
 
+// ============================================================
+// Targeted Memory Optimization Benchmarks
+// ============================================================
+
+// BenchmarkEmitParallelSteps benchmarks parallel route steps which exercise deepCopyPayload.
+// Each parallel step gets its own deep-copied payload to prevent data races.
+func BenchmarkEmitParallelSteps(b *testing.B) {
+	dir := b.TempDir()
+	content := `spine_version: 1
+
+database:
+  tables:
+    - par_steps
+
+nodes:
+  ParStepNode:
+    emits:
+      - event: PAR_STEP_EVENT
+        payload:
+          email: string
+          name: string
+          count: number
+
+routes:
+  - on: PAR_STEP_EVENT
+    parallel: true
+    steps:
+      - action: db.insert
+        table: par_steps
+      - action: log.write
+        message: "step2 $event.payload.email"
+      - action: log.write
+        message: "step3 $event.payload.name"
+`
+	mPath := filepath.Join(dir, "par_steps.spine")
+	os.WriteFile(mPath, []byte(content), 0644)
+	dbPath := filepath.Join(dir, "par_steps.db")
+
+	eng, err := spine.NewFromFile(mPath, dbPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer eng.Close()
+
+	payload := map[string]interface{}{
+		"email": "bench@test.dev",
+		"name":  "Bench User",
+		"count": float64(42),
+	}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, err := eng.Bus.Emit("PAR_STEP_EVENT", payload)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkEmitWithUUID benchmarks emits that use $uuid and $now set actions,
+// exercising the zero-alloc UUID generator and variable resolver.
+func BenchmarkEmitWithUUID(b *testing.B) {
+	dir := b.TempDir()
+	content := `spine_version: 1
+
+database:
+  tables:
+    - uuid_bench
+
+nodes:
+  UUIDNode:
+    emits:
+      - event: UUID_EVENT
+        payload:
+          email: string
+
+routes:
+  - on: UUID_EVENT
+    steps:
+      - action: set
+        id: $uuid
+        created_at: $now
+      - action: db.insert
+        table: uuid_bench
+`
+	mPath := filepath.Join(dir, "uuid.spine")
+	os.WriteFile(mPath, []byte(content), 0644)
+	dbPath := filepath.Join(dir, "uuid.db")
+
+	eng, err := spine.NewFromFile(mPath, dbPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer eng.Close()
+
+	payload := map[string]interface{}{"email": "uuid@bench.dev"}
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, err := eng.Bus.Emit("UUID_EVENT", payload)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+// BenchmarkQueryTableRows benchmarks the query path with pooled scan buffers.
+func BenchmarkQueryTableRows(b *testing.B) {
+	dir := b.TempDir()
+	content := `spine_version: 1
+
+database:
+  tables:
+    - query_bench
+
+nodes:
+  QNode:
+    emits:
+      - event: Q_INSERT
+        payload:
+          name: string
+          value: number
+
+routes:
+  - on: Q_INSERT
+    steps:
+      - action: db.insert
+        table: query_bench
+`
+	mPath := filepath.Join(dir, "query.spine")
+	os.WriteFile(mPath, []byte(content), 0644)
+	dbPath := filepath.Join(dir, "query.db")
+
+	eng, err := spine.NewFromFile(mPath, dbPath)
+	if err != nil {
+		b.Fatal(err)
+	}
+	defer eng.Close()
+
+	// Seed 100 rows so queries actually scan data
+	for i := 0; i < 100; i++ {
+		eng.Bus.Emit("Q_INSERT", map[string]interface{}{
+			"name":  fmt.Sprintf("user_%d", i),
+			"value": float64(i),
+		})
+	}
+	// Wait for batch writer to flush
+	time.Sleep(50 * time.Millisecond)
+
+	b.ResetTimer()
+	b.ReportAllocs()
+	for i := 0; i < b.N; i++ {
+		_, err := eng.Bus.GetTableRows("query_bench", 50, 0)
+		if err != nil {
+			b.Fatal(err)
+		}
+	}
+}
+
+

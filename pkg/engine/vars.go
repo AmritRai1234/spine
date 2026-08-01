@@ -8,13 +8,36 @@ import (
 	"time"
 )
 
-// generateUUID generates a standard v4 UUID string.
+// hexChars is used for zero-allocation UUID hex encoding.
+const hexChars = "0123456789abcdef"
+
+// generateUUID generates a standard v4 UUID string using stack-allocated hex encoding.
+// Avoids fmt.Sprintf overhead (5 intermediate []byte slices from %x formatting).
 func generateUUID() string {
 	var uuid [16]byte
 	_, _ = rand.Read(uuid[:])
 	uuid[6] = (uuid[6] & 0x0f) | 0x40 // Version 4
 	uuid[8] = (uuid[8] & 0x3f) | 0x80 // Variant 10
-	return fmt.Sprintf("%x-%x-%x-%x-%x", uuid[0:4], uuid[4:6], uuid[6:8], uuid[8:10], uuid[10:])
+
+	var buf [36]byte
+	hexEncode(buf[0:8], uuid[0:4])
+	buf[8] = '-'
+	hexEncode(buf[9:13], uuid[4:6])
+	buf[13] = '-'
+	hexEncode(buf[14:18], uuid[6:8])
+	buf[18] = '-'
+	hexEncode(buf[19:23], uuid[8:10])
+	buf[23] = '-'
+	hexEncode(buf[24:36], uuid[10:16])
+	return string(buf[:])
+}
+
+// hexEncode encodes src bytes into dst as lowercase hexadecimal.
+func hexEncode(dst []byte, src []byte) {
+	for i, b := range src {
+		dst[i*2] = hexChars[b>>4]
+		dst[i*2+1] = hexChars[b&0x0f]
+	}
 }
 
 // resolvePath extracts nested values from map[string]interface{}.

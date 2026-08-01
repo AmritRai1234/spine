@@ -16,6 +16,22 @@ var auditBufPool = sync.Pool{
 	},
 }
 
+// scanBuf holds reusable scan buffers for database row scanning.
+// Pooling these eliminates 2 of 3 per-row allocations on every query.
+type scanBuf struct {
+	values    []interface{}
+	valuePtrs []interface{}
+}
+
+var scanBufPool = sync.Pool{
+	New: func() interface{} {
+		return &scanBuf{
+			values:    make([]interface{}, 0, 32),
+			valuePtrs: make([]interface{}, 0, 32),
+		}
+	},
+}
+
 // Pre-built constant SQL for audit insert — avoids string allocation per emit
 const auditInsertSQL = `INSERT INTO "_spine_events" (event_name, payload, emitted_states, created_at) VALUES (?, ?, ?, ?)`
 
@@ -66,45 +82,7 @@ func (b *Bus) GetTableRows(table string, limit, offset int) ([]map[string]interf
 	}
 
 	query := fmt.Sprintf(`SELECT * FROM "%s" ORDER BY _spine_id DESC LIMIT %d OFFSET %d`, table, limit, offset)
-	rows, err := b.db.Query(query)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query table '%s': %w", table, err)
-	}
-	defer rows.Close()
-
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-
-	var results []map[string]interface{}
-	for rows.Next() {
-		values := make([]interface{}, len(cols))
-		valuePtrs := make([]interface{}, len(cols))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			continue
-		}
-
-		rowMap := make(map[string]interface{})
-		for i, col := range cols {
-			val := values[i]
-			if bVal, ok := val.([]byte); ok {
-				rowMap[col] = string(bVal)
-			} else {
-				rowMap[col] = val
-			}
-		}
-		results = append(results, rowMap)
-	}
-
-	if results == nil {
-		results = []map[string]interface{}{}
-	}
-	return results, nil
+	return b.queryRows(query)
 }
 
 // QueryWhere returns rows from a table filtered by a single column equality condition.
@@ -121,45 +99,7 @@ func (b *Bus) QueryWhere(table, column, value string, limit, offset int) ([]map[
 
 	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" = ? ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
 		table, column, limit, offset)
-	rows, err := b.db.Query(query, value)
-	if err != nil {
-		return nil, fmt.Errorf("failed to query table '%s' where %s = '%s': %w", table, column, value, err)
-	}
-	defer rows.Close()
-
-	cols, err := rows.Columns()
-	if err != nil {
-		return nil, err
-	}
-
-	var results []map[string]interface{}
-	for rows.Next() {
-		values := make([]interface{}, len(cols))
-		valuePtrs := make([]interface{}, len(cols))
-		for i := range values {
-			valuePtrs[i] = &values[i]
-		}
-
-		if err := rows.Scan(valuePtrs...); err != nil {
-			continue
-		}
-
-		rowMap := make(map[string]interface{})
-		for i, col := range cols {
-			val := values[i]
-			if bVal, ok := val.([]byte); ok {
-				rowMap[col] = string(bVal)
-			} else {
-				rowMap[col] = val
-			}
-		}
-		results = append(results, rowMap)
-	}
-
-	if results == nil {
-		results = []map[string]interface{}{}
-	}
-	return results, nil
+	return b.queryRows(query, value)
 }
 
 // GetTableRowsWithFilter returns rows with an access-level row filter applied.
@@ -304,6 +244,7 @@ func (b *Bus) QueryMultiWhere(table string, filters map[string]string, limit, of
 }
 
 // queryRows is a helper that executes a query and scans all result rows into maps.
+// Uses pooled scan buffers to eliminate 2 of 3 per-row allocations.
 func (b *Bus) queryRows(query string, args ...interface{}) ([]map[string]interface{}, error) {
 	rows, err := b.db.Query(query, args...)
 	if err != nil {
@@ -316,21 +257,39 @@ func (b *Bus) queryRows(query string, args ...interface{}) ([]map[string]interfa
 		return nil, err
 	}
 
+	nCols := len(cols)
+
+	// Pool the scan buffers — reused across rows within this query
+	sb := scanBufPool.Get().(*scanBuf)
+	defer scanBufPool.Put(sb)
+
+	// Grow to column count if needed (only allocates on first use or column count increase)
+	if cap(sb.values) < nCols {
+		sb.values = make([]interface{}, nCols)
+		sb.valuePtrs = make([]interface{}, nCols)
+	} else {
+		sb.values = sb.values[:nCols]
+		sb.valuePtrs = sb.valuePtrs[:nCols]
+	}
+	for i := range sb.values {
+		sb.values[i] = nil
+		sb.valuePtrs[i] = &sb.values[i]
+	}
+
 	var results []map[string]interface{}
 	for rows.Next() {
-		values := make([]interface{}, len(cols))
-		valuePtrs := make([]interface{}, len(cols))
-		for i := range values {
-			valuePtrs[i] = &values[i]
+		// Reset values for each row scan
+		for i := range sb.values {
+			sb.values[i] = nil
 		}
 
-		if err := rows.Scan(valuePtrs...); err != nil {
+		if err := rows.Scan(sb.valuePtrs...); err != nil {
 			continue
 		}
 
-		rowMap := make(map[string]interface{})
+		rowMap := make(map[string]interface{}, nCols)
 		for i, col := range cols {
-			val := values[i]
+			val := sb.values[i]
 			if bVal, ok := val.([]byte); ok {
 				rowMap[col] = string(bVal)
 			} else {
@@ -417,8 +376,12 @@ func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitte
 	buf := auditBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	json.NewEncoder(buf).Encode(payload)
-	// Remove trailing newline from Encode
-	payloadStr := strings.TrimRight(buf.String(), "\n")
+	// Trim trailing newline from Encode using byte slice — avoids strings.TrimRight allocation
+	raw := buf.Bytes()
+	if len(raw) > 0 && raw[len(raw)-1] == '\n' {
+		raw = raw[:len(raw)-1]
+	}
+	payloadStr := string(raw)
 	auditBufPool.Put(buf)
 
 	statesStr := strings.Join(emitted, ",")
