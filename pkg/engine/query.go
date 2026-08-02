@@ -49,8 +49,9 @@ func (b *Bus) GetTables() ([]TableInfo, error) {
 		var res []TableInfo
 		b.knownTable.Range(func(key, value interface{}) bool {
 			if name, ok := key.(string); ok {
+				safeName := sanitizeIdent(name)
 				var count int64
-				_ = b.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, name)).Scan(&count)
+				_ = b.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, safeName)).Scan(&count)
 				res = append(res, TableInfo{Name: name, Rows: count})
 			}
 			return true
@@ -63,8 +64,9 @@ func (b *Bus) GetTables() ([]TableInfo, error) {
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err == nil {
+			safeName := sanitizeIdent(name)
 			var count int64
-			_ = b.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, name)).Scan(&count)
+			_ = b.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, safeName)).Scan(&count)
 			tables = append(tables, TableInfo{Name: name, Rows: count})
 		}
 	}

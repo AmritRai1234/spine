@@ -138,16 +138,18 @@ func (b *Bus) ftsSearch(step *manifest.RouteStep, eventName string, payload map[
 	}
 	resolvedQuery := ResolveVariables(query, eventName, payload)
 
-	ftsTable := tableName
-	if !strings.HasSuffix(tableName, "_fts") {
-		ftsTable = fmt.Sprintf("%s_fts", tableName)
+	// Sanitize table identifiers to prevent SQL injection from manifest input
+	safeTable := sanitizeIdent(tableName)
+	ftsTable := safeTable
+	if !strings.HasSuffix(safeTable, "_fts") {
+		ftsTable = safeTable + "_fts"
 	}
 
 	// Attempt FTS5 virtual table query with fallback to standard table search
-	rows, err := b.db.Query(fmt.Sprintf("SELECT rowid, content FROM %s WHERE content MATCH ?", ftsTable), resolvedQuery)
+	rows, err := b.db.Query(fmt.Sprintf(`SELECT rowid, content FROM "%s" WHERE content MATCH ?`, ftsTable), resolvedQuery)
 	if err != nil {
 		// Fallback: standard table column query
-		rows, err = b.db.Query(fmt.Sprintf("SELECT rowid, created_at FROM %s WHERE created_at LIKE ?", tableName), "%"+resolvedQuery+"%")
+		rows, err = b.db.Query(fmt.Sprintf(`SELECT rowid, created_at FROM "%s" WHERE created_at LIKE ?`, safeTable), "%"+resolvedQuery+"%")
 		if err != nil {
 			return nil // Soft fallback: return empty results if table not ready
 		}
