@@ -208,19 +208,13 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 	return nil
 }
 
-func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interface{}) error {
+func (b *Bus) dbUpdate(table string, whereExpr string, eventName string, payload map[string]interface{}) error {
 	n := len(payload)
-	if n < 2 {
+	if n == 0 {
 		return nil
 	}
 
 	table = b.sanitizeIdentCached(table)
-
-	// Deterministic where-key: use "id" if present, otherwise alphabetically first key
-	whereKey := ""
-	if _, ok := payload["id"]; ok {
-		whereKey = "id"
-	}
 
 	// Deterministic key ordering: sort payload keys for stable SQL + caching
 	keys := make([]string, 0, n)
@@ -229,19 +223,48 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 	}
 	sort.Strings(keys)
 
-	// If no "id", use alphabetically first key as deterministic where-key
-	if whereKey == "" {
-		whereKey = keys[0]
+	// Resolve the WHERE clause. An explicit `where:` expression is parsed and
+	// parameterized (safe for template-interpolated values). Without one, the
+	// update falls back to matching on the payload's "id" field (or the
+	// alphabetically first key when "id" is absent).
+	var whereCol, whereOp string
+	var whereVal interface{}
+	explicitWhere := whereExpr != ""
+	if explicitWhere {
+		col, op, val, err := parseWhereCondition(whereExpr, eventName, payload)
+		if err != nil {
+			return fmt.Errorf("db.update: %w", err)
+		}
+		whereCol = b.sanitizeIdentCached(col)
+		whereOp = op
+		whereVal = val
+	} else {
+		if n < 2 {
+			return nil
+		}
+		whereKey := keys[0]
+		if _, ok := payload["id"]; ok {
+			whereKey = "id"
+		}
+		whereCol = b.sanitizeIdentCached(whereKey)
+		whereOp = "="
+		whereVal = normalizeParam(payload[whereKey], eventName, payload)
 	}
 
-	safeWhereKey := b.sanitizeIdentCached(whereKey)
-
-	// Build cache fingerprint from table + whereKey + sorted sanitized column names
+	// Build cache fingerprint: table + where target + mode + sorted columns
 	var fpBuf strings.Builder
-	fpBuf.Grow(len(table) + len(safeWhereKey) + n*10)
+	fpBuf.Grow(len(table) + len(whereCol) + n*10)
 	fpBuf.WriteString(table)
 	fpBuf.WriteByte('|')
-	fpBuf.WriteString(safeWhereKey)
+	fpBuf.WriteString(whereCol)
+	fpBuf.WriteByte('|')
+	fpBuf.WriteString(whereOp)
+	fpBuf.WriteByte('|')
+	if explicitWhere {
+		fpBuf.WriteString("expr")
+	} else {
+		fpBuf.WriteString("auto")
+	}
 	fpBuf.WriteByte('|')
 	sanitizedKeys := make([]string, n)
 	for i, k := range keys {
@@ -277,7 +300,7 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 			return err
 		}
 
-		// Build SQL string once: UPDATE "table" SET "col1" = ?, "col2" = ? WHERE "whereKey" = ?
+		// Build SQL string once: UPDATE "table" SET "col1" = ?, "col2" = ? WHERE "whereCol" op ?
 		var sb strings.Builder
 		sb.Grow(64 + len(table) + n*12)
 		sb.WriteString(`UPDATE "`)
@@ -285,7 +308,9 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 		sb.WriteString(`" SET `)
 		first := true
 		for _, safe := range sanitizedKeys {
-			if safe == safeWhereKey {
+			// Fallback mode: the where key identifies the row, so it is not SET.
+			// Explicit where mode: every payload field is SET.
+			if !explicitWhere && safe == whereCol {
 				continue
 			}
 			if !first {
@@ -297,8 +322,10 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 			first = false
 		}
 		sb.WriteString(` WHERE "`)
-		sb.WriteString(safeWhereKey)
-		sb.WriteString(`" = ?`)
+		sb.WriteString(whereCol)
+		sb.WriteString(`" `)
+		sb.WriteString(whereOp)
+		sb.WriteString(` ?`)
 
 		tmpl = &sqlTemplate{
 			sql:      sb.String(),
@@ -311,12 +338,12 @@ func (b *Bus) dbUpdate(table string, eventName string, payload map[string]interf
 	// Build params in deterministic column order (SET values first, then WHERE value)
 	params := make([]interface{}, 0, n)
 	for _, k := range keys {
-		if k == whereKey {
+		if !explicitWhere && b.sanitizeIdentCached(k) == whereCol {
 			continue
 		}
 		params = append(params, normalizeParam(payload[k], eventName, payload))
 	}
-	params = append(params, normalizeParam(payload[whereKey], eventName, payload))
+	params = append(params, whereVal)
 
 	if !b.writer.submit(table, dbTask{query: tmpl.sql, params: params}) {
 		if err := execWithRetry(b.db, tmpl.sql, params...); err != nil {
@@ -428,6 +455,40 @@ func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload
 		}
 	}
 
+	return nil
+}
+
+// dbSum computes SUM(column) over a table with an optional parameterized where
+// clause and injects the result into the payload under `as` (default "sum_result").
+// Reads go straight to the DB pool (safe under WAL) instead of the write queue.
+func (b *Bus) dbSum(table string, column string, whereExpr string, as string, eventName string, payload map[string]interface{}) error {
+	safeTable := b.sanitizeIdentCached(table)
+	safeCol := b.sanitizeIdentCached(column)
+
+	if safeTable == "" || safeCol == "" {
+		return fmt.Errorf("db.sum requires 'table' and 'column'")
+	}
+	if as == "" {
+		as = "sum_result"
+	}
+
+	query := fmt.Sprintf(`SELECT COALESCE(SUM("%s"), 0) FROM "%s"`, safeCol, safeTable)
+	var params []interface{}
+	if whereExpr != "" {
+		col, op, val, err := parseWhereCondition(whereExpr, eventName, payload)
+		if err != nil {
+			return fmt.Errorf("db.sum: %w", err)
+		}
+		safeWCol := b.sanitizeIdentCached(col)
+		query += fmt.Sprintf(` WHERE "%s" %s ?`, safeWCol, op)
+		params = append(params, val)
+	}
+
+	var sum float64
+	if err := b.db.QueryRow(query, params...).Scan(&sum); err != nil {
+		return fmt.Errorf("db.sum failed: %w", err)
+	}
+	payload[as] = sum
 	return nil
 }
 

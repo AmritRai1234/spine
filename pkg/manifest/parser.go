@@ -311,9 +311,9 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				if indent == 2 && curAccess != nil {
 					if v, ok := kvValue(trimmed, "key"); ok {
 						keyVal := unquote(v)
-						// Expand $ENV_VAR references
+						// Expand $ENV_VAR references — accepts both "$VAR" and "$env.VAR"
 						if strings.HasPrefix(keyVal, "$") {
-							envName := keyVal[1:]
+							envName := strings.TrimPrefix(keyVal[1:], "env.")
 							keyVal = os.Getenv(envName)
 						}
 						curAccess.Key = keyVal

@@ -98,6 +98,17 @@ Reduce Go boilerplate for common data patterns.
 
 ---
 
+## v2.4 — Aggregations, Update-Where & Auth Fixes ✅ *SHIPPED*
+
+Hardening pass driven by real-world usage.
+
+- [x] `db.sum` action — `SUM(column)` with optional parameterized `where:`, result injected into payload (`as:`, default `sum_result`), `0` on empty tables
+- [x] `db.update` honors explicit `where:` clause — parsed `column op value`, bound parameters (injection-safe); `id`-fallback behavior unchanged
+- [x] Access-key env expansion accepts documented `$env.VAR` syntax in addition to legacy `$VAR`
+- [x] `spine context <manifest> <Node>` — extract a single node's contract slice (emits/listens + outgoing/incoming/failure routes) as AI-ready context, human or `--json` output
+
+---
+
 ## Version Timeline
 
 | Version | Focus | Status |
@@ -110,3 +121,4 @@ Reduce Go boilerplate for common data patterns.
 | **v2.0** | Plugins, Pub/Sub Queues & Multi-File Manifests | ✅ Shipped |
 | **v2.1** | Query Filtering, DB Accessor & RouteStep Config | ✅ Shipped |
 | **v2.2** | Upsert, Typed Columns & Computed Fields | ✅ Shipped |
+| **v2.4** | Aggregations (`db.sum`), Update-Where & Auth Fixes | ✅ Shipped |

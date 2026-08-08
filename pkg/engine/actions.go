@@ -38,7 +38,15 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		}
 	case "db.update":
 		if step.Table != "" {
-			return b.dbUpdate(step.Table, eventName, payload)
+			return b.dbUpdate(step.Table, step.Where, eventName, payload)
+		}
+	case "db.sum":
+		if step.Table != "" {
+			as := step.Config["as"]
+			if as == "" {
+				as = "sum_result"
+			}
+			return b.dbSum(step.Table, step.Config["column"], step.Where, as, eventName, payload)
 		}
 	case "db.upsert":
 		if step.Table != "" {

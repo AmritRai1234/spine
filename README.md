@@ -201,6 +201,7 @@ spine deploy [fly|railway|render]  # Generate cloud deployment config (fly.toml,
 spine plugin add <plugin-name>     # Download & register WASM/Go action plugin modules
 spine docs [--port 9090]           # Launch local doc server & visualizer
 spine emit <event> --payload '{...}' # Emit event to running Spine server
+spine context <manifest> <Node>      # Print one node's contract slice (AI-ready context)
 spine codegen [manifest.spine]     # Generate type-safe TypeScript definitions
 spine replay [manifest.spine]      # Replay historical audit log events
 ```
@@ -430,9 +431,10 @@ routes:
 | Action | Description | Parameters |
 |---|---|---|
 | `db.insert` | Insert a row into a table | `table` (required) |
-| `db.update` | Update a row (matches on `id` or specified key) | `table` (required) |
+| `db.update` | Update rows matching `where:` (parameterized `column op value`), or the payload's `id` when omitted | `table` (required), `where` (optional) |
 | `db.upsert` | Insert or update on conflict | `table` (required), `key` (conflict column, default: `id`). Fails explicitly if `key` is missing from payload. |
-| `db.delete` | Delete a row by `id` or `where` condition | `table`, `where` (optional) |
+| `db.delete` | Delete rows matching `where:` (parameterized), or by payload `id` | `table`, `where` (optional) |
+| `db.sum` | Sum a numeric column into the payload (`0` on empty tables) | `table`, `column` (required); `where`, `as` (optional, default `sum_result`) |
 | `set` | Inject computed fields into the payload | Any `key: value` pairs (supports `$uuid`, `$now`, etc.) |
 | `log.write` | Write a log message with template variables | `message` (required) |
 | `http.post` | Send an HTTP POST webhook | `url` (required) |

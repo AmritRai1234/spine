@@ -148,9 +148,9 @@ All payload fields are inserted as columns. Spine auto-creates columns on first 
 ```yaml
 - action: db.update
   table: users
-  where: "id = '$event.payload.user_id'"  # Optional. Defaults to matching on `id` field.
+  where: "email = '$event.payload.email'"  # Optional. Defaults to matching on the payload's `id` field.
 ```
-Updates the row matching the `where` clause (or `id` field) with all payload fields.
+With `where`, the row(s) matching the condition are updated with all payload fields. The condition is parsed as `column op value` and **parameterized** — template-interpolated values are passed as bound parameters, not string-interpolated into SQL. Without `where`, the row matching the payload's `id` field is updated (all fields except `id` are SET).
 
 ### `db.upsert` — Insert or update on conflict
 ```yaml
@@ -164,8 +164,18 @@ If a row with the same `key` value exists, it updates. Otherwise, it inserts.
 ```yaml
 - action: db.delete
   table: users
-  where: "id = '$event.payload.user_id'"  # Optional WHERE clause.
+  where: "id = '$event.payload.user_id'"  # Optional WHERE clause (parameterized, same format as db.update).
 ```
+
+### `db.sum` — Sum a numeric column
+```yaml
+- action: db.sum
+  table: expenses               # REQUIRED. Table name
+  column: amount_cad            # REQUIRED. Column to aggregate
+  where: "category = 'office'"  # Optional. Parameterized filter (column op value)
+  as: total_expenses            # Optional. Payload field for the result (default: sum_result)
+```
+Computes `SUM(column)` and injects the result into the payload under `as`, so later steps (and the emitted state) can use `$event.payload.total_expenses`. Empty tables yield `0`, never NULL. Note: reads see committed rows — because writes are batched asynchronously, a `db.sum` in the same route as a `db.insert` may not see that insert yet. Aggregate in a separate route/event (e.g. a `CALC_TOTAL` event) instead.
 
 ### `set` — Inject computed fields into payload
 ```yaml
@@ -518,6 +528,8 @@ spine emit EVENT_NAME --payload '{"key":"value"}'
 spine init myapp --template chat     # Templates: chat, dashboard, iot
 spine deploy fly                     # Generate fly.toml + Dockerfile
 spine codegen app.spine              # Generate TypeScript types
+spine context app.spine Dashboard    # Print one node's contract slice — paste into an AI session
+                                     # so it can edit that page without reading the codebase
 spine replay app.spine               # Replay audit log events
 spine test app.spine                 # Run manifest-defined tests
 ```
@@ -542,7 +554,7 @@ spine test app.spine                 # Run manifest-defined tests
 
 3. **Don't omit `key` in `db.upsert`** — it's required and the payload must include that field.
 
-4. **Don't use raw SQL in `where` clauses with user input** — Spine sanitizes identifiers but template variables in `where` are string-interpolated. Use parameterized payload fields.
+4. **Don't write raw SQL in `where` clauses** — use the `column op value` format (e.g. `where: "status = '$event.payload.status'"`). It is parsed and parameterized, so template values are injection-safe. Compound conditions (`AND`/`OR`) are not supported in a single `where`.
 
 5. **Don't declare duplicate node names** — the parser will error with line numbers.
 

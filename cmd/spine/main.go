@@ -33,6 +33,7 @@ Commands:
   docs      Start local documentation server & interactive manifest visualizer
   emit      Emit an event to a running Spine server
   parse     Validate and inspect a .spine manifest file
+  context   Print the minimal contract slice for a single node (AI-ready)
   codegen   Generate TypeScript types from a .spine manifest file
   replay    Replay historical events from database audit log
   version   Print the current version
@@ -66,6 +67,8 @@ func main() {
 		cmdEmit(os.Args[2:])
 	case "parse":
 		cmdParse(os.Args[2:])
+	case "context":
+		cmdContext(os.Args[2:])
 	case "codegen":
 		cmdCodegen(os.Args[2:])
 	case "replay":
@@ -365,6 +368,148 @@ Examples:
 			fmt.Printf("    - %s\n", inc)
 		}
 	}
+}
+
+// ─── context ─────────────────────────────────────────────────────────────────
+
+func cmdContext(args []string) {
+	if len(args) < 2 || args[0] == "--help" || args[0] == "-h" {
+		fmt.Fprintf(os.Stderr, `Usage: spine context <manifest.spine> <NodeName> [--json]
+
+Print the minimal contract slice for a single node: its emits/listens,
+the routes those events trigger, the routes producing states it listens
+to, and its failure routes. Paste the output into an AI session so the
+agent can edit one page without reading the whole codebase.
+
+Options:
+  --json    Output the context slice as JSON
+  -h        Show this help
+
+Examples:
+  spine context app.spine Dashboard
+  spine context app.spine Dashboard --json
+`)
+		return
+	}
+
+	manifestPath := args[0]
+	nodeName := args[1]
+	outputJSON := false
+	for _, a := range args[2:] {
+		if a == "--json" {
+			outputJSON = true
+		}
+	}
+
+	schema, err := manifest.ParseManifest(manifestPath)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ Parse error: %v\n", err)
+		os.Exit(1)
+	}
+
+	ctx, err := manifest.BuildNodeContext(schema, nodeName)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "✗ %v\n", err)
+		os.Exit(1)
+	}
+
+	if outputJSON {
+		out, _ := json.MarshalIndent(ctx, "", "  ")
+		fmt.Println(string(out))
+		return
+	}
+
+	printNodeContext(ctx)
+}
+
+func printNodeContext(ctx *manifest.NodeContext) {
+	n := ctx.Node
+	fmt.Printf("# Context: %s\n", n.Name)
+	fmt.Println("# Contract boundary — edit this node's files; emit ONLY the events below;")
+	fmt.Println("# payload types are enforced by the engine at runtime.")
+	fmt.Println()
+
+	if len(n.OwnsFiles) > 0 {
+		fmt.Println("## Files owned")
+		for _, f := range n.OwnsFiles {
+			fmt.Printf("- %s\n", f)
+		}
+		fmt.Println()
+	}
+
+	fmt.Println("## Emits (this page may emit)")
+	for _, e := range n.Emits {
+		fmt.Printf("- %s\n", e.Event)
+		for _, f := range e.Fields {
+			fmt.Printf("    %s: %s\n", f.Name, f.FieldType)
+		}
+	}
+	if len(n.Emits) == 0 {
+		fmt.Println("- (none)")
+	}
+	fmt.Println()
+
+	fmt.Println("## Listens (states pushed to this page)")
+	for _, l := range n.Listens {
+		fmt.Printf("- %s\n", l.State)
+		for _, f := range l.Fields {
+			fmt.Printf("    %s: %s\n", f.Name, f.FieldType)
+		}
+	}
+	if len(n.Listens) == 0 {
+		fmt.Println("- (none)")
+	}
+	fmt.Println()
+
+	printContextRoutes("## Outgoing routes (triggered by this page)", ctx.OutgoingRoutes)
+	printContextRoutes("## Incoming routes (produce states this page sees)", ctx.IncomingRoutes)
+	printContextRoutes("## Failure routes (handle this page's route failures)", ctx.FailureRoutes)
+}
+
+func printContextRoutes(title string, routes []manifest.Route) {
+	fmt.Println(title)
+	if len(routes) == 0 {
+		fmt.Println("- (none)")
+		fmt.Println()
+		return
+	}
+	for _, r := range routes {
+		guard := ""
+		if r.IfCondition != "" {
+			guard = fmt.Sprintf("  [if: %s]", r.IfCondition)
+		}
+		fmt.Printf("- on: %s%s\n", r.OnEvent, guard)
+		for i, s := range r.Steps {
+			fmt.Printf("    %d. %s\n", i+1, summarizeStep(s))
+		}
+		if r.EmitState != "" {
+			fmt.Printf("    → emit: %s\n", r.EmitState)
+		}
+		if r.OnFailure != "" {
+			fmt.Printf("    → on_failure: %s\n", r.OnFailure)
+		}
+	}
+	fmt.Println()
+}
+
+func summarizeStep(s manifest.RouteStep) string {
+	var b strings.Builder
+	b.WriteString(s.Action)
+	switch {
+	case s.Table != "":
+		b.WriteString(" → " + s.Table)
+	case s.URL != "":
+		b.WriteString(" → " + s.URL)
+	case s.Config["event"] != "":
+		b.WriteString(" → " + s.Config["event"])
+	}
+	if s.Where != "" {
+		b.WriteString("  where: " + s.Where)
+	}
+	if s.IfCondition != "" {
+		b.WriteString("  [if: " + s.IfCondition + "]")
+	}
+	return b.String()
 }
 
 // ─── codegen ─────────────────────────────────────────────────────────────────
