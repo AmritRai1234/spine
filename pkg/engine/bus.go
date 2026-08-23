@@ -85,8 +85,17 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 		return nil, fmt.Errorf("cannot open database '%s' using driver '%s': %w", dbPath, driver, err)
 	}
 
-	// Tune connection pool for concurrent readers and single batch writer
-	db.SetMaxOpenConns(20)
+	// Tune connection pool for concurrent readers and single batch writer.
+	// The turso driver serializes writes behind one WAL write lock and waits out
+	// its 5s busy timeout under contention — a large write pool causes a lock
+	// convoy (measured: 100 conns = 3.6K writes/s with multi-second stalls,
+	// 10 conns = 18K writes/s with 2ms p99). Cap it and let the sharded
+	// batch writer absorb concurrency instead.
+	maxConns := 20
+	if driver == "turso" {
+		maxConns = 4
+	}
+	db.SetMaxOpenConns(maxConns)
 	db.SetMaxIdleConns(10)
 	db.SetConnMaxLifetime(0) // Keep alive forever
 
