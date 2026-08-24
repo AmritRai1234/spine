@@ -360,7 +360,7 @@ ws.onmessage = (event) => {
 ```yaml
 spine_version: 1          # Required. Manifest format version.
 
-include:                   # Optional. Import other .spine files.
+includes:                  # Optional. Import other .spine files.
   - auth.spine
   - billing.spine
 

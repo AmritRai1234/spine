@@ -4,7 +4,7 @@ VERSION := 2.3.0
 BINARY_NAME := spine
 INSTALL_PATH := /usr/local/bin
 
-.PHONY: all build install test clean help
+.PHONY: all build install test doc-lint clean help
 
 all: build
 
@@ -21,10 +21,14 @@ install: build
 	@sudo cp bin/$(BINARY_NAME) $(INSTALL_PATH)/$(BINARY_NAME) || cp bin/$(BINARY_NAME) ~/.local/bin/$(BINARY_NAME)
 	@echo "==> Successfully installed Spine v$(VERSION)!"
 
-## test: Runs all unit & integration test suites
-test:
+## test: Runs doc-lint plus all unit & integration test suites
+test: doc-lint
 	@echo "==> Running test suite..."
 	@go test -v ./...
+
+## doc-lint: Verifies documented .spine manifest keys match the parser whitelist
+doc-lint:
+	@./scripts/doc_lint.sh
 
 ## clean: Removes build artifacts
 clean:
