@@ -373,3 +373,54 @@ routes:
 		t.Errorf("Wrong key with env expansion: expected 401, got %d", rr.Code)
 	}
 }
+
+// TestAccessEnvDotVarExpansion verifies that access keys accept the documented
+// "$env.VAR" syntax in addition to the legacy "$VAR" syntax.
+func TestAccessEnvDotVarExpansion(t *testing.T) {
+	dir := t.TempDir()
+	manifestContent := `spine_version: 1
+
+access:
+  - role: env_user
+    key: "$env.TEST_SPINE_DOTENV_KEY"
+
+nodes:
+  - name: api
+    emits:
+      - event: PING
+
+routes:
+  - on: PING
+    steps:
+      - action: log.write
+        message: "pong"
+`
+	os.Setenv("TEST_SPINE_DOTENV_KEY", "sk_dotenv_value")
+	defer os.Unsetenv("TEST_SPINE_DOTENV_KEY")
+
+	manifestPath := filepath.Join(dir, "dotenv.spine")
+	dbPath := filepath.Join(dir, "dotenv.db")
+	if err := os.WriteFile(manifestPath, []byte(manifestContent), 0644); err != nil {
+		t.Fatalf("Failed to write manifest: %v", err)
+	}
+
+	eng, err := spine.NewFromFile(manifestPath, dbPath)
+	if err != nil {
+		t.Fatalf("Failed to create engine: %v", err)
+	}
+	defer eng.Close()
+
+	handler := eng.HTTPHandler()
+
+	// Should authenticate with the env var value
+	rr := doEmit(handler, "sk_dotenv_value", "PING", map[string]interface{}{})
+	if rr.Code != 200 {
+		t.Errorf("$env.VAR key emit: expected 200, got %d: %s", rr.Code, rr.Body.String())
+	}
+
+	// Should fail with wrong key
+	rr = doEmit(handler, "wrong_key", "PING", map[string]interface{}{})
+	if rr.Code != http.StatusUnauthorized {
+		t.Errorf("Wrong key with $env.VAR expansion: expected 401, got %d", rr.Code)
+	}
+}

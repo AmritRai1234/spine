@@ -1,7 +1,6 @@
 package tests
 
 import (
-	"fmt"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
@@ -13,7 +12,10 @@ import (
 	"github.com/AmritRai1234/spine/pkg/manifest"
 )
 
-func TestRoadmapCompletionVerification(t *testing.T) {
+// TestEndToEndFeatureParity verifies the full feature set described in
+// five_year_roadmap.md end-to-end: tenant isolation, access control, outbox
+// tuning, FTS, emit_to streams, and TypeScript codegen in one manifest.
+func TestEndToEndFeatureParity(t *testing.T) {
 	dir := t.TempDir()
 	manifestPath := filepath.Join(dir, "app.spine")
 	dbPath := filepath.Join(dir, "spine_roadmap.db")
@@ -93,6 +95,4 @@ routes:
 
 	eng.Bus.EnqueueOutboxStep(nil, "log.write", map[string]interface{}{"msg": "verified"}, 10)
 	time.Sleep(100 * time.Millisecond)
-
-	fmt.Println("✓ Verified entire Spine 5-Year Roadmap feature set cleanly!")
 }

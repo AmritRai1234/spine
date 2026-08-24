@@ -8,6 +8,7 @@ import (
 	"time"
 
 	spine "github.com/AmritRai1234/spine"
+	"github.com/AmritRai1234/spine/pkg/engine"
 )
 
 // ==================== Test 1: Numeric Field Validation & SQLite Storage ====================
@@ -240,5 +241,71 @@ routes:
 	}
 	if state["task_id"] != "t_456" {
 		t.Errorf("expected task_id=t_456, got %v", state["task_id"])
+	}
+}
+
+// TestOnFailureErrorContextPreservation verifies _error_context and original trigger attributes in failure state.
+func TestOnFailureErrorContextPreservation(t *testing.T) {
+	tmpDir := t.TempDir()
+	spineFile := filepath.Join(tmpDir, "failure.spine")
+	dbPath := filepath.Join(tmpDir, "failure.db")
+
+	manifestContent := `spine_version: 1
+
+routes:
+  - on: TRIGGER_FAIL
+    on_failure: HANDLE_FAILURE
+    steps:
+      - action: http.post
+        url: "http://invalid.local.domain.does.not.exist:9999/test"
+`
+	os.WriteFile(spineFile, []byte(manifestContent), 0644)
+
+	eng, err := engine.NewFromFile(spineFile, dbPath)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+	defer eng.Close()
+
+	initialPayload := map[string]interface{}{
+		"order_id": "ORD-12345",
+		"amount":   99.50,
+	}
+
+	res, err := eng.Bus.Emit("TRIGGER_FAIL", initialPayload)
+	if err == nil {
+		t.Fatalf("expected route execution to fail")
+	}
+
+	if res == nil || res["status"] != "error" {
+		t.Fatalf("expected status error in result, got: %v", res)
+	}
+
+	failPayload, ok := eng.Bus.GetState("HANDLE_FAILURE")
+	if !ok {
+		t.Fatalf("expected failure state HANDLE_FAILURE to be set")
+	}
+
+	// Verify original payload attributes were preserved
+	if failPayload["order_id"] != "ORD-12345" {
+		t.Fatalf("expected order_id to be preserved, got %v", failPayload["order_id"])
+	}
+
+	// Verify _error_context
+	errCtx, ok := failPayload["_error_context"].(map[string]interface{})
+	if !ok {
+		t.Fatalf("expected _error_context map in failure payload")
+	}
+
+	if errCtx["failed_event"] != "TRIGGER_FAIL" {
+		t.Fatalf("expected failed_event TRIGGER_FAIL, got %v", errCtx["failed_event"])
+	}
+	if errCtx["failed_action"] != "http.post" {
+		t.Fatalf("expected failed_action http.post, got %v", errCtx["failed_action"])
+	}
+
+	origMap, ok := errCtx["original_payload"].(map[string]interface{})
+	if !ok || origMap["order_id"] != "ORD-12345" {
+		t.Fatalf("expected original_payload in _error_context to preserve order_id")
 	}
 }

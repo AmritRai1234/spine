@@ -1,15 +1,80 @@
 package tests
 
+// Database action tests: db.insert, db.upsert, db.update, db.sum, set,
+// typed columns, and direct DB access.
+
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	spine "github.com/AmritRai1234/spine"
 )
 
-// ==================== Feature 1: db.upsert ====================
+// ---- Direct DB Accessor ----
+
+func TestDBAccessor(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "db_accessor_test.db")
+	spineFile := filepath.Join(tempDir, "db_accessor_test.spine")
+
+	manifest := `spine_version: 1
+database:
+  tables:
+    - items
+
+nodes:
+  TestNode:
+    owns_files:
+      - test.ts
+    emits:
+      - event: ADD_ITEM
+        payload:
+          name: string
+
+routes:
+  - on: ADD_ITEM
+    steps:
+      - action: db.insert
+        table: items
+`
+	os.WriteFile(spineFile, []byte(manifest), 0644)
+
+	engine, err := spine.NewFromFile(spineFile, dbPath)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+	defer engine.Close()
+
+	// DB() should return non-nil
+	db := engine.Bus.DB()
+	if db == nil {
+		t.Fatal("Bus.DB() returned nil")
+	}
+
+	// Insert via Spine, then query via raw DB()
+	engine.Bus.Emit("ADD_ITEM", map[string]interface{}{"name": "widget"})
+	time.Sleep(100 * time.Millisecond)
+
+	var count int
+	err = db.QueryRow(`SELECT COUNT(*) FROM "items"`).Scan(&count)
+	if err != nil {
+		t.Fatalf("raw DB query failed: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("expected 1 row via DB(), got %d", count)
+	}
+
+	// Verify same data visible via GetTableRows
+	rows, _ := engine.Bus.GetTableRows("items", 10, 0)
+	if len(rows) != count {
+		t.Errorf("DB() and GetTableRows disagree: DB()=%d, GetTableRows=%d", count, len(rows))
+	}
+}
+
+// ---- db.upsert ----
 
 func TestDbUpsert(t *testing.T) {
 	tempDir := t.TempDir()
@@ -125,7 +190,42 @@ routes:
 	}
 }
 
-// ==================== Feature 2: set action ====================
+func TestDbUpsertMissingKeyEnforcement(t *testing.T) {
+	tempDir := t.TempDir()
+	spineFile := filepath.Join(tempDir, "upsert.spine")
+	dbPath := filepath.Join(tempDir, "upsert.db")
+
+	manifestContent := `spine_version: 1
+
+routes:
+  - on: SAVE_USER
+    steps:
+      - action: db.upsert
+        table: users
+        key: email
+`
+	os.WriteFile(spineFile, []byte(manifestContent), 0644)
+
+	eng, err := spine.NewFromFile(spineFile, dbPath)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+	defer eng.Close()
+
+	// Missing 'email' in payload should fail cleanly with error
+	_, err = eng.Bus.Emit("SAVE_USER", map[string]interface{}{
+		"name": "Bob",
+		"age":  30,
+	})
+	if err == nil {
+		t.Fatalf("expected error when conflict key is missing from payload, got nil")
+	}
+	if !strings.Contains(err.Error(), "conflict key 'email' not present in payload") {
+		t.Fatalf("unexpected error message: %v", err)
+	}
+}
+
+// ---- set action ----
 
 func TestSetFieldsBasic(t *testing.T) {
 	tempDir := t.TempDir()
@@ -289,7 +389,244 @@ routes:
 	}
 }
 
-// ==================== Feature 3: Typed columns ====================
+// ---- db.sum ----
+
+func TestDbSumAction(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "sum_test.db")
+	spineFile := filepath.Join(tempDir, "sum_test.spine")
+
+	manifest := `spine_version: 1
+database:
+  tables:
+    - expenses
+
+nodes:
+  TestNode:
+    emits:
+      - event: ADD_EXPENSE
+        payload:
+          category: string
+          amount: number
+      - event: CALC_TOTAL
+      - event: CALC_FOOD
+
+routes:
+  - on: ADD_EXPENSE
+    steps:
+      - action: db.insert
+        table: expenses
+
+  - on: CALC_TOTAL
+    steps:
+      - action: db.sum
+        table: expenses
+        column: amount
+        as: total
+    emit: TOTAL_READY
+
+  - on: CALC_FOOD
+    steps:
+      - action: db.sum
+        table: expenses
+        column: amount
+        where: "category = 'food'"
+        as: food_total
+    emit: FOOD_READY
+`
+	os.WriteFile(spineFile, []byte(manifest), 0644)
+
+	engine, err := spine.NewFromFile(spineFile, dbPath)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+	defer engine.Close()
+
+	// Empty table sums to 0, not NULL
+	if _, err := engine.Bus.Emit("CALC_TOTAL", map[string]interface{}{}); err != nil {
+		t.Fatalf("CALC_TOTAL emit failed: %v", err)
+	}
+	state, ok := engine.Bus.GetState("TOTAL_READY")
+	if !ok {
+		t.Fatal("expected TOTAL_READY state in cache")
+	}
+	if total, _ := state["total"].(float64); total != 0 {
+		t.Errorf("empty table sum: expected 0, got %v", state["total"])
+	}
+
+	// Insert expenses (batch writer is async — wait for flush)
+	for _, e := range []map[string]interface{}{
+		{"category": "food", "amount": 10.5},
+		{"category": "food", "amount": 20.0},
+		{"category": "office", "amount": 30.0},
+	} {
+		if _, err := engine.Bus.Emit("ADD_EXPENSE", e); err != nil {
+			t.Fatalf("ADD_EXPENSE emit failed: %v", err)
+		}
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	if _, err := engine.Bus.Emit("CALC_TOTAL", map[string]interface{}{}); err != nil {
+		t.Fatalf("CALC_TOTAL emit failed: %v", err)
+	}
+	state, ok = engine.Bus.GetState("TOTAL_READY")
+	if !ok {
+		t.Fatal("expected TOTAL_READY state in cache")
+	}
+	if total, _ := state["total"].(float64); total != 60.5 {
+		t.Errorf("total sum: expected 60.5, got %v", state["total"])
+	}
+
+	// Filtered sum via parameterized where
+	if _, err := engine.Bus.Emit("CALC_FOOD", map[string]interface{}{}); err != nil {
+		t.Fatalf("CALC_FOOD emit failed: %v", err)
+	}
+	state, ok = engine.Bus.GetState("FOOD_READY")
+	if !ok {
+		t.Fatal("expected FOOD_READY state in cache")
+	}
+	if total, _ := state["food_total"].(float64); total != 30.5 {
+		t.Errorf("food sum: expected 30.5, got %v", state["food_total"])
+	}
+}
+
+// ---- db.update ----
+
+func TestDbUpdateWithWhere(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "update_where_test.db")
+	spineFile := filepath.Join(tempDir, "update_where_test.spine")
+
+	manifest := `spine_version: 1
+database:
+  tables:
+    - users
+
+nodes:
+  TestNode:
+    emits:
+      - event: ADD_USER
+        payload:
+          email: string
+          name: string
+      - event: RENAME_USER
+        payload:
+          email: string
+          name: string
+
+routes:
+  - on: ADD_USER
+    steps:
+      - action: db.insert
+        table: users
+
+  - on: RENAME_USER
+    steps:
+      - action: db.update
+        table: users
+        where: "email = '$event.payload.email'"
+`
+	os.WriteFile(spineFile, []byte(manifest), 0644)
+
+	engine, err := spine.NewFromFile(spineFile, dbPath)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+	defer engine.Close()
+
+	engine.Bus.Emit("ADD_USER", map[string]interface{}{"email": "a@test.dev", "name": "alice"})
+	engine.Bus.Emit("ADD_USER", map[string]interface{}{"email": "b@test.dev", "name": "bob"})
+	time.Sleep(300 * time.Millisecond)
+
+	// Update only alice's row via explicit where
+	if _, err := engine.Bus.Emit("RENAME_USER", map[string]interface{}{"email": "a@test.dev", "name": "alice2"}); err != nil {
+		t.Fatalf("RENAME_USER emit failed: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	rows, err := engine.Bus.GetTableRows("users", 10, 0)
+	if err != nil {
+		t.Fatalf("GetTableRows failed: %v", err)
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected 2 rows, got %d", len(rows))
+	}
+	names := map[string]string{}
+	for _, r := range rows {
+		email, _ := r["email"].(string)
+		name, _ := r["name"].(string)
+		names[email] = name
+	}
+	if names["a@test.dev"] != "alice2" {
+		t.Errorf("expected alice2 after where update, got %q", names["a@test.dev"])
+	}
+	if names["b@test.dev"] != "bob" {
+		t.Errorf("bob's row must be untouched, got %q", names["b@test.dev"])
+	}
+}
+
+func TestDbUpdateIdFallback(t *testing.T) {
+	tempDir := t.TempDir()
+	dbPath := filepath.Join(tempDir, "update_fallback_test.db")
+	spineFile := filepath.Join(tempDir, "update_fallback_test.spine")
+
+	manifest := `spine_version: 1
+database:
+  tables:
+    - items
+
+nodes:
+  TestNode:
+    emits:
+      - event: ADD_ITEM
+        payload:
+          id: string
+          qty: number
+      - event: UPDATE_ITEM
+        payload:
+          id: string
+          qty: number
+
+routes:
+  - on: ADD_ITEM
+    steps:
+      - action: db.insert
+        table: items
+
+  - on: UPDATE_ITEM
+    steps:
+      - action: db.update
+        table: items
+`
+	os.WriteFile(spineFile, []byte(manifest), 0644)
+
+	engine, err := spine.NewFromFile(spineFile, dbPath)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+	defer engine.Close()
+
+	engine.Bus.Emit("ADD_ITEM", map[string]interface{}{"id": "i1", "qty": 1.0})
+	time.Sleep(300 * time.Millisecond)
+
+	if _, err := engine.Bus.Emit("UPDATE_ITEM", map[string]interface{}{"id": "i1", "qty": 42.0}); err != nil {
+		t.Fatalf("UPDATE_ITEM emit failed: %v", err)
+	}
+	time.Sleep(300 * time.Millisecond)
+
+	rows, err := engine.Bus.GetTableRows("items", 10, 0)
+	if err != nil {
+		t.Fatalf("GetTableRows failed: %v", err)
+	}
+	if len(rows) != 1 {
+		t.Fatalf("expected 1 row (update, not insert), got %d", len(rows))
+	}
+	if qty, _ := rows[0]["qty"].(float64); qty != 42.0 {
+		t.Errorf("expected qty 42 after id-fallback update, got %v", rows[0]["qty"])
+	}
+}
+
+// ---- Typed columns ----
 
 func TestTypedColumnsNumber(t *testing.T) {
 	tempDir := t.TempDir()

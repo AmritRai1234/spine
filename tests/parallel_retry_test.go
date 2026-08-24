@@ -2,6 +2,8 @@ package tests
 
 import (
 	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/AmritRai1234/spine/pkg/engine"
@@ -69,4 +71,60 @@ routes:
 	if status, ok := res["status"].(string); !ok || status != "ok" {
 		t.Errorf("expected status 'ok', got %v", res)
 	}
+}
+
+// TestParallelRouteThreadSafety verifies parallel route steps run concurrently without data races or slice corruption.
+func TestParallelRouteThreadSafety(t *testing.T) {
+	tmpDir := t.TempDir()
+	spineFile := filepath.Join(tmpDir, "parallel.spine")
+	dbPath := filepath.Join(tmpDir, "parallel.db")
+
+	manifestContent := `spine_version: 1
+
+nodes:
+  - name: api
+    emits:
+      - event: PROCESS_DATA
+        payload:
+          id: string
+          val1: string
+          val2: string
+
+routes:
+  - on: PROCESS_DATA
+    parallel: true
+    steps:
+      - action: set
+        val1: "computed_1"
+      - action: set
+        val2: "computed_2"
+      - action: log.write
+        message: "Processing $event.payload.id"
+`
+	os.WriteFile(spineFile, []byte(manifestContent), 0644)
+
+	eng, err := engine.NewFromFile(spineFile, dbPath)
+	if err != nil {
+		t.Fatalf("failed to create engine: %v", err)
+	}
+	defer eng.Close()
+
+	var wg sync.WaitGroup
+	concurrentReqs := 20
+	for i := 0; i < concurrentReqs; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			payload := map[string]interface{}{
+				"id":   "req_" + string(rune(idx)),
+				"val1": "initial1",
+				"val2": "initial2",
+			}
+			_, err := eng.Bus.Emit("PROCESS_DATA", payload)
+			if err != nil {
+				t.Errorf("parallel emit failed: %v", err)
+			}
+		}(i)
+	}
+	wg.Wait()
 }

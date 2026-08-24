@@ -2,6 +2,7 @@ package tests
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/AmritRai1234/spine/pkg/engine"
@@ -36,8 +37,7 @@ routes:
 		t.Fatalf("ParseManifest failed: %v", err)
 	}
 
-	dbPath := "test_turso.turso"
-	defer os.Remove(dbPath)
+	dbPath := filepath.Join(t.TempDir(), "test_turso.turso")
 
 	reg := manifest.NewRegistry(schema)
 	hub := engine.NewHub()
