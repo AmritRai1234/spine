@@ -2,43 +2,43 @@
 
 Current ruling on top. Written by the CEO persona (spine-ceo); the war room and
 architect plan the HOW inside each brief. Replaced each cycle by the closed-loop
-protocol.
+protocol. Full ledger in DECISION.md.
 
 ---
 
-## Cycle 1 — 2026-08-25 | Epic: "CI Truthfulness" (toolchain pin)
+## Cycle 2 — 2026-08-25 | Epic: "Write-Path Durability" (batch-commit failure handling)
 
-**What we build:** CI stops lying about its toolchain. Replace the hardcoded
-`go-version: "1.24"` in both jobs of `.github/workflows/ci.yml` with
-`go-version-file: go.mod`, so GitHub Actions reads the Go version from the
-manifest of record — one source of truth, no drift, no silent auto-download
-crutch.
+**What we build:** Close the engine's last durability gap. `bus.go:374` ignores
+the batch `tx.Commit()` error and clears the batch on failure — every
+`db.insert/update/upsert/delete` in that batch is silently lost, and this is
+the only path ALL writes flow through. New behavior on Commit error: log loudly
+with the failing SQL, RETAIN the batch (do not reset), back off briefly and
+retry once or twice; if still failing, spill through a durable path
+(outbox-style) or surface the error to the emit caller. Same treatment for the
+`tx.Begin` fallback's ignored per-statement errors (bus.go:340-346).
 
-**Why it serves the mission:** Spine is a self-hosted Shopify alternative whose
-whole pitch is trust — merchants own their data and their runtime. A CI that
-only passes because GOTOOLCHAIN auto-downloads a different version than it
-declares is a quality lie: it masks real breakage, wastes minutes per run
-fetching a second toolchain, and breaks the day runner defaults change. CI must
-verify exactly what we ship. (Closes assessment LOW #13:
-"CI pins Go 1.24 while go.mod requires 1.25.0".)
+**Why it serves the mission:** Quality #1, Safety #2. A merchant's write that
+vanishes with no log is the worst failure class for a commerce backend — an
+order placed that never lands, a stock decrement that silently didn't happen.
+This is assessment priority #1 and the single remaining reliability gap between
+Spine's performance story and its durability story.
 
-**Values:** Quality #1 (dominant — truthful CI is the foundation of "no
-known-broken ships"), Simplicity #4 (one source of truth for the Go version,
-replacing a duplicated magic constant).
+**Values:** Quality (dominant), Safety (data integrity, money movement),
+Performance (floor — retry logic lives on the failure path only; hot path
+unchanged).
 
-**REJECTED this cycle (complexity budget):** the two HIGH engine findings —
-batch-commit silent drop (bus.go:374) and startup error-swallows
-(query.go initEventTable, outbox.go initOutboxTable) — because they touch the
-async write path while 27 files of the user's uncommitted WIP sit on top of it;
-engine surgery on a moving tree is how known-broken ships happen. Queue
-position 1 for the next clean-tree cycle. Also rejected: WS rate-limit /
-connection cap, README benchmark relabeling (README is WIP-modified), any new
-dependency, any go.mod bump, any edit to the 16 modified / 11 untracked WIP
-files.
+**Precondition:** the tree MUST be clean of the user's uncommitted WIP first —
+this touches `pkg/engine/bus.go`, which currently carries 16 modified +
+11 untracked WIP files on top of it. The user commits or branches the WIP, then
+this epic runs.
+
+**REJECTED this cycle:** the startup error-swallows (HIGH #2, query.go:376 /
+outbox.go:23) fold in ONLY if the fix is trivially adjacent; otherwise they get
+cycle 3. No WS/rate-limit work, no new deps, no README edits, no go.mod bump.
 
 **Success criteria:**
-1. Both ci.yml jobs source the Go version from go.mod — no hardcoded version remains.
-2. Workflow YAML validates (actionlint).
-3. Local gate green: `go build ./... && go vet ./... && go test ./...`.
-4. Commit contains ONLY this cycle's files: `.github/workflows/ci.yml`, `NEXT-EPIC.md`, `DECISION.md`.
-5. Zero user WIP files touched, staged, or reverted.
+1. Injected commit failure → loud log, batch retained, retry observed (black-box
+   test in tests/ with a failure-injection seam).
+2. No code path silently drops a write batch.
+3. Full gate green INCLUDING `go test -race ./...` (engine change).
+4. Zero user WIP files touched; commit scoped to engine files + tests + ledger.
