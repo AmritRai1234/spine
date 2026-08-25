@@ -523,9 +523,9 @@ routes:
 
 ```bash
 spine serve app.spine --port 8080 --db data.db --api-key SECRET
-spine dev app.spine                  # Hot-reload dev server
+spine dev app.spine                  # Hot-reload dev server (watches manifest + includes)
 spine emit EVENT_NAME --payload '{"key":"value"}'
-spine init myapp --template chat     # Templates: chat, dashboard, iot
+spine init myapp --template chat     # Templates: chat, dashboard, iot, shadcn (Vite + React + Tailwind + shadcn/ui)
 spine deploy fly                     # Generate fly.toml + Dockerfile
 spine codegen app.spine              # Generate TypeScript types
 spine context app.spine Dashboard    # Print one node's contract slice — paste into an AI session

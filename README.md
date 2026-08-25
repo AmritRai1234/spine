@@ -195,7 +195,7 @@ Spine provides a rich command-line toolkit for local dev, scaffolding, codegen, 
 ```bash
 spine serve app.spine [options]    # Start production HTTP/WS engine
 spine dev app.spine [options]      # Start hot-reloading dev server with colored logging
-spine init [dir] [--template X]   # Scaffold new project (templates: chat, dashboard, iot)
+spine init [dir] [--template X]   # Scaffold new project (templates: chat, dashboard, iot, shadcn)
 spine test [manifest.spine]        # Run manifest-defined assertion tests
 spine deploy [fly|railway|render]  # Generate cloud deployment config (fly.toml, Dockerfile)
 spine plugin add <plugin-name>     # Download & register WASM/Go action plugin modules
@@ -350,6 +350,27 @@ ws.onmessage = (event) => {
 | `age: number` in payload | Creates `REAL` column (not TEXT), enables numeric sorting |
 | `emit: USER_REGISTERED` | Broadcasts to all WebSocket clients instantly |
 | `?where=active:1` | Returns filtered rows with parameterized SQL (injection-safe) |
+
+### Frontend with Vite + shadcn/ui (native template)
+
+```bash
+spine init myapp --template shadcn
+cd myapp
+spine dev app.spine --api-key local-dev-key          # terminal 1 (hot-reload enabled)
+cd web && npm install && SPINE_API_KEY=local-dev-key npm run dev   # terminal 2 (Vite HMR)
+```
+
+The `shadcn` template scaffolds a complete **Vite + React + TypeScript + Tailwind v4 + shadcn/ui** app in `web/`, pre-wired to your manifest:
+
+| Scaffold piece | Purpose |
+|---|---|
+| `web/components.json` | shadcn/ui config — `npx shadcn@latest add <component>` works out of the box |
+| `web/src/components/ui/*` | Vendored Button, Card, Input, Badge, Table (new-york style) |
+| `web/src/lib/spine.ts` | Typed client: HTTP emit/query + WS subscriptions with auto-reconnect and in-band auth |
+| `web/src/hooks/use-spine.ts` | `useSpineState(state)` / `useSpineStateTick(state)` — re-render on engine broadcasts |
+| `web/src/App.tsx` | Live dashboard: emit `NEW_TASK` → table refetches on the `TASK_CREATED` WebSocket broadcast |
+
+Because both layers hot-reload independently — `.spine` manifests via `spine dev`, React components via Vite HMR — you can evolve backend routes and UI simultaneously with zero restarts.
 
 ---
 
