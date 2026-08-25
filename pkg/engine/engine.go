@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -55,11 +56,16 @@ type Engine struct {
 	Bus           *Bus
 	Hub           *Hub
 	Schema        *manifest.SpineSchema
-	APIKey        string           // Legacy single-key auth (backward compat)
-	access        *AccessResolver  // Multi-key role-based access control
+	APIKey        string          // Legacy single-key auth (backward compat)
+	accessPtr     atomic.Pointer[AccessResolver] // Multi-key role-based access control (hot-swappable)
 	rateLimiter   *middleware.RateLimitManager
 	customContext *middleware.CustomContextManager
 	spineFile     string
+
+	reloadMu       sync.Mutex    // guards Schema field swaps & diff logging during hot-reload
+	reloadStop     chan struct{} // closed to stop the hot-reload watcher goroutine
+	reloadStopOnce sync.Once
+	reloadInterval time.Duration // manifest poll interval for hot-reload
 }
 
 // SetRateLimit enables IP-based token bucket rate limiting on public endpoints.
@@ -87,15 +93,16 @@ func New(schema *manifest.SpineSchema, dbPath string) (*Engine, error) {
 		return nil, err
 	}
 	eng := &Engine{
-		Bus:           bus,
-		Hub:           hub,
-		Schema:        schema,
-		customContext: middleware.NewCustomContextManager(),
+		Bus:            bus,
+		Hub:            hub,
+		Schema:         schema,
+		customContext:  middleware.NewCustomContextManager(),
+		reloadInterval: time.Second,
 	}
 
 	// Wire access resolver if manifest defines access rules
 	if len(schema.Access) > 0 {
-		eng.access = NewAccessResolver(schema.Access)
+		eng.accessPtr.Store(NewAccessResolver(schema.Access))
 	}
 
 	return eng, nil
@@ -135,9 +142,9 @@ func NewFromFile(spineFile, dbPath string) (*Engine, error) {
 	return eng, nil
 }
 
-// Access returns the engine's AccessResolver.
+// Access returns the engine's AccessResolver (nil if no rules are defined).
 func (e *Engine) Access() *AccessResolver {
-	return e.access
+	return e.accessPtr.Load()
 }
 
 // SetAPIKey configures the API key requirement for protected HTTP endpoints.
@@ -145,8 +152,13 @@ func (e *Engine) SetAPIKey(key string) {
 	e.APIKey = key
 }
 
-// Close shuts down the engine and its rate limiter.
+// Close shuts down the engine, its hot-reload watcher, and its rate limiter.
 func (e *Engine) Close() error {
+	e.reloadStopOnce.Do(func() {
+		if e.reloadStop != nil {
+			close(e.reloadStop)
+		}
+	})
 	if e.rateLimiter != nil {
 		e.rateLimiter.Close()
 	}
@@ -156,7 +168,7 @@ func (e *Engine) Close() error {
 // ListenAndServe starts HTTP+WS server with graceful shutdown on SIGINT/SIGTERM.
 func (e *Engine) ListenAndServe(addr string) error {
 	if e.spineFile != "" {
-		e.startHotReload()
+		e.StartHotReload()
 	}
 	mux := e.buildMux()
 	srv := &http.Server{
@@ -199,13 +211,15 @@ func (e *Engine) HTTPHandler() http.Handler {
 }
 
 func (e *Engine) wrapMiddleware(handler http.HandlerFunc) http.HandlerFunc {
-	var h http.HandlerFunc
+	// Precompute the legacy single-key handler once.
+	legacyAuth := middleware.AuthMiddleware(e.APIKey, handler)
 
-	if e.access != nil && e.access.HasRules() {
-		// Multi-key role-based auth: resolve key → AccessContext, inject into context
-		h = func(w http.ResponseWriter, r *http.Request) {
+	// Resolve the access resolver per-request so hot-reloaded rules take
+	// effect immediately without rebuilding the mux.
+	h := func(w http.ResponseWriter, r *http.Request) {
+		if resolver := e.accessPtr.Load(); resolver != nil && resolver.HasRules() {
 			clientKey := extractAPIKey(r.Header.Get("X-API-Key"), r.Header.Get("Authorization"))
-			ac := e.access.Resolve(clientKey)
+			ac := resolver.Resolve(clientKey)
 			if ac == nil {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
@@ -217,10 +231,9 @@ func (e *Engine) wrapMiddleware(handler http.HandlerFunc) http.HandlerFunc {
 			}
 			ctx := context.WithValue(r.Context(), accessContextKey, ac)
 			handler(w, r.WithContext(ctx))
+			return
 		}
-	} else {
-		// Legacy single-key auth
-		h = middleware.AuthMiddleware(e.APIKey, handler)
+		legacyAuth(w, r)
 	}
 
 	if e.rateLimiter != nil {
@@ -263,14 +276,14 @@ func getAccessContext(r *http.Request) *AccessContext {
 // Returns (authenticated, accessContext). accessContext may be nil in legacy mode.
 func (e *Engine) wsAuthCheck(r *http.Request) (bool, *AccessContext) {
 	// Multi-key access mode
-	if e.access != nil && e.access.HasRules() {
+	if resolver := e.accessPtr.Load(); resolver != nil && resolver.HasRules() {
 		var key string
 		if token := r.URL.Query().Get("token"); token != "" {
 			key = token
 		} else {
 			key = extractAPIKey(r.Header.Get("X-API-Key"), r.Header.Get("Authorization"))
 		}
-		ac := e.access.Resolve(key)
+		ac := resolver.Resolve(key)
 		return ac != nil, ac
 	}
 
@@ -657,9 +670,9 @@ spine_optimizer_mode{mode="%s"} 1
 					token, _ := raw["token"].(string)
 
 					var authOk bool
-					if e.access != nil && e.access.HasRules() {
+					if resolver := e.accessPtr.Load(); resolver != nil && resolver.HasRules() {
 						// Multi-key mode: resolve token to access context
-						ac := e.access.Resolve(token)
+						ac := resolver.Resolve(token)
 						authOk = ac != nil
 						if authOk {
 							wsAccess = ac
@@ -771,39 +784,156 @@ spine_optimizer_mode{mode="%s"} 1
 	return mux
 }
 
-func (e *Engine) startHotReload() {
-	var lastMod time.Time
-	if fi, err := os.Stat(e.spineFile); err == nil {
-		lastMod = fi.ModTime()
+// SetHotReloadInterval overrides the manifest poll interval (default 1s).
+// Must be called before StartHotReload / ListenAndServe.
+func (e *Engine) SetHotReloadInterval(d time.Duration) {
+	if d > 0 {
+		e.reloadInterval = d
 	}
-	ticker := time.NewTicker(1 * time.Second)
+}
+
+// StartHotReload begins watching the manifest and its includes for changes.
+// On change: re-parse, validate, atomically swap the route registry, ensure
+// newly declared tables, and refresh the access resolver. Invalid manifests
+// are rejected and the previous schema keeps serving (rollback by omission).
+func (e *Engine) StartHotReload() {
+	if e.spineFile == "" || e.reloadStop != nil {
+		return
+	}
+	e.reloadStop = make(chan struct{})
+	stop := e.reloadStop
+	interval := e.reloadInterval
+
+	snapshot := watchSnapshot(e.watchSet())
+
 	go func() {
-		for range ticker.C {
-			fi, err := os.Stat(e.spineFile)
-			if err != nil {
-				continue
-			}
-			if fi.ModTime().After(lastMod) {
-				lastMod = fi.ModTime()
-				log.Printf("[spine] manifest change detected, reloading...")
-				s, err := manifest.ParseManifest(e.spineFile)
-				if err != nil {
-					log.Printf("[spine] ✗ hot-reload failed: %v", err)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				current := watchSnapshot(e.watchSet())
+				if !snapshotChanged(snapshot, current) {
 					continue
 				}
-
-				if e.Schema != nil {
-					diff := DiffManifests(e.Schema, s)
-					log.Printf("[spine] manifest diff: %s", diff.Summary())
-				}
-
-				e.Schema = s
-				e.Bus.UpdateRegistry(manifest.NewRegistry(s))
-				if len(s.Access) > 0 {
-					e.access = NewAccessResolver(s.Access)
-				}
-				log.Printf("[spine] ✓ reloaded: %d nodes, %d routes", len(s.Nodes), len(s.Routes))
+				time.Sleep(150 * time.Millisecond) // debounce editor multi-writes
+				e.reloadManifest()
+				snapshot = watchSnapshot(e.watchSet()) // pick up newly added includes
 			}
 		}
 	}()
+	log.Printf("[spine] hot-reload watcher active on '%s' (+includes)", e.spineFile)
+}
+
+// reloadManifest parses the current manifest and swaps it in if valid.
+func (e *Engine) reloadManifest() {
+	s, err := manifest.ParseManifest(e.spineFile)
+	if err != nil {
+		log.Printf("[spine] ✗ hot-reload failed (keeping previous schema): %v", err)
+		return
+	}
+
+	e.reloadMu.Lock()
+	if e.Schema != nil {
+		diff := DiffManifests(e.Schema, s)
+		if summary := diff.Summary(); summary != "" {
+			log.Printf("[spine] manifest diff: %s", summary)
+		}
+	}
+	e.Schema = s
+	e.reloadMu.Unlock()
+
+	e.Bus.UpdateRegistry(manifest.NewRegistry(s))
+	e.Bus.EnsureTables(s.DbTables)
+	if len(s.Access) > 0 {
+		e.accessPtr.Store(NewAccessResolver(s.Access))
+	}
+	log.Printf("[spine] ✓ hot-reloaded: %d nodes, %d routes", len(s.Nodes), len(s.Routes))
+}
+
+// watchSet returns the root manifest plus all transitively included .spine files.
+func (e *Engine) watchSet() []string {
+	files := []string{e.spineFile}
+	seen := map[string]bool{e.spineFile: true}
+	queue := []string{e.spineFile}
+	for len(queue) > 0 {
+		f := queue[0]
+		queue = queue[1:]
+		data, err := os.ReadFile(f)
+		if err != nil {
+			continue
+		}
+		dir := filepath.Dir(f)
+		for _, inc := range parseIncludeRefs(data) {
+			p := inc
+			if !filepath.IsAbs(p) {
+				p = filepath.Join(dir, p)
+			}
+			if !seen[p] {
+				seen[p] = true
+				files = append(files, p)
+				queue = append(queue, p)
+			}
+		}
+	}
+	return files
+}
+
+// parseIncludeRefs extracts include file paths from a manifest's raw text,
+// accepting both canonical `includes:` and legacy `include:` spellings.
+func parseIncludeRefs(data []byte) []string {
+	var refs []string
+	inBlock := false
+	for _, line := range strings.Split(string(data), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
+		if trimmed == "includes:" || trimmed == "include:" {
+			inBlock = true
+			continue
+		}
+		if inBlock {
+			if strings.HasPrefix(line, " ") || strings.HasPrefix(line, "\t") {
+				item := strings.TrimSpace(strings.TrimPrefix(trimmed, "- "))
+				item = strings.Trim(item, `"'`)
+				if item != "" && !strings.HasPrefix(item, "#") {
+					refs = append(refs, item)
+				}
+				continue
+			}
+			inBlock = false // next top-level key reached
+		}
+	}
+	return refs
+}
+
+// watchSnapshot captures modtimes of the given files. Missing files map to
+// the zero time so creation/deletion are detected as changes.
+func watchSnapshot(files []string) map[string]time.Time {
+	snap := make(map[string]time.Time, len(files))
+	for _, f := range files {
+		fi, err := os.Stat(f)
+		if err != nil {
+			snap[f] = time.Time{}
+			continue
+		}
+		snap[f] = fi.ModTime()
+	}
+	return snap
+}
+
+// snapshotChanged reports whether two watch snapshots differ.
+func snapshotChanged(a, b map[string]time.Time) bool {
+	if len(a) != len(b) {
+		return true
+	}
+	for f, mt := range a {
+		if b[f] != mt {
+			return true
+		}
+	}
+	return false
 }

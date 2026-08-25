@@ -13,6 +13,7 @@ import (
 	spine "github.com/AmritRai1234/spine"
 	"github.com/AmritRai1234/spine/pkg/codegen"
 	"github.com/AmritRai1234/spine/pkg/manifest"
+	"github.com/AmritRai1234/spine/pkg/templates"
 )
 
 var version = spine.Version
@@ -657,9 +658,11 @@ func cmdInit(args []string) {
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--help", "-h":
-			fmt.Fprintf(os.Stderr, `Usage: spine init [directory] [--template chat|dashboard|iot]
+			fmt.Fprintf(os.Stderr, `Usage: spine init [directory] [--template chat|dashboard|iot|shadcn]
 
 Scaffolds a new Spine project with starter manifest, DB schema, and starter template.
+Template 'shadcn' additionally scaffolds a Vite + React + Tailwind + shadcn/ui
+frontend in ./web wired to the Spine backend (live WebSocket dashboard).
 `)
 			return
 		case "--template":
@@ -679,6 +682,23 @@ Scaffolds a new Spine project with starter manifest, DB schema, and starter temp
 			fmt.Fprintf(os.Stderr, "✗ Failed to create directory '%s': %v\n", targetDir, err)
 			os.Exit(1)
 		}
+	}
+
+	// shadcn template scaffolds manifest + env + full Vite/shadcn frontend.
+	if templateName == "shadcn" {
+		if err := templates.ScaffoldShadcn(targetDir); err != nil {
+			fmt.Fprintf(os.Stderr, "✗ Failed to scaffold shadcn template: %v\n", err)
+			os.Exit(1)
+		}
+
+		fmt.Printf("✓ Initialized Spine project in '%s' (template: shadcn)\n", targetDir)
+		fmt.Printf("  ├── app.spine          # events: NEW_TASK → TASK_CREATED\n")
+		fmt.Printf("  ├── .env.example\n")
+		fmt.Printf("  └── web/               # Vite + React + Tailwind v4 + shadcn/ui\n\n")
+		fmt.Printf("1) spine dev app.spine --api-key local-dev-key\n")
+		fmt.Printf("2) cd web && npm install && SPINE_API_KEY=local-dev-key npm run dev\n")
+		fmt.Printf("   (add more components anytime with: npx shadcn@latest add dialog)\n")
+		return
 	}
 
 	var manifestContent string
@@ -808,14 +828,15 @@ func cmdDev(args []string) {
 		manifestPath string = "app.spine"
 		port         string = "8080"
 		dbPath       string = "spine_dev.db"
+		apiKey       string
 	)
 
 	for i := 0; i < len(args); i++ {
 		switch args[i] {
 		case "--help", "-h":
-			fmt.Fprintf(os.Stderr, `Usage: spine dev [manifest.spine] [--port <port>] [--db <path>]
+			fmt.Fprintf(os.Stderr, `Usage: spine dev [manifest.spine] [--port <port>] [--db <path>] [--api-key <key>]
 
-Starts a hot-reloading development server with verbose event stream logging.
+Starts a hot-reloading development server (manifest + includes are watched).
 `)
 			return
 		case "--port":
@@ -827,6 +848,11 @@ Starts a hot-reloading development server with verbose event stream logging.
 			i++
 			if i < len(args) {
 				dbPath = args[i]
+			}
+		case "--api-key":
+			i++
+			if i < len(args) {
+				apiKey = args[i]
 			}
 		default:
 			if !strings.HasPrefix(args[i], "-") {
@@ -850,13 +876,17 @@ Starts a hot-reloading development server with verbose event stream logging.
 	}
 	defer eng.Close()
 
-	server := &http.Server{
-		Addr:    ":" + port,
-		Handler: eng.HTTPHandler(),
+	// Protect endpoints when an API key is provided (recommended in dev so
+	// the browser client exercises the same auth path as production).
+	if apiKey != "" {
+		eng.SetAPIKey(apiKey)
+		fmt.Printf("\033[36m[SPINE DEV]\033[0m API key auth enabled (X-API-Key / ws ?token= / auth handshake)\n")
 	}
 
 	fmt.Printf("\033[32m[SPINE DEV] ✓ Engine ready and listening for events...\033[0m\n")
-	if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+	// ListenAndServe starts the hot-reload watcher (manifest + includes) and
+	// handles graceful shutdown on SIGINT/SIGTERM.
+	if err := eng.ListenAndServe(":" + port); err != nil && err != http.ErrServerClosed {
 		fmt.Fprintf(os.Stderr, "\033[31m[SPINE DEV] ✗ Server error: %v\033[0m\n", err)
 	}
 }
