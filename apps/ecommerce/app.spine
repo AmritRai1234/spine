@@ -1,0 +1,583 @@
+spine_version: 1
+
+# ── Access Control (RLAC) ─────────────────────────────────────────
+# admin:   full access, resolved from $ADMIN_SECRET env var at runtime
+# staff:   fulfilment only — can move orders through the pipeline and
+#          restock cancelled lines, but cannot touch the catalog
+# shopper: may browse-cart-checkout, validate coupons, nothing else
+access:
+  - role: admin
+    key: "$ADMIN_SECRET"
+
+  - role: staff
+    key: "$STAFF_SECRET"
+    events:
+      - UPDATE_ORDER_STATUS
+      - RESTOCK_ORDER_ITEM
+
+  - role: shopper
+    key: "sk_shopper_key"
+    events:
+      - ADD_TO_CART
+      - UPDATE_CART_ITEM
+      - REMOVE_FROM_CART
+      - PLACE_ORDER
+      - ADD_ORDER_ITEM
+      - VALIDATE_COUPON
+
+# ── Tables (auto-created with schema evolution) ───────────────────
+database:
+  tables:
+    - products
+    - product_variants
+    - cart_items
+    - orders
+    - order_items
+    - coupons
+    - store_settings
+    - shipping_zones
+    - tax_rules
+
+# ── Nodes & Contracts ─────────────────────────────────────────────
+# owns_files = the AI-codability map: every frontend file belongs to
+# exactly one node, so an editor can go file → node → emits/listens →
+# routes → tables. Shared runtime files (web/src/lib/spine.ts, hooks/*,
+# components/ui/*, types.ts, main.tsx, App.tsx) belong to the engine
+# runtime, not to a domain node.
+nodes:
+  Catalog:
+    owns_files:
+      - web/src/pages/Catalog.tsx
+      - web/src/pages/ProductDetail.tsx
+    emits:
+      - event: PUBLISH_PRODUCT
+        payload:
+          sku: string
+          name: string
+          price: number
+          stock: integer
+          description: string
+          image_url: string
+          category: string
+      - event: RETIRE_PRODUCT
+        payload:
+          sku: string
+      - event: PUBLISH_VARIANT
+        payload:
+          sku: string
+          product_id: string
+          option1_name: string
+          option1_value: string
+          price: number
+          stock: integer
+    listens:
+      - state: PRODUCT_PUBLISHED
+        payload:
+          sku: string
+      - state: STOCK_ADJUSTED
+        payload:
+          product_id: string
+      - state: VARIANT_PUBLISHED
+        payload:
+          sku: string
+
+  Storefront:
+    owns_files:
+      - web/src/components/CartDrawer.tsx
+      - web/src/lib/cart.ts
+    emits:
+      - event: ADD_TO_CART
+        payload:
+          cart_id: string
+          product_id: string
+          name: string
+          price: number
+          qty: integer
+          variant_id: string
+          variant_label: string
+      - event: UPDATE_CART_ITEM
+        payload:
+          cart_id: string
+          product_id: string
+          variant_id: string
+          qty: integer
+      - event: REMOVE_FROM_CART
+        payload:
+          cart_id: string
+          product_id: string
+          variant_id: string
+    listens:
+      - state: CART_UPDATED
+        payload:
+          cart_id: string
+
+  Checkout:
+    owns_files:
+      - web/src/pages/Checkout.tsx
+    emits:
+      - event: PLACE_ORDER
+        payload:
+          cart_id: string
+          email: string
+          order_id: string
+          # Optional extension columns ride along and are created via schema
+          # evolution (declared fields above are engine-validated as REQUIRED):
+          #   ship_name, address1, city, country, zip,
+          #   coupon_code, coupon_discount
+      - event: ADD_ORDER_ITEM
+        payload:
+          order_id: string
+          product_id: string
+          name: string
+          price: number
+          qty: integer
+      - event: VALIDATE_COUPON
+        payload:
+          cart_id: string
+          code: string
+    listens:
+      - state: ORDER_CREATED
+        payload:
+          order_id: string
+          status: string
+      - state: ORDER_STATUS_CHANGED
+        payload:
+          order_id: string
+          status: string
+      - state: COUPON_VALIDATED
+        payload:
+          cart_id: string
+          coupon_code: string
+      - state: COUPON_REJECTED
+        payload:
+          cart_id: string
+          error: string
+
+  Tracking:
+    owns_files:
+      - web/src/pages/MyOrders.tsx
+    listens:
+      - state: ORDER_STATUS_CHANGED
+        payload:
+          order_id: string
+          status: string
+
+  # Stripe reaches the engine through POST /webhook/stripe ingestion.
+  # Declared here so the contract is visible and validated. Only `type` is
+  # declared — every Stripe event carries it; the rest of the payload shape
+  # varies by event type.
+  Payments:
+    emits:
+      - event: WEBHOOK_STRIPE
+        payload:
+          type: string
+    listens:
+      - state: ORDER_STATUS_CHANGED
+        payload:
+          order_id: string
+          status: string
+
+  Operations:
+    owns_files:
+      - web/src/pages/Admin.tsx
+      - web/src/pages/admin/AdminLayout.tsx
+      - web/src/pages/admin/tabs.ts
+      - web/src/pages/admin/Dashboard.tsx
+      - web/src/pages/admin/AdminProducts.tsx
+      - web/src/pages/admin/AdminOrders.tsx
+      - web/src/pages/admin/AdminCustomers.tsx
+      - web/src/pages/admin/AdminAnalytics.tsx
+      - web/src/pages/admin/AdminEvents.tsx
+      - web/src/pages/admin/AdminSettings.tsx
+      - web/src/pages/admin/AdminShippingTax.tsx
+      - web/src/lib/admin.ts
+      - web/src/lib/store.ts
+    emits:
+      - event: UPDATE_ORDER_STATUS
+        payload:
+          id: string
+          status: string
+          actor: string
+      - event: RESTOCK_ORDER_ITEM
+        payload:
+          order_id: string
+          product_id: string
+          qty: integer
+          actor: string
+      - event: CREATE_COUPON
+        payload:
+          code: string
+          percent_off: number
+          fixed_off: number
+          active: string
+      - event: SAVE_SETTING
+        payload:
+          key: string
+          value: string
+      - event: SAVE_SHIPPING_ZONE
+        payload:
+          country: string
+          rate: number
+      - event: SAVE_TAX_RULE
+        payload:
+          country: string
+          rate: number
+    listens:
+      - state: ORDER_STATUS_CHANGED
+        payload:
+          order_id: string
+          status: string
+      - state: STOCK_ADJUSTED
+        payload:
+          product_id: string
+
+# ── Routes (event → action pipelines) ─────────────────────────────
+routes:
+  # Admin publishes/updates a product (upsert by SKU)
+  - on: PUBLISH_PRODUCT
+    steps:
+      - action: set
+        id: $uuid
+        created_at: $now
+      - action: db.upsert
+        table: products
+        key: sku
+      - action: log.write
+        message: "Product published: $event.payload.name ($event.payload.sku)"
+    emit: PRODUCT_PUBLISHED
+
+  # Admin retires a product by SKU
+  - on: RETIRE_PRODUCT
+    steps:
+      - action: db.delete
+        table: products
+        where: "sku = '$event.payload.sku'"
+      - action: log.write
+        message: "Product retired: $event.payload.sku"
+    emit: PRODUCT_RETIRED
+
+  # Admin publishes/updates a product variant (upsert by SKU). Variants are
+  # the detail rows of the products header table (Architect ruling): each row
+  # is one option combination (Size × Color), carrying its own price + stock.
+  - on: PUBLISH_VARIANT
+    steps:
+      - action: set
+        id: $uuid
+        created_at: $now
+      - action: db.upsert
+        table: product_variants
+        key: sku
+      - action: log.write
+        message: "Variant published: $event.payload.sku ($event.payload.option1_value / $event.payload.option2_value) — $event.payload.price"
+    emit: VARIANT_PUBLISHED
+
+  # Shopper adds a line to their cart. cart_items is keyed by line_key
+  # (cart_id|product_id|variant_id — the client always sends variant_id, ""
+  # for plain products) so the same product in two sizes stays separate
+  # lines and re-adding a line upserts it instead of duplicating.
+  - on: ADD_TO_CART
+    steps:
+      - action: set
+        line_key: "$event.payload.cart_id|$event.payload.product_id|$event.payload.variant_id"
+        updated_at: $now
+      - action: db.upsert
+        table: cart_items
+        key: line_key
+      - action: log.write
+        message: "Cart $event.payload.cart_id: +$event.payload.qty × $event.payload.name"
+    emit: CART_UPDATED
+
+  - on: UPDATE_CART_ITEM
+    steps:
+      - action: assert
+        condition: "$event.payload.qty >= 1"
+        message: "cart quantity must be at least 1"
+      - action: set
+        line_key: "$event.payload.cart_id|$event.payload.product_id|$event.payload.variant_id"
+        updated_at: $now
+      - action: db.update
+        table: cart_items
+        where: "line_key = '$event.payload.line_key'"
+    emit: CART_UPDATED
+
+  - on: REMOVE_FROM_CART
+    steps:
+      - action: set
+        line_key: "$event.payload.cart_id|$event.payload.product_id|$event.payload.variant_id"
+      - action: db.delete
+        table: cart_items
+        where: "line_key = '$event.payload.line_key'"
+    emit: CART_UPDATED
+
+  # Shopper adds a line item snapshot to a placed order.
+  # Trust boundary: price and stock are re-checked SERVER-SIDE against the
+  # catalog row before the line is accepted — tampered prices are rejected
+  # and phantom inventory cannot be sold. When a variant_id is supplied the
+  # check runs against product_variants (per-SKU price + stock); otherwise it
+  # falls back to the product row (backward compatible).
+  - on: ADD_ORDER_ITEM
+    on_failure: CHECKOUT_FAILED
+    steps:
+      # Variant path — live row from product_variants
+      - action: db.lookup
+        table: product_variants
+        key_column: id
+        value_expr: $event.payload.variant_id
+        as: variant_
+        if: "$event.payload.variant_id exists"
+      - action: assert
+        condition: "$event.payload.price == $event.payload.variant_price"
+        message: "price mismatch: '$event.payload.name' variant sells for $event.payload.variant_price, request claimed $event.payload.price"
+        if: "$event.payload.variant_id exists"
+      - action: assert
+        condition: "$event.payload.qty <= $event.payload.variant_stock"
+        message: "insufficient stock: '$event.payload.name' variant has $event.payload.variant_stock left, requested $event.payload.qty"
+        if: "$event.payload.variant_id exists"
+      # Product path — no variant claimed
+      - action: db.lookup
+        table: products
+        key_column: id
+        value_expr: $event.payload.product_id
+        as: product_
+        if: "$event.payload.variant_id == ''"
+      - action: assert
+        condition: "$event.payload.price == $event.payload.product_price"
+        message: "price mismatch: '$event.payload.product_name' sells for $event.payload.product_price, request claimed $event.payload.price"
+        if: "$event.payload.variant_id == ''"
+      - action: assert
+        condition: "$event.payload.qty <= $event.payload.product_stock"
+        message: "insufficient stock: '$event.payload.product_name' has $event.payload.product_stock left, requested $event.payload.qty"
+        if: "$event.payload.variant_id == ''"
+      # Server-calculated line total (verified price × qty) — the client never
+      # supplies dollar amounts; the price guard above ran first.
+      - action: math.calc
+        set: line_total
+        expr: "$event.payload.price * $event.payload.qty"
+      # Prune looked-up helper columns so db.insert persists only line data.
+      # product_id stays — order_items carries it and the stock adjust needs it.
+      - action: unset
+        fields: "product_sku product_name product_price product_stock product_description product_image_url product_category product_created_at variant_sku variant_option1_name variant_option1_value variant_option2_name variant_option2_value variant_price variant_stock variant_created_at"
+      # Accept the line item… synchronously: the server-side subtotal at
+      # PLACE_ORDER reads this row, so the insert must be durable first.
+      - action: db.insert
+        table: order_items
+        sync: true
+      # …and atomically decrement the right stock counter (floor 0)
+      - action: db.adjust
+        table: product_variants
+        column: stock
+        by: "-$event.payload.qty"
+        floor: "0"
+        where: "id = $event.payload.variant_id"
+        if: "$event.payload.variant_id exists"
+      - action: db.adjust
+        table: products
+        column: stock
+        by: "-$event.payload.qty"
+        floor: "0"
+        where: "id = $event.payload.product_id"
+        if: "$event.payload.variant_id == ''"
+    emit: ORDER_ITEM_ADDED
+
+  # Admin/staff restock a cancelled line (trusted role — driven from admin UI).
+  # Restores variant stock when the line carried a variant, else product stock.
+  - on: RESTOCK_ORDER_ITEM
+    steps:
+      - action: db.adjust
+        table: product_variants
+        column: stock
+        by: $event.payload.qty
+        where: "id = $event.payload.variant_id"
+        if: "$event.payload.variant_id exists"
+      - action: db.adjust
+        table: products
+        column: stock
+        by: $event.payload.qty
+        where: "id = $event.payload.product_id"
+        if: "$event.payload.variant_id == ''"
+      - action: log.write
+        message: "Restocked $event.payload.qty × $event.payload.product_id (variant $event.payload.variant_id) from cancelled order $event.payload.order_id (by $event.payload.actor)"
+    emit: STOCK_ADJUSTED
+
+  # Admin moves an order through the fulfilment pipeline.
+  # db.update fallback mode: payload "id" locates the row and is excluded
+  # from the SET clause, so only status/actor/updated_at are written.
+  - on: UPDATE_ORDER_STATUS
+    steps:
+      - action: set
+        updated_at: $now
+      - action: db.update
+        table: orders
+      - action: log.write
+        message: "Order $event.payload.id → $event.payload.status (by $event.payload.actor)"
+    emit: ORDER_STATUS_CHANGED
+
+  # Checkout — creates the order; failures route to CHECKOUT_FAILED.
+  # Address + coupon columns ride along via schema evolution.
+  # ── Server-calculated totals (CEO ruling, Safety) ──
+  # subtotal comes from the PERSISTED line items (db.sum over line_total),
+  # shipping/tax from admin-configured rules, and the coupon discount is
+  # recomputed from the coupons table. The client never supplies dollar
+  # amounts — it sends facts (order_id, country, coupon_code) only.
+  - on: PLACE_ORDER
+    on_failure: CHECKOUT_FAILED
+    steps:
+      - action: set
+        id: $event.payload.order_id
+        status: pending
+        created_at: $now
+        coupon_discount: 0
+      # Subtotal: sum of server-computed line totals for this order
+      - action: db.sum
+        table: order_items
+        column: line_total
+        where: "order_id = '$event.payload.order_id'"
+        as: subtotal
+      # Empty carts cannot be ordered
+      - action: assert
+        condition: "$event.payload.subtotal > 0"
+        message: "cannot place an order with no items (subtotal = $event.payload.subtotal)"
+      # Flat shipping rate for the country ("*" zone row = default); missing
+      # zone → free shipping (0). Tax: percentage rule for the country;
+      # missing rule → 0% tax.
+      - action: db.sum
+        table: shipping_zones
+        column: rate
+        where: "country = '$event.payload.country'"
+        as: shipping_cost
+      - action: db.sum
+        table: tax_rules
+        column: rate
+        where: "country = '$event.payload.country'"
+        as: tax_rate
+      # Coupon guard chain — re-verified against the coupons table. The
+      # DISCOUNT DOLLARS are computed here server-side (never client-claimed).
+      - action: db.lookup
+        table: coupons
+        key_column: code
+        value_expr: $event.payload.coupon_code
+        as: coupon_
+        if: "$event.payload.coupon_code exists"
+      - action: assert
+        condition: "$event.payload.coupon_active == true"
+        message: "coupon '$event.payload.coupon_code' is not active"
+        if: "$event.payload.coupon_code exists"
+      # Server-side tax = subtotal × rate%
+      - action: math.calc
+        set: tax_amount
+        expr: "$event.payload.subtotal * $event.payload.tax_rate / 100"
+      # Server-side discount = subtotal × coupon% — replaces the client claim
+      - action: math.calc
+        set: coupon_discount
+        expr: "$event.payload.subtotal * $event.payload.coupon_percent_off / 100"
+        if: "$event.payload.coupon_code exists"
+      # Grand total, all components server-derived
+      - action: math.calc
+        set: total
+        expr: "$event.payload.subtotal + $event.payload.shipping_cost + $event.payload.tax_amount - $event.payload.coupon_discount"
+      # Prune looked-up helper columns so db.insert persists only order data
+      - action: unset
+        fields: "coupon_active coupon_percent_off coupon_fixed_off coupon_created_at tax_rate"
+      - action: db.insert
+        table: orders
+      # New-order notification (durable outbox retries cover downtime).
+      # No-ops silently when ALERT_WEBHOOK_URL is unset.
+      - action: notify.webhook
+        url: $env.ALERT_WEBHOOK_URL
+        on_failure: NOTIFY_FAILED
+      - action: log.write
+        message: "Order placed for cart $event.payload.cart_id by $event.payload.email — total $event.payload.total (subtotal $event.payload.subtotal, shipping $event.payload.shipping_cost, tax $event.payload.tax_amount)"
+    emit: ORDER_CREATED
+
+  # Shopper applies a coupon at checkout — validated server-side, result
+  # broadcast back so the cart math uses engine-sourced numbers only.
+  - on: VALIDATE_COUPON
+    on_failure: COUPON_REJECTED
+    steps:
+      - action: db.lookup
+        table: coupons
+        key_column: code
+        value_expr: $event.payload.code
+        as: coupon_
+      - action: assert
+        condition: "$event.payload.coupon_active == true"
+        message: "'$event.payload.code' is not active"
+      - action: set
+        coupon_code: $event.payload.code
+    emit: COUPON_VALIDATED
+
+  # Admin creates/updates a discount code (upsert by code)
+  - on: CREATE_COUPON
+    steps:
+      - action: set
+        created_at: $now
+      - action: db.upsert
+        table: coupons
+        key: code
+      - action: log.write
+        message: "Coupon saved: $event.payload.code (percent_off=$event.payload.percent_off fixed_off=$event.payload.fixed_off)"
+    emit: COUPON_SAVED
+
+  # Stripe test-mode webhook flips paid sessions to `paid`.
+  # Configure the session with client_reference_id = <order_id>; the nested
+  # path resolves through data.object.client_reference_id.
+  - on: WEBHOOK_STRIPE
+    if: "$event.payload.type == checkout.session.completed"
+    steps:
+      - action: set
+        id: $event.payload.data.object.client_reference_id
+        status: paid
+        updated_at: $now
+      - action: db.update
+        table: orders
+      - action: log.write
+        message: "Stripe payment captured for order $event.payload.id"
+    emit: ORDER_STATUS_CHANGED
+
+  # Admin saves a store setting (KV)
+  - on: SAVE_SETTING
+    steps:
+      - action: db.upsert
+        table: store_settings
+        key: key
+      - action: log.write
+        message: "Setting saved: $event.payload.key"
+    emit: SETTING_SAVED
+
+  # Admin saves a flat shipping rate for a country ("*" = default zone).
+  # Missing zone at checkout = free shipping (0).
+  - on: SAVE_SHIPPING_ZONE
+    steps:
+      - action: set
+        created_at: $now
+      - action: db.upsert
+        table: shipping_zones
+        key: country
+      - action: log.write
+        message: "Shipping zone saved: $event.payload.country → $event.payload.rate"
+    emit: SHIPPING_ZONE_SAVED
+
+  # Admin saves a percentage tax rule for a country ("*" = default rule).
+  # Missing rule at checkout = 0% tax.
+  - on: SAVE_TAX_RULE
+    steps:
+      - action: set
+        created_at: $now
+      - action: db.upsert
+        table: tax_rules
+        key: country
+      - action: log.write
+        message: "Tax rule saved: $event.payload.country → $event.payload.rate%"
+    emit: TAX_RULE_SAVED
+
+  # Failure handler — alert log entry when checkout breaks
+  - on: CHECKOUT_FAILED
+    steps:
+      - action: log.write
+        message: "[ALERT] Checkout failed for $event.payload.cart_id: $event.payload.error"
+
+  # Notification failures are non-fatal — log and move on
+  - on: NOTIFY_FAILED
+    steps:
+      - action: log.write
+        message: "[WARN] New-order notification failed: $event.payload.error"

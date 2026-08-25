@@ -1,0 +1,11 @@
+# Secrets — never commit real keys
+.env
+
+# Local databases
+*.db
+*.db-*
+*.sqlite
+*.sqlite3
+
+# Logs
+*.log

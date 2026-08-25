@@ -1,0 +1,18 @@
+[Unit]
+Description=Spine E-commerce (event-driven storefront + admin)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/spine-ecommerce
+EnvironmentFile=/opt/spine-ecommerce/.env
+ExecStart=/opt/spine-ecommerce/spine serve app.spine
+Restart=on-failure
+RestartSec=3
+# Light hardening — keep the data dir writable (spine.db lives next to the app)
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
