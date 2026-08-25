@@ -356,19 +356,24 @@ func (b *Bus) GetOptimizer() *AdaptiveOptimizer {
 	return b.optimizer
 }
 
-// GetState retrieves a cached state payload from RAM in sub-microsecond time.
-// Lock-free via sync.Map — zero contention under concurrent reads.
+// GetState retrieves a cached state payload as an immutable snapshot.
+// Lock-free via sync.Map. The returned map is a structural copy, mirroring
+// SetState: the cache holds immutable snapshots that neither producers nor
+// readers can mutate retroactively.
 func (b *Bus) GetState(stateName string) (map[string]interface{}, bool) {
 	val, ok := b.stateCache.Load(stateName)
 	if !ok {
 		return nil, false
 	}
-	return val.(map[string]interface{}), true
+	return deepCopyPayload(val.(map[string]interface{})), true
 }
 
 // SetState caches the state payload in RAM. Lock-free via sync.Map.
+// The payload is structurally deep-copied before caching: later route steps
+// and chained emissions keep mutating the original map, so storing a live
+// reference would let concurrent events rewrite history behind readers' backs.
 func (b *Bus) SetState(stateName string, payload map[string]interface{}) {
-	b.stateCache.Store(stateName, payload)
+	b.stateCache.Store(stateName, deepCopyPayload(payload))
 }
 
 // startBatchWriter starts a single writer goroutine that drains all shards.
@@ -650,6 +655,10 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 			var stepErr error
 			var failedStep *manifest.RouteStep
 			var failedIdx int
+			// Steps that completed successfully (completion order). On failure
+			// they are saga-compensated in reverse, mirroring the sequential
+			// path so parallel routes get the same transactional guarantees.
+			var succeededSteps []manifest.RouteStep
 
 			for i := range route.Steps {
 				wg.Add(1)
@@ -667,11 +676,19 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 							failedIdx = stepIndex
 						}
 						errMu.Unlock()
+					} else {
+						errMu.Lock()
+						succeededSteps = append(succeededSteps, *s)
+						errMu.Unlock()
 					}
 				}(&route.Steps[i], stepPayload, idx)
 			}
 			wg.Wait()
 			if stepErr != nil {
+				// Roll back every sibling that made it through — a sibling may
+				// still have succeeded after the failing step, and its effects
+				// must not survive the failed route.
+				b.rollbackCompensation(succeededSteps, event, payload)
 				onFailure := route.OnFailure
 				if failedStep != nil && failedStep.OnFailure != "" {
 					onFailure = failedStep.OnFailure
@@ -751,8 +768,20 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 
 	if idempotencyKey != "" {
 		if claimedKey != "" {
-			resultJSON, _ := json.Marshal(res)
-			_, _ = b.db.Exec(`UPDATE "_spine_idem" SET status = 'completed', result_json = `+b.ph(1)+` WHERE key = `+b.ph(2), string(resultJSON), idempotencyKey)
+			resultJSON, err := json.Marshal(res)
+			if err != nil {
+				// res contains only strings/ints/slices, so this should never
+				// fire — but storing a partial/empty blob would surface later
+				// as a "corrupted cached result" error, so log loudly instead.
+				log.Printf("[idempotency] marshal completed result failed for key %s: %v", idempotencyKey, err)
+				resultJSON = []byte("{}")
+			}
+			if _, err := b.db.Exec(`UPDATE "_spine_idem" SET status = 'completed', result_json = `+b.ph(1)+` WHERE key = `+b.ph(2), string(resultJSON), idempotencyKey); err != nil {
+				// The event itself already succeeded, so we cannot fail now —
+				// but without this row a retried request will re-execute the
+				// route instead of receiving the cached result.
+				log.Printf("[idempotency] failed to mark key %s completed: %v", idempotencyKey, err)
+			}
 			execSuccess = true
 		}
 	}

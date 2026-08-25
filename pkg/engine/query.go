@@ -333,7 +333,7 @@ func (b *Bus) GetEventLogs(eventName string, limit, offset int) ([]map[string]in
 
 	rows, err := b.db.Query(query, args...)
 	if err != nil {
-		return []map[string]interface{}{}, nil
+		return nil, fmt.Errorf("event log query failed: %w", err)
 	}
 	defer rows.Close()
 
@@ -361,6 +361,52 @@ func (b *Bus) GetEventLogs(eventName string, limit, offset int) ([]map[string]in
 		events = []map[string]interface{}{}
 	}
 	return events, nil
+}
+
+// GetEventsSince returns audit events with id > lastID in ascending order so a
+// reconnecting WebSocket client can replay everything it missed with no gaps.
+// hasMore reports whether additional events exist beyond the returned batch,
+// letting callers page (or warn) instead of silently truncating. Used by the
+// /ws reconnect handshake.
+func (b *Bus) GetEventsSince(lastID int64, limit int) ([]map[string]interface{}, bool, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 500
+	}
+
+	query := `SELECT id, event_name, payload, emitted_states, created_at FROM "_spine_events" WHERE id > ` + b.ph(1) + ` ORDER BY id ASC LIMIT ` + b.ph(2)
+	rows, err := b.db.Query(query, lastID, limit+1)
+	if err != nil {
+		return nil, false, fmt.Errorf("event log query failed: %w", err)
+	}
+	defer rows.Close()
+
+	var events []map[string]interface{}
+	for rows.Next() {
+		var id int64
+		var name, payloadStr, statesStr, createdAt string
+		if err := rows.Scan(&id, &name, &payloadStr, &statesStr, &createdAt); err == nil {
+			var payload map[string]interface{}
+			_ = json.Unmarshal([]byte(payloadStr), &payload)
+
+			states := strings.Split(statesStr, ",")
+
+			events = append(events, map[string]interface{}{
+				"id":             id,
+				"event":          name,
+				"payload":        payload,
+				"emitted_states": states,
+				"created_at":     createdAt,
+			})
+		}
+	}
+	hasMore := len(events) > limit
+	if hasMore {
+		events = events[:limit]
+	}
+	if events == nil {
+		events = []map[string]interface{}{}
+	}
+	return events, hasMore, nil
 }
 
 // initEventTable creates the _spine_events system table for automatic event audit logging.

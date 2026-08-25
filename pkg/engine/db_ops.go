@@ -68,13 +68,22 @@ func (b *Bus) ensureTable(table string, colDefs []string) error {
 			colName := strings.Trim(parts[0], `"`)
 			if colName != "_spine_id" {
 				alterSQL := fmt.Sprintf(`ALTER TABLE "%s" ADD COLUMN %s`, table, colDef)
-				_, _ = b.db.Exec(alterSQL)
+				if _, err := b.db.Exec(alterSQL); err != nil && !isColumnExistsErr(err) {
+					// "duplicate column" is the expected idempotent path when
+					// the table predates this manifest; anything else is a
+					// real failure (permissions, disk, malformed definition)
+					// that would otherwise resurface later as confusing
+					// insert errors far from the cause.
+					return fmt.Errorf("add column %s.%s failed: %w", table, colName, err)
+				}
 			}
 
 			if strings.HasSuffix(colName, "_id") || colName == "id" || colName == "email" || colName == "status" || colName == "state" {
 				idxSQL := fmt.Sprintf(`CREATE INDEX IF NOT EXISTS "idx_%s_%s" ON "%s"("%s")`,
 					table, colName, table, colName)
-				_, _ = b.db.Exec(idxSQL)
+				if _, err := b.db.Exec(idxSQL); err != nil {
+					return fmt.Errorf("create index idx_%s_%s failed: %w", table, colName, err)
+				}
 			}
 		}
 	}
@@ -83,8 +92,18 @@ func (b *Bus) ensureTable(table string, colDefs []string) error {
 	return nil
 }
 
-func normalizeParam(v interface{}, eventName string, payload map[string]interface{}) interface{} {
-	if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
+// isColumnExistsErr reports whether err is the benign "column already exists"
+// response from an idempotent ALTER TABLE ADD COLUMN across supported dialects.
+func isColumnExistsErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	return strings.Contains(msg, "duplicate column") || // SQLite
+		strings.Contains(msg, "already exists") // Postgres / others
+}
+
+func normalizeParam(v interface{}, eventName string, payload map[string]interface{}) interface{} {	if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
 		return ResolveVariables(strVal, eventName, payload)
 	}
 	switch val := v.(type) {

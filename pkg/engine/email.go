@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"github.com/AmritRai1234/spine/pkg/manifest"
 )
@@ -28,7 +29,7 @@ import (
 
 const emailDisabledLogEvery = 50
 
-var emailDisabledCount int
+var emailDisabledCount atomic.Int64
 
 // resolveEmailFrom returns the sender address for a step: explicit config
 // wins, then $SMTP_FROM, else "".
@@ -119,8 +120,8 @@ func sendMail(host, port, user, pass, from string, to []string, msg []byte) erro
 func (b *Bus) emailSend(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
 	host := os.Getenv("SMTP_HOST")
 	if host == "" {
-		emailDisabledCount++
-		if emailDisabledCount%emailDisabledLogEvery == 1 {
+		// Atomic: concurrent Emit goroutines may skip mail simultaneously.
+		if n := emailDisabledCount.Add(1); (n-1)%emailDisabledLogEvery == 0 {
 			log.Printf("[email] SMTP_HOST not set — email.send skipped (notifications disabled)")
 		}
 		return nil

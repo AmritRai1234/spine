@@ -961,21 +961,28 @@ spine_dropped_audit %d
 					lastSeenIDFloat, _ := raw["last_seen_id"].(float64)
 					lastSeenID := int64(lastSeenIDFloat)
 
-					logs, err := e.Bus.GetEventLogs("", 100, 0)
-					var missedEvents []map[string]interface{}
-					if err == nil {
-						for _, logItem := range logs {
-							if id, ok := logItem["id"].(int64); ok && id > lastSeenID {
-								missedEvents = append(missedEvents, logItem)
-							}
-						}
-					}
+					// Replay everything after last_seen_id in ascending order.
+					// Querying id > lastSeenID (instead of fetching the newest
+					// N rows) guarantees no gaps; hasMore tells the client when
+					// the batch was capped so it can page rather than assume
+					// it is fully caught up.
+					const replayBatchMax = 500
+					missedEvents, hasMore, replayErr := e.Bus.GetEventsSince(lastSeenID, replayBatchMax)
 
 					ack := map[string]interface{}{
 						"type":          "reconnect_ack",
 						"status":        "ok",
 						"replayed":      len(missedEvents),
 						"missed_events": missedEvents,
+						"has_more":      hasMore,
+					}
+					if replayErr != nil {
+						// Surface DB failures explicitly — a client must never
+						// mistake an outage for "nothing happened while away".
+						log.Printf("[ws] reconnect replay query failed: %v", replayErr)
+						ack["status"] = "error"
+						ack["error"] = "replay query failed"
+						ack["missed_events"] = nil
 					}
 					ackBytes, _ := json.Marshal(ack)
 					select {
@@ -1114,6 +1121,15 @@ func (e *Engine) reloadManifest() {
 		return
 	}
 
+	// Ensure tables BEFORE mutating any shared state: if the new manifest
+	// declares tables the database cannot create, keep serving the previous
+	// schema entirely instead of leaving Schema and the routing registry
+	// pointing at different generations.
+	if err := e.Bus.EnsureTables(s.DbTables); err != nil {
+		log.Printf("[spine] ✗ hot-reload table creation failed (keeping previous schema): %v", err)
+		return
+	}
+
 	e.reloadMu.Lock()
 	if e.Schema != nil {
 		diff := DiffManifests(e.Schema, s)
@@ -1124,13 +1140,6 @@ func (e *Engine) reloadManifest() {
 	e.Schema = s
 	e.reloadMu.Unlock()
 
-	// Ensure tables BEFORE swapping the registry: if the new manifest declares
-	// tables the database cannot create, keep serving the previous schema
-	// instead of routing into missing tables.
-	if err := e.Bus.EnsureTables(s.DbTables); err != nil {
-		log.Printf("[spine] ✗ hot-reload table creation failed (keeping previous schema): %v", err)
-		return
-	}
 	e.Bus.UpdateRegistry(manifest.NewRegistry(s))
 	// Always rebuild the access resolver — an empty ruleset must clear a
 	// previously configured resolver, not leave stale rules in force.
