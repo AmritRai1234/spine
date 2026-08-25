@@ -32,8 +32,8 @@ var scanBufPool = sync.Pool{
 	},
 }
 
-// Pre-built constant SQL for audit insert — avoids string allocation per emit
-const auditInsertSQL = `INSERT INTO "_spine_events" (event_name, payload, emitted_states, created_at) VALUES (?, ?, ?, ?)`
+// Pre-built constant SQL for audit insert is built per-bus from the dialect
+// (see NewBus: bus.auditSQL) since placeholder syntax varies by backend.
 
 // TableInfo describes a database table and its row count.
 type TableInfo struct {
@@ -43,7 +43,7 @@ type TableInfo struct {
 
 // GetTables lists all tables in the database along with their current row count.
 func (b *Bus) GetTables() ([]TableInfo, error) {
-	rows, err := b.db.Query(`SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`)
+	rows, err := b.db.Query(b.dialect.listTables)
 	if err != nil {
 		// Fallback for non-SQLite / Turso drivers if sqlite_master isn't available
 		var res []TableInfo
@@ -99,8 +99,8 @@ func (b *Bus) QueryWhere(table, column, value string, limit, offset int) ([]map[
 		offset = 0
 	}
 
-	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" = ? ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
-		table, column, limit, offset)
+	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" = %s ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
+		table, column, b.ph(1), limit, offset)
 	return b.queryRows(query, value)
 }
 
@@ -121,8 +121,8 @@ func (b *Bus) GetTableRowsWithFilter(table string, limit, offset int, accessFilt
 	}
 	safeCol := b.sanitizeIdentCached(col)
 
-	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" %s ? ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
-		table, safeCol, op, limit, offset)
+	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" %s %s ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
+		table, safeCol, op, b.ph(1), limit, offset)
 	return b.queryRows(query, val)
 }
 
@@ -148,8 +148,8 @@ func (b *Bus) QueryWhereWithAccess(table, column, value string, limit, offset in
 	}
 	safeFilterCol := b.sanitizeIdentCached(col)
 
-	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" = ? AND "%s" %s ? ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
-		table, column, safeFilterCol, op, limit, offset)
+	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" = %s AND "%s" %s %s ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
+		table, column, b.ph(1), safeFilterCol, op, b.ph(2), limit, offset)
 	return b.queryRows(query, value, val)
 }
 
@@ -171,15 +171,15 @@ func (b *Bus) GetTableRowsCursor(table string, lastID int64, limit int, accessFi
 		}
 		safeFilterCol := b.sanitizeIdentCached(col)
 		if lastID > 0 {
-			query = fmt.Sprintf(`SELECT * FROM "%s" WHERE _spine_id < ? AND "%s" %s ? ORDER BY _spine_id DESC LIMIT %d`, table, safeFilterCol, op, limit)
+			query = fmt.Sprintf(`SELECT * FROM "%s" WHERE _spine_id < %s AND "%s" %s %s ORDER BY _spine_id DESC LIMIT %d`, table, b.ph(1), safeFilterCol, op, b.ph(2), limit)
 			args = []interface{}{lastID, val}
 		} else {
-			query = fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" %s ? ORDER BY _spine_id DESC LIMIT %d`, table, safeFilterCol, op, limit)
+			query = fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" %s %s ORDER BY _spine_id DESC LIMIT %d`, table, safeFilterCol, op, b.ph(1), limit)
 			args = []interface{}{val}
 		}
 	} else {
 		if lastID > 0 {
-			query = fmt.Sprintf(`SELECT * FROM "%s" WHERE _spine_id < ? ORDER BY _spine_id DESC LIMIT %d`, table, limit)
+			query = fmt.Sprintf(`SELECT * FROM "%s" WHERE _spine_id < %s ORDER BY _spine_id DESC LIMIT %d`, table, b.ph(1), limit)
 			args = []interface{}{lastID}
 		} else {
 			query = fmt.Sprintf(`SELECT * FROM "%s" ORDER BY _spine_id DESC LIMIT %d`, table, limit)
@@ -220,9 +220,11 @@ func (b *Bus) QueryMultiWhere(table string, filters map[string]string, limit, of
 	var whereClauses []string
 	var args []interface{}
 
+	paramN := 0
 	for col, val := range filters {
 		safeCol := sanitizeIdent(col)
-		whereClauses = append(whereClauses, fmt.Sprintf(`"%s" = ?`, safeCol))
+		paramN++
+		whereClauses = append(whereClauses, fmt.Sprintf(`"%s" = %s`, safeCol, b.ph(paramN)))
 		args = append(args, val)
 	}
 
@@ -232,7 +234,8 @@ func (b *Bus) QueryMultiWhere(table string, filters map[string]string, limit, of
 			return nil, fmt.Errorf("invalid access filter '%s': %w", accessFilter, err)
 		}
 		safeFilterCol := b.sanitizeIdentCached(col)
-		whereClauses = append(whereClauses, fmt.Sprintf(`"%s" %s ?`, safeFilterCol, op))
+		paramN++
+		whereClauses = append(whereClauses, fmt.Sprintf(`"%s" %s %s`, safeFilterCol, op, b.ph(paramN)))
 		args = append(args, val)
 	}
 
@@ -320,10 +323,10 @@ func (b *Bus) GetEventLogs(eventName string, limit, offset int) ([]map[string]in
 	var args []interface{}
 
 	if eventName != "" {
-		query = `SELECT id, event_name, payload, emitted_states, created_at FROM "_spine_events" WHERE event_name = ? ORDER BY id DESC LIMIT ? OFFSET ?`
+		query = `SELECT id, event_name, payload, emitted_states, created_at FROM "_spine_events" WHERE event_name = ` + b.ph(1) + ` ORDER BY id DESC LIMIT ` + b.ph(2) + ` OFFSET ` + b.ph(3)
 		args = []interface{}{eventName, limit, offset}
 	} else {
-		query = `SELECT id, event_name, payload, emitted_states, created_at FROM "_spine_events" ORDER BY id DESC LIMIT ? OFFSET ?`
+		query = `SELECT id, event_name, payload, emitted_states, created_at FROM "_spine_events" ORDER BY id DESC LIMIT ` + b.ph(1) + ` OFFSET ` + b.ph(2)
 		args = []interface{}{limit, offset}
 	}
 
@@ -360,16 +363,18 @@ func (b *Bus) GetEventLogs(eventName string, limit, offset int) ([]map[string]in
 }
 
 // initEventTable creates the _spine_events system table for automatic event audit logging.
+// Statements are executed separately — some drivers (pgx extended protocol)
+// reject multi-statement strings.
 func (b *Bus) initEventTable() {
 	query := `CREATE TABLE IF NOT EXISTS "_spine_events" (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id ` + b.dialect.autoIncPK + `,
 		event_name TEXT NOT NULL,
 		payload TEXT NOT NULL,
 		emitted_states TEXT,
 		created_at TEXT NOT NULL
-	);
-	CREATE INDEX IF NOT EXISTS "idx_spine_events_name" ON "_spine_events"("event_name");`
+	)`
 	b.db.Exec(query)
+	b.db.Exec(`CREATE INDEX IF NOT EXISTS "idx_spine_events_name" ON "_spine_events"("event_name")`)
 }
 
 // logEventAudit enqueues an event emission to the _spine_events audit table.
@@ -391,6 +396,6 @@ func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitte
 
 	params := []interface{}{event, payloadStr, statesStr, nowStr}
 
-	b.writer.submitAny(dbTask{query: auditInsertSQL, params: params})
+	b.writer.submitAny(dbTask{query: b.auditSQL, params: params})
 	// Non-blocking: submitAny silently drops if all shards saturated
 }

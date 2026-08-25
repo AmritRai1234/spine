@@ -15,7 +15,7 @@ type Migration struct {
 // initMigrationsTable initializes the migration tracking table.
 func (b *Bus) initMigrationsTable() error {
 	query := `CREATE TABLE IF NOT EXISTS "_spine_migrations" (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id ` + b.dialect.autoIncPK + `,
 		version INTEGER UNIQUE NOT NULL,
 		name TEXT NOT NULL,
 		applied_at TEXT NOT NULL
@@ -31,7 +31,7 @@ func (b *Bus) ApplyMigration(m Migration) (bool, error) {
 	}
 
 	var count int
-	err := b.db.QueryRow(`SELECT COUNT(1) FROM "_spine_migrations" WHERE version = ?`, m.Version).Scan(&count)
+	err := b.db.QueryRow(`SELECT COUNT(1) FROM "_spine_migrations" WHERE version = `+b.ph(1), m.Version).Scan(&count)
 	if err != nil {
 		return false, err
 	}
@@ -51,7 +51,7 @@ func (b *Bus) ApplyMigration(m Migration) (bool, error) {
 	}
 
 	nowStr := time.Now().UTC().Format(time.RFC3339)
-	if _, err := tx.Exec(`INSERT INTO "_spine_migrations" (version, name, applied_at) VALUES (?, ?, ?)`, m.Version, m.Name, nowStr); err != nil {
+	if _, err := tx.Exec(`INSERT INTO "_spine_migrations" (version, name, applied_at) VALUES (`+b.ph(1)+`, `+b.ph(2)+`, `+b.ph(3)+`)`, m.Version, m.Name, nowStr); err != nil {
 		tx.Rollback()
 		return false, fmt.Errorf("failed to record migration v%d: %w", m.Version, err)
 	}

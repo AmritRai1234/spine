@@ -52,6 +52,10 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		if step.Table != "" {
 			key := step.Config["key"]
 			if key == "" {
+				// Accept the more descriptive alias too
+				key = step.Config["conflict_key"]
+			}
+			if key == "" {
 				key = "id"
 			}
 			return b.dbUpsert(step.Table, key, eventName, payload)
@@ -153,11 +157,13 @@ func (b *Bus) ftsSearch(step *manifest.RouteStep, eventName string, payload map[
 		ftsTable = safeTable + "_fts"
 	}
 
-	// Attempt FTS5 virtual table query with fallback to standard table search
-	rows, err := b.db.Query(fmt.Sprintf(`SELECT rowid, content FROM "%s" WHERE content MATCH ?`, ftsTable), resolvedQuery)
+	// Attempt FTS5 virtual table query with fallback to standard table search.
+	// (FTS5 is SQLite-only; on other backends the first query errors and the
+	// LIKE-based fallback runs instead.)
+	rows, err := b.db.Query(fmt.Sprintf(`SELECT %s, content FROM "%s" WHERE content MATCH %s`, b.dialect.rowIDCol, ftsTable, b.ph(1)), resolvedQuery)
 	if err != nil {
 		// Fallback: standard table column query
-		rows, err = b.db.Query(fmt.Sprintf(`SELECT rowid, created_at FROM "%s" WHERE created_at LIKE ?`, safeTable), "%"+resolvedQuery+"%")
+		rows, err = b.db.Query(fmt.Sprintf(`SELECT %s, created_at FROM "%s" WHERE created_at LIKE %s`, b.dialect.rowIDCol, safeTable, b.ph(1)), "%"+resolvedQuery+"%")
 		if err != nil {
 			return nil // Soft fallback: return empty results if table not ready
 		}

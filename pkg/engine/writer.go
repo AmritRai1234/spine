@@ -104,7 +104,11 @@ func (sw *shardedWriter) submitAny(task dbTask) (ok bool) {
 }
 
 func (sw *shardedWriter) closeAll() {
-	atomic.StoreUint32(&sw.closed, 1)
+	// CAS on closed: only the first caller closes the channels; subsequent
+	// calls (e.g. double Engine.Close) are no-ops.
+	if !atomic.CompareAndSwapUint32(&sw.closed, 0, 1) {
+		return
+	}
 	for i := range sw.shards {
 		close(sw.shards[i])
 	}

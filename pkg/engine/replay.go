@@ -34,17 +34,21 @@ func (b *Bus) ReplayEvents(filter ReplayFilter) ([]ReplayResult, error) {
 	query := `SELECT id, event_name, payload, created_at FROM "_spine_events"`
 	var args []interface{}
 	var where []string
+	paramN := 0
 
 	if filter.EventName != "" {
-		where = append(where, "event_name = ?")
+		paramN++
+		where = append(where, "event_name = "+b.ph(paramN))
 		args = append(args, filter.EventName)
 	}
 	if !filter.FromTime.IsZero() {
-		where = append(where, "created_at >= ?")
+		paramN++
+		where = append(where, "created_at >= "+b.ph(paramN))
 		args = append(args, filter.FromTime.Format(time.RFC3339))
 	}
 	if !filter.ToTime.IsZero() {
-		where = append(where, "created_at <= ?")
+		paramN++
+		where = append(where, "created_at <= "+b.ph(paramN))
 		args = append(args, filter.ToTime.Format(time.RFC3339))
 	}
 

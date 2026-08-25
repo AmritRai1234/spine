@@ -3,6 +3,7 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 )
@@ -52,8 +53,8 @@ func (b *Bus) ensureTable(table string, colDefs []string) error {
 
 	// Use _spine_id as the internal auto-increment PK to avoid colliding
 	// with user payload fields named "id" (which would cause datatype mismatch).
-	createSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (_spine_id INTEGER PRIMARY KEY AUTOINCREMENT, %s)`,
-		table, strings.Join(colDefs, ", "))
+	createSQL := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS "%s" (_spine_id %s, %s)`,
+		table, b.dialect.autoIncPK, strings.Join(colDefs, ", "))
 	if _, err := b.db.Exec(createSQL); err != nil {
 		return fmt.Errorf("create table failed: %w", err)
 	}
@@ -180,7 +181,7 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 			if i > 0 {
 				sb.WriteString(", ")
 			}
-			sb.WriteByte('?')
+			sb.WriteString(b.ph(i + 1))
 		}
 		sb.WriteByte(')')
 
@@ -300,13 +301,14 @@ func (b *Bus) dbUpdate(table string, whereExpr string, eventName string, payload
 			return err
 		}
 
-		// Build SQL string once: UPDATE "table" SET "col1" = ?, "col2" = ? WHERE "whereCol" op ?
+		// Build SQL string once: UPDATE "table" SET "col1" = $1, ... WHERE "whereCol" op $n
 		var sb strings.Builder
 		sb.Grow(64 + len(table) + n*12)
 		sb.WriteString(`UPDATE "`)
 		sb.WriteString(table)
 		sb.WriteString(`" SET `)
 		first := true
+		paramN := 0
 		for _, safe := range sanitizedKeys {
 			// Fallback mode: the where key identifies the row, so it is not SET.
 			// Explicit where mode: every payload field is SET.
@@ -316,16 +318,19 @@ func (b *Bus) dbUpdate(table string, whereExpr string, eventName string, payload
 			if !first {
 				sb.WriteString(", ")
 			}
+			paramN++
 			sb.WriteByte('"')
 			sb.WriteString(safe)
-			sb.WriteString(`" = ?`)
+			sb.WriteString(`" = `)
+			sb.WriteString(b.ph(paramN))
 			first = false
 		}
 		sb.WriteString(` WHERE "`)
 		sb.WriteString(whereCol)
 		sb.WriteString(`" `)
 		sb.WriteString(whereOp)
-		sb.WriteString(` ?`)
+		sb.WriteString(` `)
+		sb.WriteString(b.ph(paramN + 1))
 
 		tmpl = &sqlTemplate{
 			sql:      sb.String(),
@@ -424,13 +429,13 @@ func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload
 
 	if whereExpr == "" {
 		if idVal, ok := payload["id"]; ok {
-			deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE "id" = ?`, table)
+			deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE "id" = %s`, table, b.ph(1))
 			params = []interface{}{idVal}
 		} else if len(payload) > 0 {
 			// Fallback: use first payload key as delete condition
 			for k, v := range payload {
 				safeK := b.sanitizeIdentCached(k)
-				deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE "%s" = ?`, table, safeK)
+				deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE "%s" = %s`, table, safeK, b.ph(1))
 				params = []interface{}{v}
 				break
 			}
@@ -445,7 +450,7 @@ func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload
 			return fmt.Errorf("db.delete: %w", err)
 		}
 		safeCol := b.sanitizeIdentCached(col)
-		deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE "%s" %s ?`, table, safeCol, op)
+		deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE "%s" %s %s`, table, safeCol, op, b.ph(1))
 		params = []interface{}{val}
 	}
 
@@ -480,7 +485,7 @@ func (b *Bus) dbSum(table string, column string, whereExpr string, as string, ev
 			return fmt.Errorf("db.sum: %w", err)
 		}
 		safeWCol := b.sanitizeIdentCached(col)
-		query += fmt.Sprintf(` WHERE "%s" %s ?`, safeWCol, op)
+		query += fmt.Sprintf(` WHERE "%s" %s %s`, safeWCol, op, b.ph(1))
 		params = append(params, val)
 	}
 
@@ -490,6 +495,26 @@ func (b *Bus) dbSum(table string, column string, whereExpr string, as string, ev
 	}
 	payload[as] = sum
 	return nil
+}
+
+// ensureUniqueIndex guarantees the ON CONFLICT target column carries a unique
+// index before any upsert runs (PostgreSQL rejects ON CONFLICT with SQLSTATE
+// 42P10 otherwise; SQLite tolerates it only by accident of PK semantics).
+// Checked on every call via a lock-free sync.Map — common case is one atomic
+// load. Failure is NOT cached: a dropped/failed index self-heals on the next
+// upsert instead of leaving a permanently broken cached template.
+func (b *Bus) ensureUniqueIndex(table, col string) {
+	fp := table + "|" + col
+	if _, ok := b.uniqueIdx.Load(fp); ok {
+		return
+	}
+	idxSQL := fmt.Sprintf(`CREATE UNIQUE INDEX IF NOT EXISTS "uq_%s_%s" ON "%s"("%s")`,
+		table, col, table, col)
+	if _, err := b.db.Exec(idxSQL); err != nil {
+		log.Printf("[upsert] ensure unique index uq_%s_%s failed: %v", table, col, err)
+		return
+	}
+	b.uniqueIdx.Store(fp, struct{}{})
 }
 
 func (b *Bus) dbUpsert(table string, conflictKey string, eventName string, payload map[string]interface{}) error {
@@ -504,6 +529,7 @@ func (b *Bus) dbUpsert(table string, conflictKey string, eventName string, paylo
 
 	table = b.sanitizeIdentCached(table)
 	safeConflictKey := b.sanitizeIdentCached(conflictKey)
+	b.ensureUniqueIndex(table, safeConflictKey)
 
 	// Deterministic key ordering
 	keys := make([]string, 0, n)
@@ -552,11 +578,6 @@ func (b *Bus) dbUpsert(table string, conflictKey string, eventName string, paylo
 			return err
 		}
 
-		// Create unique index on conflict key if not exists
-		idxSQL := fmt.Sprintf(`CREATE UNIQUE INDEX IF NOT EXISTS "uq_%s_%s" ON "%s"("%s")`,
-			table, safeConflictKey, table, safeConflictKey)
-		_, _ = b.db.Exec(idxSQL)
-
 		// Build: INSERT INTO "t" ("a","b") VALUES (?,?) ON CONFLICT("key") DO UPDATE SET "a"=excluded."a"
 		var sb strings.Builder
 		sb.Grow(128 + len(table) + n*24)
@@ -576,7 +597,7 @@ func (b *Bus) dbUpsert(table string, conflictKey string, eventName string, paylo
 			if i > 0 {
 				sb.WriteString(", ")
 			}
-			sb.WriteByte('?')
+			sb.WriteString(b.ph(i + 1))
 		}
 		sb.WriteString(`) ON CONFLICT("`)
 		sb.WriteString(safeConflictKey)

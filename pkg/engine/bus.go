@@ -12,6 +12,8 @@ import (
 	"unsafe"
 
 	"github.com/AmritRai1234/spine/pkg/manifest"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/stdlib"
 	_ "github.com/mattn/go-sqlite3"
 	_ "turso.tech/database/tursogo"
 )
@@ -44,6 +46,11 @@ type Bus struct {
 	insertSQLCache sync.Map // "table|col1,col2" → *sqlTemplate
 	updateSQLCache sync.Map // "table|whereKey|col1,col2" → *sqlTemplate
 	upsertSQLCache sync.Map // "table|conflictKey|col1,col2" → *sqlTemplate
+	uniqueIdx      sync.Map // "table|conflictCol" → ensured unique index marker
+
+	// Dialect-specific SQL fragments (placeholder style, auto-PK, table list)
+	dialect  *dialect
+	auditSQL string
 
 	// In-memory RAM State Cache — lock-free sync.Map eliminates RWMutex convoys
 	// under concurrent parallel-route Emit calls
@@ -67,22 +74,43 @@ type Bus struct {
 	idempotencyCache sync.Map // idempotencyKey string -> *idempotencyEntry
 }
 
-// NewBus creates a Bus wired to a Registry, SQLite/Turso database, and WS hub.
+// NewBus creates a Bus wired to a Registry, SQLite/Turso/Postgres database, and WS hub.
+// The backend is chosen from the DSN: postgres:// or postgresql:// selects
+// PostgreSQL (pgx), libsql://, turso://, turso: or *.turso selects Turso,
+// anything else is a local SQLite file path.
 func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 	driver := "sqlite3"
 	connStr := dbPath
+	d := &sqliteDialect // Turso/libSQL is wire-compatible with SQLite syntax
 
-	if strings.HasPrefix(dbPath, "libsql://") || strings.HasPrefix(dbPath, "turso://") || strings.HasPrefix(dbPath, "turso:") {
+	switch {
+	case strings.HasPrefix(dbPath, "postgres://") || strings.HasPrefix(dbPath, "postgresql://"):
+		driver = "pgx"
+		d = &postgresDialect
+	case strings.HasPrefix(dbPath, "libsql://") || strings.HasPrefix(dbPath, "turso://") || strings.HasPrefix(dbPath, "turso:") || strings.HasSuffix(dbPath, ".turso"):
 		driver = "turso"
-	} else if strings.HasSuffix(dbPath, ".turso") {
-		driver = "turso"
-	} else {
+	default:
 		connStr = dbPath + "?_journal_mode=WAL&_synchronous=NORMAL&_cache_size=-64000&_busy_timeout=30000"
 	}
 
-	db, err := sql.Open(driver, connStr)
-	if err != nil {
-		return nil, fmt.Errorf("cannot open database '%s' using driver '%s': %w", dbPath, driver, err)
+	var db *sql.DB
+	if driver == "pgx" {
+		// QueryExecModeExec (unnamed prepared statements) instead of pgx's default
+		// statement cache: spine evolves schemas at runtime (ALTER TABLE ... ADD
+		// COLUMN), which invalidates cached SELECT * plans and makes every pooled
+		// connection fail with "cached plan must not change result type" (0A000).
+		cfg, pcfgErr := pgx.ParseConfig(connStr)
+		if pcfgErr != nil {
+			return nil, fmt.Errorf("cannot parse postgres DSN '%s': %w", dbPath, pcfgErr)
+		}
+		cfg.DefaultQueryExecMode = pgx.QueryExecModeExec
+		db = stdlib.OpenDB(*cfg)
+	} else {
+		var openErr error
+		db, openErr = sql.Open(driver, connStr)
+		if openErr != nil {
+			return nil, fmt.Errorf("cannot open database '%s' using driver '%s': %w", dbPath, driver, openErr)
+		}
 	}
 
 	// Tune connection pool for concurrent readers and single batch writer.
@@ -122,7 +150,10 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 		optimizer:    NewAdaptiveOptimizer(),
 		outboxNotify: make(chan struct{}, 1),
 		stopCh:       make(chan struct{}),
+		dialect:      d,
 	}
+	bus.auditSQL = `INSERT INTO "_spine_events" (event_name, payload, emitted_states, created_at) VALUES (` +
+		d.placeholder(1) + `, ` + d.placeholder(2) + `, ` + d.placeholder(3) + `, ` + d.placeholder(4) + `)`
 	atomic.StorePointer(&bus.registry, unsafe.Pointer(reg))
 	bus.startBatchWriter()
 	bus.initEventTable()
@@ -134,9 +165,7 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 	}()
 
 	// Pre-create tables declared in manifest (including imported sub-manifests)
-	for _, tbl := range reg.GetSchema().DbTables {
-		_ = bus.ensureTable(tbl, []string{"created_at TEXT"})
-	}
+	bus.EnsureTables(reg.GetSchema().DbTables)
 
 	// Adaptive WAL Checkpointing worker (Year 1 Performance):
 	// Runs passive/truncate WAL checkpoints during low traffic windows (RPS < 10) to avoid write stalls
@@ -152,6 +181,15 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 	bus.startIdempotencyCacheEvictor()
 
 	return bus, nil
+}
+
+// EnsureTables pre-creates tables declared in a schema. Existing tables are
+// untouched; missing tables are created. Used at startup and after hot-reload
+// so newly declared tables are immediately queryable.
+func (b *Bus) EnsureTables(tables []string) {
+	for _, tbl := range tables {
+		_ = b.ensureTable(tbl, []string{"created_at TEXT"})
+	}
 }
 
 func (b *Bus) startAdaptiveCheckpointing() {

@@ -11,7 +11,7 @@ import (
 // initOutboxTable creates the _spine_outbox table for persistent webhook retries.
 func (b *Bus) initOutboxTable() {
 	query := `CREATE TABLE IF NOT EXISTS "_spine_outbox" (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		id ` + b.dialect.autoIncPK + `,
 		action TEXT NOT NULL,
 		payload TEXT NOT NULL,
 		step_data TEXT DEFAULT '',
@@ -19,9 +19,9 @@ func (b *Bus) initOutboxTable() {
 		status TEXT DEFAULT 'pending',
 		next_retry_at TEXT NOT NULL,
 		created_at TEXT NOT NULL
-	);
-	CREATE INDEX IF NOT EXISTS "idx_spine_outbox_status" ON "_spine_outbox"("status", "next_retry_at");`
+	)`
 	b.db.Exec(query)
+	b.db.Exec(`CREATE INDEX IF NOT EXISTS "idx_spine_outbox_status" ON "_spine_outbox"("status", "next_retry_at")`)
 	// Ensure step_data column exists on upgraded schemas
 	b.db.Exec(`ALTER TABLE "_spine_outbox" ADD COLUMN step_data TEXT DEFAULT ''`)
 }
@@ -111,7 +111,7 @@ func (b *Bus) processOutboxQueue() {
 		maxWorkers, maxRetries, backoffMs := getOutboxConfig()
 		nowStr := time.Now().UTC().Format(time.RFC3339)
 
-		rows, err := b.db.Query(`SELECT id, action, payload, COALESCE(step_data, ''), attempts FROM "_spine_outbox" WHERE status = 'pending' AND next_retry_at <= ? ORDER BY id ASC LIMIT 50`, nowStr)
+		rows, err := b.db.Query(`SELECT id, action, payload, COALESCE(step_data, ''), attempts FROM "_spine_outbox" WHERE status = 'pending' AND next_retry_at <= `+b.ph(1)+` ORDER BY id ASC LIMIT 50`, nowStr)
 		if err != nil {
 			return
 		}
@@ -161,18 +161,18 @@ func (b *Bus) processOutboxQueue() {
 
 				err := b.execStep(step, "_spine_outbox_retry", payload)
 				if err == nil {
-					b.db.Exec(`UPDATE "_spine_outbox" SET status = 'completed' WHERE id = ?`, t.id)
+					b.db.Exec(`UPDATE "_spine_outbox" SET status = 'completed' WHERE id = `+b.ph(1), t.id)
 				} else {
 					nextAttempts := t.attempts + 1
 					if nextAttempts > maxRetries {
-						b.db.Exec(`UPDATE "_spine_outbox" SET status = 'failed', attempts = ? WHERE id = ?`, nextAttempts, t.id)
+						b.db.Exec(`UPDATE "_spine_outbox" SET status = 'failed', attempts = `+b.ph(1)+` WHERE id = `+b.ph(2), nextAttempts, t.id)
 					} else {
 						multiplier := 1 << (nextAttempts - 1)
 						if multiplier > 32 {
 							multiplier = 32
 						}
 						nextRetry := time.Now().UTC().Add(time.Duration(backoffMs*multiplier) * time.Millisecond).Format(time.RFC3339)
-						b.db.Exec(`UPDATE "_spine_outbox" SET attempts = ?, next_retry_at = ? WHERE id = ?`, nextAttempts, nextRetry, t.id)
+						b.db.Exec(`UPDATE "_spine_outbox" SET attempts = `+b.ph(1)+`, next_retry_at = `+b.ph(2)+` WHERE id = `+b.ph(3), nextAttempts, nextRetry, t.id)
 					}
 				}
 			}(task)
