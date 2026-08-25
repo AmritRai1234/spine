@@ -10,13 +10,11 @@ import (
 	"log"
 	"net/http"
 	"os"
-	"os/signal"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
-	"syscall"
 	"time"
 
 	"github.com/AmritRai1234/spine/pkg/manifest"
@@ -30,11 +28,75 @@ type contextKey string
 // accessContextKey is the context key for storing the resolved AccessContext.
 const accessContextKey contextKey = "spine_access"
 
-// maxRequestBodySize is the maximum allowed request body size (1 MB).
-const maxRequestBodySize = 1 << 20 // 1 MB
+// maxRequestBodySize is the maximum allowed request body size (1 MB by
+// default; override with SPINE_MAX_BODY_BYTES for image-heavy payloads such
+// as data-URL product images). Fail-closed: invalid/empty values keep 1 MB.
+func maxBodyBytesFromEnv(v string) int64 {
+	if v == "" {
+		return 1 << 20
+	}
+	if n, err := strconv.ParseInt(v, 10, 64); err == nil && n > 0 {
+		return n
+	}
+	return 1 << 20
+}
+
+var maxRequestBodySize = maxBodyBytesFromEnv(os.Getenv("SPINE_MAX_BODY_BYTES"))
+
+// WebSocket resource hardening knobs (gorilla canonical keepalive pattern).
+const (
+	wsWriteWait      = 10 * time.Second
+	wsPongWait       = 45 * time.Second
+	wsPingPeriod     = 30 * time.Second
+	wsMaxMessageSize = 1 << 20 // 1 MB, matches the HTTP body cap
+)
+
+// wsOriginPolicy builds a CheckOrigin function that allows origins based on env SPINE_WS_ORIGINS.
+// - No Origin header => allowed (non-browser clients).
+// - Origin host[:port] == r.Host => allowed (same-origin).
+// - Origin exactly matches an entry in the allowlist => allowed.
+// - Allowlist contains "*" => all origins allowed.
+// The allowlist is re-read per check (cheap: one os.Getenv) so tests and
+// hot-reconfigured deployments can change SPINE_WS_ORIGINS at runtime.
+func wsOriginCheck(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	// No Origin => non-browser client, allow
+	if origin == "" {
+		return true
+	}
+	// Same-origin check: compare authority (host[:port]) on both sides so a
+	// dev server on localhost:3000 talking to an engine on :8080 is NOT
+	// silently same-origin, but an engine behind its own origin is.
+	if extractHost(origin) == extractHost(r.Host) {
+		return true
+	}
+	raw := os.Getenv("SPINE_WS_ORIGINS")
+	for _, o := range strings.Split(raw, ",") {
+		o = strings.TrimSpace(o)
+		if o == "*" || o == origin {
+			return true
+		}
+	}
+	return false
+}
+
+// extractHost extracts the authority (host or host:port) from an Origin URL
+// (scheme://host[:port]/path) or from r.Host. Port is preserved — same-origin
+// means scheme-host-port equality for our purposes; only the scheme is dropped.
+func extractHost(origin string) string {
+	// Strip scheme
+	if idx := strings.Index(origin, "://"); idx > 0 {
+		origin = origin[idx+3:]
+	}
+	// Strip any path (Origins normally carry none, but be strict)
+	if idx := strings.Index(origin, "/"); idx > 0 {
+		origin = origin[:idx]
+	}
+	return origin
+}
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool { return true },
+	CheckOrigin: wsOriginCheck,
 }
 
 // Pools to reduce allocations on the hot path
@@ -56,16 +118,24 @@ type Engine struct {
 	Bus           *Bus
 	Hub           *Hub
 	Schema        *manifest.SpineSchema
-	APIKey        string          // Legacy single-key auth (backward compat)
+	APIKey        string                         // Legacy single-key auth (backward compat)
 	accessPtr     atomic.Pointer[AccessResolver] // Multi-key role-based access control (hot-swappable)
 	rateLimiter   *middleware.RateLimitManager
 	customContext *middleware.CustomContextManager
 	spineFile     string
 
+	webhookSecrets map[string]string // provider -> secret
+	webhookMu      sync.RWMutex
+
 	reloadMu       sync.Mutex    // guards Schema field swaps & diff logging during hot-reload
 	reloadStop     chan struct{} // closed to stop the hot-reload watcher goroutine
 	reloadStopOnce sync.Once
 	reloadInterval time.Duration // manifest poll interval for hot-reload
+
+	// WebSocket hardening knobs
+	wsMaxConns    int           // connection cap (refuse upgrades with 503 above this)
+	wsAuthTimeout time.Duration // first-message auth deadline (close 4001)
+	wsConnCount   atomic.Int64  // live WebSocket connections
 }
 
 // SetRateLimit enables IP-based token bucket rate limiting on public endpoints.
@@ -98,12 +168,26 @@ func New(schema *manifest.SpineSchema, dbPath string) (*Engine, error) {
 		Schema:         schema,
 		customContext:  middleware.NewCustomContextManager(),
 		reloadInterval: time.Second,
+		webhookSecrets: make(map[string]string),
+		wsMaxConns:     10000,
+		wsAuthTimeout:  5 * time.Second,
+	}
+
+	// WebSocket connection cap from env (invalid/negative values fall back to
+	// the default).
+	if v := os.Getenv("SPINE_WS_MAX_CONNS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			eng.wsMaxConns = n
+		}
 	}
 
 	// Wire access resolver if manifest defines access rules
 	if len(schema.Access) > 0 {
 		eng.accessPtr.Store(NewAccessResolver(schema.Access))
 	}
+
+	// Auto-populate webhook secrets from environment
+	eng.loadWebhookSecretsFromEnv()
 
 	return eng, nil
 }
@@ -152,6 +236,54 @@ func (e *Engine) SetAPIKey(key string) {
 	e.APIKey = key
 }
 
+// SetWebhookSecret configures the HMAC secret for a given webhook provider.
+// Use before serving; not safe for concurrent use during serving.
+func (e *Engine) SetWebhookSecret(provider, secret string) {
+	e.webhookMu.Lock()
+	defer e.webhookMu.Unlock()
+	if e.webhookSecrets == nil {
+		e.webhookSecrets = make(map[string]string)
+	}
+	if secret == "" {
+		delete(e.webhookSecrets, provider)
+	} else {
+		e.webhookSecrets[provider] = secret
+	}
+}
+
+// GetWebhookSecret returns the configured secret for a provider.
+func (e *Engine) GetWebhookSecret(provider string) string {
+	e.webhookMu.RLock()
+	defer e.webhookMu.RUnlock()
+	return e.webhookSecrets[provider]
+}
+
+// loadWebhookSecretsFromEnv reads webhook secrets from environment variables.
+// Looks for SPINE_WEBHOOK_SECRET_<PROVIDER> and the canonical <PROVIDER>_WEBHOOK_SECRET.
+func (e *Engine) loadWebhookSecretsFromEnv() {
+	for _, env := range os.Environ() {
+		parts := strings.SplitN(env, "=", 2)
+		if len(parts) != 2 || parts[1] == "" {
+			continue
+		}
+		key := parts[0]
+		val := parts[1]
+
+		// Match SPINE_WEBHOOK_SECRET_<PROVIDER>
+		if strings.HasPrefix(key, "SPINE_WEBHOOK_SECRET_") {
+			provider := strings.ToLower(strings.TrimPrefix(key, "SPINE_WEBHOOK_SECRET_"))
+			e.SetWebhookSecret(provider, val)
+			continue
+		}
+
+		// Match <PROVIDER>_WEBHOOK_SECRET (canonical form like STRIPE_WEBHOOK_SECRET)
+		if strings.HasSuffix(key, "_WEBHOOK_SECRET") {
+			provider := strings.ToLower(strings.TrimSuffix(key, "_WEBHOOK_SECRET"))
+			e.SetWebhookSecret(provider, val)
+		}
+	}
+}
+
 // Close shuts down the engine, its hot-reload watcher, and its rate limiter.
 func (e *Engine) Close() error {
 	e.reloadStopOnce.Do(func() {
@@ -180,29 +312,10 @@ func (e *Engine) ListenAndServe(addr string) error {
 	}
 	srv.SetKeepAlivesEnabled(true)
 
-	// Graceful shutdown on SIGINT/SIGTERM
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- srv.ListenAndServe()
-	}()
-
-	quit := make(chan os.Signal, 1)
-	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
-
-	select {
-	case err := <-errCh:
-		return err
-	case sig := <-quit:
-		log.Printf("[spine] received signal %v, shutting down gracefully...", sig)
-		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-		defer cancel()
-		if err := srv.Shutdown(ctx); err != nil {
-			log.Printf("[spine] graceful shutdown error: %v", err)
-			return err
-		}
-		log.Printf("[spine] server stopped")
-		return nil
-	}
+	return e.serveWithShutdown(
+		[]*http.Server{srv},
+		[]func() error{srv.ListenAndServe},
+	)
 }
 
 // HTTPHandler returns the configured http.Handler for embedding in custom servers.
@@ -254,6 +367,42 @@ func (e *Engine) wrapMiddleware(handler http.HandlerFunc) http.HandlerFunc {
 	if e.customContext != nil {
 		h = e.customContext.Middleware(h)
 	}
+
+	// Logging & Request ID tracing
+	h = middleware.LoggingMiddleware(h)
+
+	// Outer panic recovery handler
+	h = middleware.RecoveryMiddleware(h)
+
+	return h
+}
+
+// wrapWebhookMiddleware applies the same chain as wrapMiddleware minus the auth layer.
+// Webhook endpoints carry provider-signed payloads authenticated via webhook_verify middleware.
+func (e *Engine) wrapWebhookMiddleware(handler http.HandlerFunc) http.HandlerFunc {
+	h := handler
+
+	if e.rateLimiter != nil {
+		h = e.rateLimiter.Middleware(h)
+	}
+
+	// Body size limiter for payload protection
+	h = middleware.BodyLimitMiddleware(maxRequestBodySize, h)
+
+	// Payload nesting depth limiter (max 32 levels) to prevent JSON bomb DOS attacks
+	h = middleware.DepthLimitMiddleware(32, h)
+
+	// Security headers & CORS
+	h = middleware.SecurityHeadersMiddleware(h)
+	h = middleware.CORSMiddleware(middleware.DefaultCORSOptions(), h)
+
+	// Custom Context Extractor (Location, Temperature, Custom Metadata)
+	if e.customContext != nil {
+		h = e.customContext.Middleware(h)
+	}
+
+	// Webhook signature verification (HMAC-SHA256)
+	h = middleware.WebhookVerifyMiddleware(e.GetWebhookSecret, h)
 
 	// Logging & Request ID tracing
 	h = middleware.LoggingMiddleware(h)
@@ -316,11 +465,21 @@ func (e *Engine) buildMux() *http.ServeMux {
 	})
 
 	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+		// Truthful readiness: ping the database so orchestrators don't get a
+		// healthy signal while the engine's write path is down.
+		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
+		defer cancel()
+		if err := e.Bus.DB().PingContext(ctx); err != nil {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			w.Write([]byte(`{"status":"not_ready","error":"database unreachable"}`))
+			return
+		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ready"}`))
 	})
 
-	mux.HandleFunc("/webhook/", e.wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/webhook/", e.wrapWebhookMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		if r.Method != http.MethodPost {
 			w.WriteHeader(405)
@@ -349,6 +508,13 @@ func (e *Engine) buildMux() *http.ServeMux {
 
 		eventName := fmt.Sprintf("WEBHOOK_%s", strings.ToUpper(provider))
 		payload["_provider"] = provider
+
+		// Idempotency stamp: use the event "id" (Stripe event id) as idempotency key
+		if idVal, ok := payload["id"]; ok {
+			if idStr, ok := idVal.(string); ok && idStr != "" {
+				payload["_idempotency_key"] = idStr
+			}
+		}
 
 		res, err := e.Bus.Emit(eventName, payload)
 		if err != nil {
@@ -388,7 +554,24 @@ spine_optimizer_batch_size %d
 # HELP spine_optimizer_mode Current optimization mode
 # TYPE spine_optimizer_mode gauge
 spine_optimizer_mode{mode="%s"} 1
-`, rps, batchSize, mode)
+
+# HELP spine_commit_failures Batch commits that failed after retries (batch spilled)
+# TYPE spine_commit_failures counter
+spine_commit_failures %d
+
+# HELP spine_spill_writes Writes durably retained in _spine_write_spill
+# TYPE spine_spill_writes counter
+spine_spill_writes %d
+
+# HELP spine_lost_writes Writes dropped because even the spill insert failed
+# TYPE spine_lost_writes counter
+spine_lost_writes %d
+
+# HELP spine_dropped_audit Audit rows dropped due to shard saturation
+# TYPE spine_dropped_audit counter
+spine_dropped_audit %d
+`, rps, batchSize, mode,
+			e.Bus.CommitFailures(), e.Bus.SpillWrites(), e.Bus.LostWrites(), e.Bus.DroppedAudit())
 
 		w.Write([]byte(metrics))
 	})
@@ -622,7 +805,14 @@ spine_optimizer_mode{mode="%s"} 1
 		})
 	}))
 
-	mux.HandleFunc("/ws", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/ws", wrapWSHandler(func(w http.ResponseWriter, r *http.Request) {
+		// Connection cap: refuse upgrades above the limit BEFORE any upgrade
+		// work (cheap atomic read).
+		if e.wsConnCount.Load() >= int64(e.wsMaxConns) {
+			http.Error(w, "too many websocket connections", http.StatusServiceUnavailable)
+			return
+		}
+
 		// WebSocket auth check — upfront header/query param check
 		authenticated, wsAccess := e.wsAuthCheck(r)
 
@@ -631,27 +821,72 @@ spine_optimizer_mode{mode="%s"} 1
 			log.Printf("[ws] upgrade error: %v", err)
 			return
 		}
+		// Decrement happens in the read-loop cleanup (below), NOT here — this
+		// handler returns immediately after spawning the read/write loops, so
+		// a deferred decrement would undercount live connections.
+		e.wsConnCount.Add(1)
+
+		// Resource hardening (gorilla canonical pattern): cap message size,
+		// and require pongs to reset the read deadline so dead peers are
+		// reaped instead of holding connections forever.
+		conn.SetReadLimit(wsMaxMessageSize)
+		_ = conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		conn.SetPongHandler(func(string) error {
+			return conn.SetReadDeadline(time.Now().Add(wsPongWait))
+		})
+
 		client := &WsClient{Conn: conn, Send: make(chan []byte, 256)}
-		
+
 		if authenticated {
 			e.Hub.Register <- client
 		}
 
+		// First-message auth deadline: unauthenticated connections are closed
+		// with 4001 after e.wsAuthTimeout (websocket.org guidance — without
+		// it, unauthenticated sockets sit open indefinitely).
+		var authTimer *time.Timer
+		if !authenticated {
+			authTimer = time.AfterFunc(e.wsAuthTimeout, func() {
+				_ = conn.WriteControl(websocket.CloseMessage,
+					websocket.FormatCloseMessage(websocket.ClosePolicyViolation, "authentication timeout"),
+					time.Now().Add(wsWriteWait))
+				_ = conn.Close()
+			})
+		}
+
+		// Writer goroutine: state messages + periodic pings.
 		go func() {
 			defer conn.Close()
-			for msg := range client.Send {
-				conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-				if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
-					break
+			pingTicker := time.NewTicker(wsPingPeriod)
+			defer pingTicker.Stop()
+			for {
+				select {
+				case msg, ok := <-client.Send:
+					if !ok {
+						return
+					}
+					_ = conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+					if err := conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+						return
+					}
+				case <-pingTicker.C:
+					_ = conn.SetWriteDeadline(time.Now().Add(wsWriteWait))
+					if err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(wsWriteWait)); err != nil {
+						return
+					}
 				}
 			}
 		}()
 
 		go func() {
 			defer func() {
+				if authTimer != nil {
+					authTimer.Stop()
+				}
 				if authenticated {
 					e.Hub.Unregister <- client
 				}
+				e.wsConnCount.Add(-1) // connection fully closed
 				conn.Close()
 			}()
 			for {
@@ -686,6 +921,9 @@ spine_optimizer_mode{mode="%s"} 1
 						if !authenticated {
 							authenticated = true
 							e.Hub.Register <- client
+							if authTimer != nil {
+								authTimer.Stop()
+							}
 						}
 						ack := map[string]interface{}{"type": "auth_ack", "status": "ok"}
 						if wsAccess != nil {
@@ -707,8 +945,19 @@ spine_optimizer_mode{mode="%s"} 1
 					continue
 				}
 
-				// Handle WebSocket reconnect handshake with event log replay
+				// Handle WebSocket reconnect handshake with event log replay.
+				// AUTH-GATED: replay returns full event payloads, so it must
+				// never be served to unauthenticated connections.
 				if msgType, _ := raw["type"].(string); msgType == "reconnect" {
+					if !authenticated {
+						ack := map[string]interface{}{"type": "reconnect_ack", "status": "error", "error": "unauthorized: authentication required"}
+						ackBytes, _ := json.Marshal(ack)
+						select {
+						case client.Send <- ackBytes:
+						default:
+						}
+						continue
+					}
 					lastSeenIDFloat, _ := raw["last_seen_id"].(float64)
 					lastSeenID := int64(lastSeenIDFloat)
 
@@ -770,7 +1019,7 @@ spine_optimizer_mode{mode="%s"} 1
 				}
 			}
 		}()
-	})
+	}))
 
 	// Serve static web dashboard
 	if fi, err := os.Stat("web/dist"); err == nil && fi.IsDir() {
@@ -789,6 +1038,36 @@ spine_optimizer_mode{mode="%s"} 1
 func (e *Engine) SetHotReloadInterval(d time.Duration) {
 	if d > 0 {
 		e.reloadInterval = d
+	}
+}
+
+// SetMaxWSConns overrides the WebSocket connection cap (default 10000, or
+// SPINE_WS_MAX_CONNS). Must be called before serving.
+func (e *Engine) SetMaxWSConns(n int) {
+	if n > 0 {
+		e.wsMaxConns = n
+	}
+}
+
+// SetWSAuthTimeout overrides the first-message authentication deadline
+// (default 5s). Must be called before serving.
+func (e *Engine) SetWSAuthTimeout(d time.Duration) {
+	if d > 0 {
+		e.wsAuthTimeout = d
+	}
+}
+
+// wrapWSHandler applies panic recovery to a WebSocket handler. The standard
+// HTTP middleware chain does not cover /ws (it is registered directly on the
+// mux), so a panic there would otherwise kill the whole process.
+func wrapWSHandler(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("[ws] panic recovered: %v", rec)
+			}
+		}()
+		h(w, r)
 	}
 }
 
@@ -845,11 +1124,17 @@ func (e *Engine) reloadManifest() {
 	e.Schema = s
 	e.reloadMu.Unlock()
 
-	e.Bus.UpdateRegistry(manifest.NewRegistry(s))
-	e.Bus.EnsureTables(s.DbTables)
-	if len(s.Access) > 0 {
-		e.accessPtr.Store(NewAccessResolver(s.Access))
+	// Ensure tables BEFORE swapping the registry: if the new manifest declares
+	// tables the database cannot create, keep serving the previous schema
+	// instead of routing into missing tables.
+	if err := e.Bus.EnsureTables(s.DbTables); err != nil {
+		log.Printf("[spine] ✗ hot-reload table creation failed (keeping previous schema): %v", err)
+		return
 	}
+	e.Bus.UpdateRegistry(manifest.NewRegistry(s))
+	// Always rebuild the access resolver — an empty ruleset must clear a
+	// previously configured resolver, not leave stale rules in force.
+	e.accessPtr.Store(NewAccessResolver(s.Access))
 	log.Printf("[spine] ✓ hot-reloaded: %d nodes, %d routes", len(s.Nodes), len(s.Routes))
 }
 

@@ -2,6 +2,7 @@ package engine
 
 import (
 	"database/sql"
+	"encoding/json"
 	"fmt"
 	"log"
 	"strconv"
@@ -9,7 +10,6 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
-	"unsafe"
 
 	"github.com/AmritRai1234/spine/pkg/manifest"
 	"github.com/jackc/pgx/v5"
@@ -18,13 +18,6 @@ import (
 	_ "turso.tech/database/tursogo"
 )
 
-// idempotencyEntry wraps a cached result with a timestamp for TTL eviction.
-type idempotencyEntry struct {
-	result    map[string]interface{}
-	createdAt time.Time
-}
-
-// Pool for emitted states slices to reduce allocs on the hot path
 var statesPool = sync.Pool{
 	New: func() interface{} {
 		s := make([]string, 0, 4)
@@ -36,7 +29,7 @@ var statesPool = sync.Pool{
 // executes route steps, persists to SQLite/Turso, and broadcasts state
 // changes over WebSocket.
 type Bus struct {
-	registry unsafe.Pointer // *manifest.Registry, swapped atomically
+	registry atomic.Pointer[manifest.Registry] // *manifest.Registry, swapped atomically
 	db       *sql.DB
 	hub      *Hub
 
@@ -68,10 +61,19 @@ type Bus struct {
 	// Background workers stop signal
 	stopCh chan struct{}
 
-	// Idempotency key cache with TTL eviction (Year 3 Distributed Reliability):
-	// Prevents duplicate execution when the same idempotency key is re-emitted.
-	// Entries are evicted after 5 minutes to prevent unbounded memory growth.
-	idempotencyCache sync.Map // idempotencyKey string -> *idempotencyEntry
+	// Write-path durability counters (exposed on /metrics). All atomic.
+	commitFailures uint64 // batch commits that failed after retries (spilled)
+	spillWrites    uint64 // writes durably retained in _spine_write_spill
+	lostWrites     uint64 // writes dropped because even the spill insert failed
+	droppedAudit   uint64 // audit rows dropped due to shard saturation
+
+	// Cron worker state — owned by the single cron goroutine, no lock needed.
+	cronLast    map[string]int64 // route key -> last fire (unix seconds)
+	cronRunning map[string]bool  // route key -> a fire is in progress
+
+	// Prebuilt dialect-aware SQL used by the durability machinery.
+	spillSQL      string // INSERT into _spine_write_spill
+	idemInsertSQL string // idempotent INSERT OR IGNORE / ON CONFLICT DO NOTHING
 }
 
 // NewBus creates a Bus wired to a Registry, SQLite/Turso/Postgres database, and WS hub.
@@ -129,17 +131,26 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 
 	// Apply performance pragmas for local engines
 	if driver == "sqlite3" {
-		pragmas := []string{
-			"PRAGMA journal_mode=WAL",
-			"PRAGMA synchronous=NORMAL",
-			"PRAGMA cache_size=-64000",
-			"PRAGMA temp_store=MEMORY",
-			"PRAGMA mmap_size=0",              // Regular I/O — avoids TLB shootdown & page faults on write-heavy workloads
-			"PRAGMA page_size=8192",           // 8KB pages — better I/O alignment for modern SSDs
-			"PRAGMA wal_autocheckpoint=10000",
+		pragmas := []struct {
+			sql  string
+			name string
+		}{
+			{"PRAGMA journal_mode=WAL", "journal_mode=WAL"},
+			{"PRAGMA synchronous=NORMAL", "synchronous=NORMAL"},
+			{"PRAGMA cache_size=-64000", "cache_size=-64000"},
+			{"PRAGMA temp_store=MEMORY", "temp_store=MEMORY"},
+			{"PRAGMA mmap_size=0", "mmap_size=0"},
+			{"PRAGMA page_size=8192", "page_size=8192"},
+			{"PRAGMA wal_autocheckpoint=10000", "wal_autocheckpoint=10000"},
 		}
 		for _, p := range pragmas {
-			db.Exec(p)
+			if _, err := db.Exec(p.sql); err != nil {
+				if p.name == "journal_mode=WAL" {
+					log.Printf("[spine] ⚠ WARNING: journal_mode=WAL failed (%v) — continuing degraded (NFS/read-only FS?)", err)
+				} else {
+					return nil, fmt.Errorf("SQLite pragma %s failed: %w", p.name, err)
+				}
+			}
 		}
 	}
 
@@ -151,13 +162,27 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 		outboxNotify: make(chan struct{}, 1),
 		stopCh:       make(chan struct{}),
 		dialect:      d,
+		cronLast:     make(map[string]int64),
+		cronRunning:  make(map[string]bool),
 	}
 	bus.auditSQL = `INSERT INTO "_spine_events" (event_name, payload, emitted_states, created_at) VALUES (` +
 		d.placeholder(1) + `, ` + d.placeholder(2) + `, ` + d.placeholder(3) + `, ` + d.placeholder(4) + `)`
-	atomic.StorePointer(&bus.registry, unsafe.Pointer(reg))
+	bus.spillSQL = `INSERT INTO "_spine_write_spill" (query, params_json, status, created_at) VALUES (` +
+		d.placeholder(1) + `, ` + d.placeholder(2) + `, 'pending', ` + d.placeholder(3) + `)`
+	bus.idemInsertSQL = d.idemInsertPrefix + ` "_spine_idem" (key, status, result_json, created_at) VALUES (` +
+		d.placeholder(1) + `, 'running', NULL, ` + d.placeholder(2) + `)` + d.idemConflictSuffix
+	bus.registry.Store(reg)
 	bus.startBatchWriter()
-	bus.initEventTable()
-	bus.initOutboxTable()
+	if err := bus.initEventTable(); err != nil {
+		return nil, fmt.Errorf("startup init event table failed: %w", err)
+	}
+	if err := bus.initOutboxTable(); err != nil {
+		return nil, fmt.Errorf("startup init outbox table failed: %w", err)
+	}
+	if err := bus.initSpillTable(); err != nil {
+		return nil, fmt.Errorf("startup init spill table failed: %w", err)
+	}
+	bus.startSpillDrainer()
 	bus.wg.Add(1)
 	go func() {
 		defer bus.wg.Done()
@@ -165,7 +190,9 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 	}()
 
 	// Pre-create tables declared in manifest (including imported sub-manifests)
-	bus.EnsureTables(reg.GetSchema().DbTables)
+	if err := bus.EnsureTables(reg.GetSchema().DbTables); err != nil {
+		return nil, fmt.Errorf("startup ensure tables failed: %w", err)
+	}
 
 	// Adaptive WAL Checkpointing worker (Year 1 Performance):
 	// Runs passive/truncate WAL checkpoints during low traffic windows (RPS < 10) to avoid write stalls
@@ -177,8 +204,11 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 	// Triggers routes matching cron: "interval_sec" declarations on schedule
 	bus.startScheduledCronWorker()
 
-	// Idempotency cache TTL eviction: sweeps entries older than 5 minutes
-	bus.startIdempotencyCacheEvictor()
+	// Idempotency table + evictor: durable _spine_idem table with SQL-based cleanup
+	if err := bus.initIdempotencyTable(); err != nil {
+		return nil, fmt.Errorf("startup init idempotency table failed: %w", err)
+	}
+	bus.startIdempotencyEvictor()
 
 	return bus, nil
 }
@@ -186,10 +216,13 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 // EnsureTables pre-creates tables declared in a schema. Existing tables are
 // untouched; missing tables are created. Used at startup and after hot-reload
 // so newly declared tables are immediately queryable.
-func (b *Bus) EnsureTables(tables []string) {
+func (b *Bus) EnsureTables(tables []string) error {
 	for _, tbl := range tables {
-		_ = b.ensureTable(tbl, []string{"created_at TEXT"})
+		if err := b.ensureTable(tbl, []string{"created_at TEXT"}); err != nil {
+			return fmt.Errorf("ensure table '%s' failed: %w", tbl, err)
+		}
 	}
+	return nil
 }
 
 func (b *Bus) startAdaptiveCheckpointing() {
@@ -231,34 +264,73 @@ func (b *Bus) startScheduledCronWorker() {
 					continue
 				}
 
-				for _, route := range reg.GetSchema().Routes {
-					if route.Cron != "" {
-						// Parse interval (seconds or duration string like '1s', '5s', '1m')
-						var intervalSec int = 60
-						if dur, err := time.ParseDuration(route.Cron); err == nil {
-							intervalSec = int(dur.Seconds())
-						} else if sec, err := strconv.Atoi(route.Cron); err == nil {
-							intervalSec = sec
-						}
-
-						if intervalSec > 0 && time.Now().Unix()%int64(intervalSec) == 0 {
-							payload := map[string]interface{}{
-								"scheduled_at": time.Now().Format(time.RFC3339),
-								"_cron":        route.Cron,
-							}
-							_, _ = b.Emit(route.OnEvent, payload)
-						}
+				for i, route := range reg.GetSchema().Routes {
+					if route.Cron == "" {
+						continue
 					}
+					// Parse interval (seconds or duration string like '1s', '5s', '1m')
+					var intervalSec int = 60
+					if dur, err := time.ParseDuration(route.Cron); err == nil {
+						intervalSec = int(dur.Seconds())
+					} else if sec, err := strconv.Atoi(route.Cron); err == nil {
+						intervalSec = sec
+					}
+					if intervalSec <= 0 {
+						continue
+					}
+
+					key := fmt.Sprintf("%s\x00%d", route.OnEvent, i)
+					now := time.Now()
+					nowSec := now.Unix()
+
+					// Phase alignment + once-per-interval guard: prevents
+					// double-fires within an interval (e.g. after hot-reload
+					// or a slow previous run).
+					if nowSec%int64(intervalSec) != 0 {
+						continue
+					}
+					if last, ok := b.cronLast[key]; ok && nowSec-last < int64(intervalSec) {
+						continue
+					}
+					if b.cronRunning[key] {
+						continue // overlap guard: previous fire still running
+					}
+
+					b.cronLast[key] = nowSec
+					b.cronRunning[key] = true
+					payload := map[string]interface{}{
+						"scheduled_at": now.Format(time.RFC3339),
+						"_cron":        route.Cron,
+					}
+					if _, err := b.Emit(route.OnEvent, payload); err != nil {
+						log.Printf("[cron] route '%s' fire failed: %v", route.OnEvent, err)
+					}
+					delete(b.cronRunning, key)
 				}
 			}
 		}
 	}()
 }
 
-// startIdempotencyCacheEvictor runs a background sweep every 60 seconds,
-// removing idempotency cache entries older than 5 minutes.
-// Prevents unbounded memory growth under long-running deployments.
-func (b *Bus) startIdempotencyCacheEvictor() {
+// initIdempotencyTable creates the _spine_idem table for durable idempotency.
+// Created during startup so a missing/unwritable DB aborts startup.
+func (b *Bus) initIdempotencyTable() error {
+	_, err := b.db.Exec(`CREATE TABLE IF NOT EXISTS "_spine_idem" (
+		key TEXT PRIMARY KEY,
+		status TEXT NOT NULL,
+		result_json TEXT,
+		created_at TEXT NOT NULL
+	)`)
+	if err != nil {
+		return fmt.Errorf("cannot create _spine_idem table: %w", err)
+	}
+	return nil
+}
+
+// startIdempotencyEvictor runs a background sweep every 60 seconds,
+// deleting completed _spine_idem entries older than 5 minutes.
+// Prevents unbounded growth under long-running deployments.
+func (b *Bus) startIdempotencyEvictor() {
 	b.wg.Add(1)
 	go func() {
 		defer b.wg.Done()
@@ -272,13 +344,8 @@ func (b *Bus) startIdempotencyCacheEvictor() {
 			case <-b.stopCh:
 				return
 			case now := <-ticker.C:
-				b.idempotencyCache.Range(func(key, value interface{}) bool {
-					entry, ok := value.(*idempotencyEntry)
-					if ok && now.Sub(entry.createdAt) > ttl {
-						b.idempotencyCache.Delete(key)
-					}
-					return true
-				})
+				cutoff := now.Add(-ttl).UTC().Format(time.RFC3339)
+				_, _ = b.db.Exec(`DELETE FROM "_spine_idem" WHERE status = 'completed' AND created_at < `+b.ph(1), cutoff)
 			}
 		}
 	}()
@@ -323,43 +390,11 @@ func (b *Bus) startBatchWriter() {
 			if len(batch) == 0 {
 				return
 			}
-			tx, err := b.db.Begin()
-			if err != nil {
-				// Fallback execute directly
-				for _, task := range batch {
-					b.db.Exec(task.query, task.params...)
-				}
-				batch = batch[:0]
-				return
+			if err := flushBatchWithRetry(b.db, batch); err != nil {
+				// Never silently drop: retain the batch durably via the spill
+				// table and let the spill drainer replay it once the DB recovers.
+				b.spillBatch(batch, err)
 			}
-
-			// Prepared statement cache within this transaction.
-			// Reusing stmts eliminates sqlite3_prepare_v2 overhead (31% of CPU).
-			stmtCache := make(map[string]*sql.Stmt, 8)
-			defer func() {
-				for _, s := range stmtCache {
-					s.Close()
-				}
-			}()
-
-			for _, task := range batch {
-				stmt, ok := stmtCache[task.query]
-				if !ok {
-					stmt, err = tx.Prepare(task.query)
-					if err != nil {
-						// Fallback: direct exec
-						if _, execErr := tx.Exec(task.query, task.params...); execErr != nil {
-							log.Printf("[batch] exec error: %v", execErr)
-						}
-						continue
-					}
-					stmtCache[task.query] = stmt
-				}
-				if _, err := stmt.Exec(task.params...); err != nil {
-					log.Printf("[batch] exec error: %v", err)
-				}
-			}
-			_ = tx.Commit()
 			batch = batch[:0]
 		}
 
@@ -456,12 +491,12 @@ func (b *Bus) Close() error {
 
 // UpdateRegistry atomically swaps the registry (used for hot-reload).
 func (b *Bus) UpdateRegistry(newReg *manifest.Registry) {
-	atomic.StorePointer(&b.registry, unsafe.Pointer(newReg))
+	b.registry.Store(newReg)
 }
 
 // GetRegistry returns the current registry. Lock-free.
 func (b *Bus) GetRegistry() *manifest.Registry {
-	return (*manifest.Registry)(atomic.LoadPointer(&b.registry))
+	return b.registry.Load()
 }
 
 // DB returns the underlying *sql.DB connection for advanced queries.
@@ -484,19 +519,94 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 
 	b.optimizer.RecordRequest()
 
-	// Idempotency Key Dedup Check (Year 3 Feature)
+	// Idempotency: DB-backed claim protocol (depth == 0 only; chained emissions
+	// share the parent key by design and must NOT be deduped).
 	var idempotencyKey string
-	if ik, ok := payload["_idempotency_key"].(string); ok && ik != "" {
-		idempotencyKey = ik
-		if cached, found := b.idempotencyCache.Load(idempotencyKey); found {
-			entry := cached.(*idempotencyEntry)
-			resCopy := make(map[string]interface{}, len(entry.result))
-			for k, v := range entry.result {
-				resCopy[k] = v
+	var claimedKey string // non-empty when this call owns the claim
+	if depth == 0 {
+		if ik, ok := payload["_idempotency_key"].(string); ok && ik != "" {
+			idempotencyKey = ik
+			now := time.Now().UTC().Format(time.RFC3339)
+
+			res, err := b.db.Exec(b.idemInsertSQL, idempotencyKey, now)
+			if err != nil {
+				return nil, fmt.Errorf("idempotency claim failed: %w", err)
 			}
-			resCopy["idempotent_hit"] = true
-			return resCopy, nil
+			rows, _ := res.RowsAffected()
+			if rows == 0 {
+				// Key exists — read current status
+				var status string
+				var resultJSON sql.NullString
+				var createdAt string
+				err = b.db.QueryRow(`SELECT status, result_json, created_at FROM "_spine_idem" WHERE key = `+b.ph(1), idempotencyKey).Scan(&status, &resultJSON, &createdAt)
+				if err != nil {
+					return nil, fmt.Errorf("idempotency check failed: %w", err)
+				}
+
+				createdTime, parseErr := time.Parse(time.RFC3339, createdAt)
+				if parseErr != nil {
+					return nil, fmt.Errorf("idempotency: invalid created_at '%s': %w", createdAt, parseErr)
+				}
+
+				switch {
+				case status == "completed":
+					if resultJSON.Valid && resultJSON.String != "" {
+						var cachedResult map[string]interface{}
+						if jsonErr := json.Unmarshal([]byte(resultJSON.String), &cachedResult); jsonErr == nil {
+							cachedResult["idempotent_hit"] = true
+							return cachedResult, nil
+						}
+					}
+					return nil, fmt.Errorf("idempotency: corrupted completed result for key '%s'", idempotencyKey)
+				case status == "running" && time.Since(createdTime) < 5*time.Minute:
+					return nil, fmt.Errorf("idempotency conflict: request with key '%s' is already in-flight", idempotencyKey)
+				case status == "running":
+					// Stale (>=5 min) — guarded steal
+					oldCreated := createdAt
+					now2 := time.Now().UTC().Format(time.RFC3339)
+					updRes, updErr := b.db.Exec(`UPDATE "_spine_idem" SET status = 'running', created_at = `+b.ph(1)+` WHERE key = `+b.ph(2)+` AND created_at = `+b.ph(3), now2, idempotencyKey, oldCreated)
+					if updErr != nil {
+						return nil, fmt.Errorf("idempotency steal failed: %w", updErr)
+					}
+					stolen, _ := updRes.RowsAffected()
+					if stolen == 0 {
+						// Someone else stole it — re-read final state
+						var finalStatus string
+						var finalResult sql.NullString
+						_ = b.db.QueryRow(`SELECT status, result_json FROM "_spine_idem" WHERE key = `+b.ph(1), idempotencyKey).Scan(&finalStatus, &finalResult)
+						if finalStatus == "completed" && finalResult.Valid && finalResult.String != "" {
+							var cachedResult map[string]interface{}
+							if json.Unmarshal([]byte(finalResult.String), &cachedResult) == nil {
+								cachedResult["idempotent_hit"] = true
+								return cachedResult, nil
+							}
+						}
+						return nil, fmt.Errorf("idempotency conflict: key '%s' stolen by another request", idempotencyKey)
+					}
+					claimedKey = idempotencyKey
+				default:
+					return nil, fmt.Errorf("idempotency: unknown status '%s' for key '%s'", status, idempotencyKey)
+				}
+			} else {
+				claimedKey = idempotencyKey
+			}
 		}
+	}
+
+	// Deferred idempotency cleanup: on success store result; on error or panic delete claim.
+	var execSuccess bool
+	if claimedKey != "" {
+		defer func() {
+			if r := recover(); r != nil {
+				_, _ = b.db.Exec(`DELETE FROM "_spine_idem" WHERE key = `+b.ph(1), claimedKey)
+				panic(r)
+			}
+			if execSuccess {
+				// resultJSON is serialized in the success block below
+			} else {
+				_, _ = b.db.Exec(`DELETE FROM "_spine_idem" WHERE key = `+b.ph(1), claimedKey)
+			}
+		}()
 	}
 
 	reg := b.GetRegistry()
@@ -640,10 +750,11 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 	}
 
 	if idempotencyKey != "" {
-		b.idempotencyCache.Store(idempotencyKey, &idempotencyEntry{
-			result:    res,
-			createdAt: time.Now(),
-		})
+		if claimedKey != "" {
+			resultJSON, _ := json.Marshal(res)
+			_, _ = b.db.Exec(`UPDATE "_spine_idem" SET status = 'completed', result_json = `+b.ph(1)+` WHERE key = `+b.ph(2), string(resultJSON), idempotencyKey)
+			execSuccess = true
+		}
 	}
 
 	return res, nil
@@ -732,7 +843,7 @@ func (b *Bus) execStep(step *manifest.RouteStep, eventName string, payload map[s
 			time.Sleep(time.Duration(step.BackoffMs) * time.Millisecond)
 		}
 	}
-	if step.Action == "http.post" {
+	if step.Action == "http.post" || step.Action == "notify.webhook" {
 		b.enqueueOutboxStep(step, step.Action, payload, step.BackoffMs)
 	}
 	return fmt.Errorf("action %s failed after %d attempts: %w", step.Action, attempts, lastErr)
@@ -757,6 +868,8 @@ func (b *Bus) rollbackCompensation(succeededSteps []manifest.RouteStep, eventNam
 			compStep.Where = compWhere
 		}
 
-		_ = b.dispatchAction(&compStep, eventName, payload)
+		if err := b.dispatchAction(&compStep, eventName, payload); err != nil {
+			log.Printf("[compensation] step '%s' compensating action '%s' failed: %v", step.Action, compStep.Action, err)
+		}
 	}
 }

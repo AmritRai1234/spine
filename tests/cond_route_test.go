@@ -24,6 +24,13 @@ routes:
         message: "Admin registered: $event.payload.email"
         if: "$event.payload.email contains 'admin.com'"
     emit: ADMIN_REGISTERED
+
+  - on: SCORE_EVENT
+    if: "$event.payload.score == 15.0"
+    steps:
+      - action: log.write
+        message: "Score matched: $event.payload.score"
+    emit: SCORE_MATCHED
 `
 
 	tmpManifest, err := os.CreateTemp("", "cond_*.spine")
@@ -39,11 +46,14 @@ routes:
 		t.Fatalf("ParseManifest failed: %v", err)
 	}
 
-	if len(schema.Routes) != 1 {
-		t.Fatalf("expected 1 route, got %d", len(schema.Routes))
+	if len(schema.Routes) != 2 {
+		t.Fatalf("expected 2 routes, got %d", len(schema.Routes))
 	}
 	if schema.Routes[0].IfCondition != "$event.payload.role == 'admin'" {
 		t.Errorf("expected route condition '$event.payload.role == 'admin'', got '%s'", schema.Routes[0].IfCondition)
+	}
+	if schema.Routes[1].IfCondition != "$event.payload.score == 15.0" {
+		t.Errorf("expected route condition '$event.payload.score == 15.0', got '%s'", schema.Routes[1].IfCondition)
 	}
 
 	dbPath := "test_cond.db"
@@ -81,5 +91,29 @@ routes:
 	emitted2, _ := res2["emitted_states"].([]string)
 	if len(emitted2) != 1 || emitted2[0] != "ADMIN_REGISTERED" {
 		t.Errorf("expected ['ADMIN_REGISTERED'], got %v", emitted2)
+	}
+
+	// Case 3: SCORE_EVENT with score=15 (decimal 15.0 == integer 15 → numeric equal)
+	res3, err := bus.Emit("SCORE_EVENT", map[string]interface{}{
+		"score": 15,
+	})
+	if err != nil {
+		t.Fatalf("Emit failed: %v", err)
+	}
+	emitted3, _ := res3["emitted_states"].([]string)
+	if len(emitted3) != 1 || emitted3[0] != "SCORE_MATCHED" {
+		t.Errorf("expected ['SCORE_MATCHED'] for score=15, got %v", emitted3)
+	}
+
+	// Case 4: SCORE_EVENT with score=7 (different number → should skip)
+	res4, err := bus.Emit("SCORE_EVENT", map[string]interface{}{
+		"score": 7,
+	})
+	if err != nil {
+		t.Fatalf("Emit failed: %v", err)
+	}
+	emitted4, _ := res4["emitted_states"].([]string)
+	if len(emitted4) != 0 {
+		t.Errorf("expected 0 emitted states for score=7, got %v", emitted4)
 	}
 }

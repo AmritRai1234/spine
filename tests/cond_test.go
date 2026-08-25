@@ -30,6 +30,17 @@ func TestEvaluateCondition(t *testing.T) {
 		{"$event.payload.age <= 20", false},
 		{"$event.payload.status exists", true},
 		{"$event.payload.nonexistent exists", false},
+
+		// equalsValue numeric coercion edge cases
+		{"15.0 == 15", true},    // decimal + integer — equal floats
+		{"007 == 7", false},     // leading zeros — string compare
+		{"1e3 == 1000", false},  // scientific notation — string compare
+		{" 42  == 42", true},    // whitespace-trimmed — equal floats
+		{"abc == abc", true},    // same non-numeric string
+		{"abc == 1", false},     // non-numeric vs number — not equal
+		{"-2.50 == -2.5", true}, // negative trailing zero — equal floats
+		{"007 != 7", true},      // leading zeros != — not equal
+		{"15.0 != 7", true},     // decimal != int — different numbers
 	}
 
 	for _, tt := range tests {

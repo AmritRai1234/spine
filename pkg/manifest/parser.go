@@ -316,6 +316,12 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 							envName := strings.TrimPrefix(keyVal[1:], "env.")
 							keyVal = os.Getenv(envName)
 						}
+						// Fail closed: a role whose key resolved to empty is an open
+						// door (every unauthenticated caller matches it). Refuse to
+						// start instead of shipping an exposed admin/staff role.
+						if keyVal == "" {
+							return nil, parseError(manifestPath, lineno, "access role '%s' has an empty key — refusing to start with an open role (set the key directly or via its environment variable)", curAccess.Role)
+						}
 						curAccess.Key = keyVal
 						state = sAccessEntry
 						continue

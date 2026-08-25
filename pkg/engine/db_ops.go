@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strconv"
 	"strings"
+
+	"github.com/AmritRai1234/spine/pkg/manifest"
 )
 
 // sqlTemplate holds a pre-built SQL string and the deterministic column order.
@@ -108,7 +111,14 @@ func sqliteType(fieldType string) string {
 	}
 }
 
-func (b *Bus) dbInsert(table string, eventName string, payload map[string]interface{}) error {
+// dbInsert persists the payload as a new row. By default the write goes
+// through the async sharded batch writer; with config `sync: "true"` it runs
+// synchronously via execWithRetry so a subsequent synchronous read (db.sum,
+// db.lookup, db.adjust) in the SAME route chain — or the next route — is
+// guaranteed to observe the row. Commerce uses this for order lines: the
+// server-side subtotal at PLACE_ORDER must never race the line insert.
+func (b *Bus) dbInsert(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
+	table := step.Table
 	n := len(payload)
 	if n == 0 {
 		return nil
@@ -199,11 +209,21 @@ func (b *Bus) dbInsert(table string, eventName string, payload map[string]interf
 		values[i] = normalizeParam(payload[k], eventName, payload)
 	}
 
+	if step.Config["sync"] == "true" {
+		// Synchronous write: errors surface to the route (on_failure fires)
+		// and the row is durable before the next step runs.
+		if err := execWithRetry(b.db, tmpl.sql, values...); err != nil {
+			return fmt.Errorf("insert failed: %w", err)
+		}
+		return nil
+	}
+
 	if !b.writer.submit(table, dbTask{query: tmpl.sql, params: values}) {
-		// All shards full — async overflow
-		go func(t dbTask) {
-			b.writer.submit(table, t)
-		}(dbTask{query: tmpl.sql, params: values})
+		// All shards full — synchronous fallback so the write is never
+		// silently dropped and failures surface to the route (on_failure).
+		if err := execWithRetry(b.db, tmpl.sql, values...); err != nil {
+			return fmt.Errorf("insert failed: %w", err)
+		}
 	}
 
 	return nil
@@ -241,7 +261,7 @@ func (b *Bus) dbUpdate(table string, whereExpr string, eventName string, payload
 		whereVal = val
 	} else {
 		if n < 2 {
-			return nil
+			return fmt.Errorf("db.update requires at least 2 payload fields when no explicit 'where' is given (one where-key + one value to set), got %d", n)
 		}
 		whereKey := keys[0]
 		if _, ok := payload["id"]; ok {
@@ -497,6 +517,148 @@ func (b *Bus) dbSum(table string, column string, whereExpr string, as string, ev
 	return nil
 }
 
+// dbLookup finds a single row matching key_column = value_expr (a resolvable
+// expression, e.g. "$event.payload.product_id") and merges every column of the
+// row into the event payload. An optional "as" config prefixes merged keys
+// ("as: product_" turns price → product_price) to avoid clobbering event fields.
+// No matching row → error, so route on_failure machinery handles it.
+func (b *Bus) dbLookup(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
+	keyColumn := step.Config["key_column"]
+	valueExpr := step.Config["value_expr"]
+	if keyColumn == "" || valueExpr == "" {
+		return fmt.Errorf("db.lookup requires 'key_column' and 'value_expr' config")
+	}
+
+	safeTable := b.sanitizeIdentCached(step.Table)
+	safeKeyCol := b.sanitizeIdentCached(keyColumn)
+	if safeTable == "" || safeKeyCol == "" {
+		return fmt.Errorf("db.lookup requires 'table' and a valid 'key_column'")
+	}
+
+	value := ResolveValue(valueExpr, eventName, payload)
+	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" = %s LIMIT 1`, safeTable, safeKeyCol, b.ph(1))
+	rows, err := b.queryRows(query, value)
+	if err != nil {
+		return fmt.Errorf("db.lookup failed on '%s': %w", safeTable, err)
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("db.lookup: no row in '%s' where %s = %v", safeTable, safeKeyCol, value)
+	}
+
+	prefix := step.Config["as"]
+	for k, v := range rows[0] {
+		if k == "_spine_id" || k == "_error_context" {
+			continue
+		}
+		payload[prefix+k] = v
+	}
+	return nil
+}
+
+// dbAdjust performs an atomic relative update: SET col = col + delta WHERE ...
+// The delta ("by" config) is a resolvable integer expression (may be negative)
+// and is always bound as a parameter — never interpolated into the SQL text.
+//
+// Optional config:
+//   - floor: minimum allowed resulting value; when set, the UPDATE gains an
+//     AND col + ? >= floor guard. Zero affected rows → step fails, so
+//     insufficient stock / balance aborts the route via on_failure.
+//
+// Runs synchronously against the DB pool (not the batched writer): read-
+// modify-write steps must complete before downstream reads and must surface
+// errors to the route pipeline.
+func (b *Bus) dbAdjust(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
+	column := step.Config["column"]
+	byExpr := step.Config["by"]
+	if column == "" || byExpr == "" {
+		return fmt.Errorf("db.adjust requires 'column' and 'by' config")
+	}
+	if step.Where == "" {
+		return fmt.Errorf("db.adjust requires a parameterized 'where' condition")
+	}
+
+	delta, err := resolveInt(byExpr, eventName, payload)
+	if err != nil {
+		return fmt.Errorf("db.adjust invalid 'by' expression '%s': %w", byExpr, err)
+	}
+
+	whereCol, whereOp, whereVal, err := parseWhereCondition(step.Where, eventName, payload)
+	if err != nil {
+		return fmt.Errorf("db.adjust: %w", err)
+	}
+
+	safeTable := b.sanitizeIdentCached(step.Table)
+	safeCol := b.sanitizeIdentCached(column)
+	safeWhereCol := b.sanitizeIdentCached(whereCol)
+	if safeTable == "" || safeCol == "" || safeWhereCol == "" {
+		return fmt.Errorf("db.adjust: table, column and where column must be valid identifiers")
+	}
+
+	// Ensure the adjusted column exists (no-op for established tables).
+	if err := b.ensureTable(safeTable, []string{`"` + safeCol + `" INTEGER`}); err != nil {
+		return fmt.Errorf("db.adjust ensure column failed: %w", err)
+	}
+
+	var query string
+	var params []interface{}
+	if floorStr := step.Config["floor"]; floorStr != "" {
+		floor, ferr := resolveInt(floorStr, eventName, payload)
+		if ferr != nil {
+			return fmt.Errorf("db.adjust invalid 'floor' expression '%s': %w", floorStr, ferr)
+		}
+		// Placeholders are strictly positional: delta appears twice (SET + guard).
+		query = fmt.Sprintf(`UPDATE "%s" SET "%s" = "%s" + %s WHERE "%s" %s %s AND "%s" + %s >= %s`,
+			safeTable, safeCol, safeCol, b.ph(1), safeWhereCol, whereOp, b.ph(2), safeCol, b.ph(3), b.ph(4))
+		params = []interface{}{delta, whereVal, delta, floor}
+	} else {
+		query = fmt.Sprintf(`UPDATE "%s" SET "%s" = "%s" + %s WHERE "%s" %s %s`,
+			safeTable, safeCol, safeCol, b.ph(1), safeWhereCol, whereOp, b.ph(2))
+		params = []interface{}{delta, whereVal}
+	}
+
+	res, err := execWithRetryResult(b.db, query, params...)
+	if err != nil {
+		return fmt.Errorf("db.adjust failed: %w", err)
+	}
+	if step.Config["floor"] != "" {
+		if n, rerr := res.RowsAffected(); rerr == nil && n == 0 {
+			// Distinguish between row-not-found and floor rejection.
+			// Run a cheap SELECT 1 existence check on the same WHERE condition.
+			var exists int
+			checkQuery := fmt.Sprintf(`SELECT 1 FROM "%s" WHERE "%s" %s %s LIMIT 1`,
+				safeTable, safeWhereCol, whereOp, b.ph(1))
+			if err := b.db.QueryRow(checkQuery, whereVal).Scan(&exists); err != nil {
+				return fmt.Errorf("db.adjust rejected: row not found in '%s' where %s %s %v",
+					safeTable, safeWhereCol, whereOp, whereVal)
+			}
+			return fmt.Errorf("db.adjust rejected: adjustment of '%s' by %+d would cross floor %s",
+				safeCol, delta, step.Config["floor"])
+		}
+	}
+	return nil
+}
+
+// resolveInt evaluates an integer expression: literal, or $-prefixed template.
+// Accepts int/int64/float64 payloads and negative literals like "-$event.payload.qty".
+func resolveInt(expr string, eventName string, payload map[string]interface{}) (int64, error) {
+	switch v := ResolveValue(expr, eventName, payload).(type) {
+	case int:
+		return int64(v), nil
+	case int32:
+		return int64(v), nil
+	case int64:
+		return v, nil
+	case uint64:
+		return int64(v), nil
+	case float64:
+		return int64(v), nil
+	case string:
+		return strconv.ParseInt(strings.TrimSpace(v), 10, 64)
+	default:
+		return 0, fmt.Errorf("not an integer expression")
+	}
+}
+
 // ensureUniqueIndex guarantees the ON CONFLICT target column carries a unique
 // index before any upsert runs (PostgreSQL rejects ON CONFLICT with SQLSTATE
 // 42P10 otherwise; SQLite tolerates it only by accident of PK semantics).
@@ -529,7 +691,6 @@ func (b *Bus) dbUpsert(table string, conflictKey string, eventName string, paylo
 
 	table = b.sanitizeIdentCached(table)
 	safeConflictKey := b.sanitizeIdentCached(conflictKey)
-	b.ensureUniqueIndex(table, safeConflictKey)
 
 	// Deterministic key ordering
 	keys := make([]string, 0, n)
@@ -556,28 +717,34 @@ func (b *Bus) dbUpsert(table string, conflictKey string, eventName string, paylo
 	}
 	fingerprint := fpBuf.String()
 
+	// Build typed column definitions from the manifest field types.
+	fieldTypes := b.GetRegistry().GetFieldTypes(eventName)
+	colDefs := make([]string, n)
+	for i, safe := range sanitizedKeys {
+		sqlType := "TEXT"
+		if fieldTypes != nil {
+			if ft, ok := fieldTypes[keys[i]]; ok {
+				sqlType = sqliteType(ft)
+			}
+		}
+		colDefs[i] = `"` + safe + `" ` + sqlType
+	}
+
+	// Ensure the table (and thus the conflict column) exists BEFORE creating
+	// its unique index: PostgreSQL rejects CREATE UNIQUE INDEX on a missing
+	// column (SQLSTATE 42703), and SQLite rejects ON CONFLICT without a
+	// matching unique constraint. Doing this outside the cache branch also
+	// fixes first-upsert on a fresh table.
+	if err := b.ensureTable(table, colDefs); err != nil {
+		return err
+	}
+	b.ensureUniqueIndex(table, safeConflictKey)
+
 	// Lookup or build the SQL template
 	var tmpl *sqlTemplate
 	if cached, ok := b.upsertSQLCache.Load(fingerprint); ok {
 		tmpl = cached.(*sqlTemplate)
 	} else {
-		// Build typed column definitions
-		fieldTypes := b.GetRegistry().GetFieldTypes(eventName)
-		colDefs := make([]string, n)
-		for i, safe := range sanitizedKeys {
-			sqlType := "TEXT"
-			if fieldTypes != nil {
-				if ft, ok := fieldTypes[keys[i]]; ok {
-					sqlType = sqliteType(ft)
-				}
-			}
-			colDefs[i] = `"` + safe + `" ` + sqlType
-		}
-
-		if err := b.ensureTable(table, colDefs); err != nil {
-			return err
-		}
-
 		// Build: INSERT INTO "t" ("a","b") VALUES (?,?) ON CONFLICT("key") DO UPDATE SET "a"=excluded."a"
 		var sb strings.Builder
 		sb.Grow(128 + len(table) + n*24)
@@ -633,9 +800,11 @@ func (b *Bus) dbUpsert(table string, conflictKey string, eventName string, paylo
 	}
 
 	if !b.writer.submit(table, dbTask{query: tmpl.sql, params: values}) {
-		go func(t dbTask) {
-			b.writer.submit(table, t)
-		}(dbTask{query: tmpl.sql, params: values})
+		// All shards full — synchronous fallback so the write is never
+		// silently dropped and failures surface to the route (on_failure).
+		if err := execWithRetry(b.db, tmpl.sql, values...); err != nil {
+			return fmt.Errorf("upsert failed: %w", err)
+		}
 	}
 
 	return nil

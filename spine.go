@@ -18,6 +18,7 @@ type Route = manifest.Route
 type Node = manifest.Node
 type ReplayFilter = engine.ReplayFilter
 type ReplayResult = engine.ReplayResult
+type TLSConfig = engine.TLSConfig
 
 // New creates a fully wired Engine from a parsed schema.
 func New(schema *manifest.SpineSchema, dbPath string) (*engine.Engine, error) {

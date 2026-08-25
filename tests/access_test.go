@@ -58,6 +58,54 @@ routes:
         message: "Deleted lead $event.payload.id"
 `
 
+// TestAccessEmptyKeyFailsClosed: an access rule whose key resolves to empty
+// (unset env var) refuses to start — no open admin/staff roles.
+func TestAccessEmptyKeyFailsClosed(t *testing.T) {
+	t.Setenv("SPINE_TEST_UNSET_KEY", "")
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "open.spine")
+	manifestContent := `spine_version: 1
+
+database:
+  tables:
+    - leads
+
+access:
+  - role: admin
+    key: "$SPINE_TEST_UNSET_KEY"
+
+nodes:
+  - name: api
+    emits:
+      - event: SUBMIT_LEAD
+        payload:
+          email: string
+
+routes:
+  - on: SUBMIT_LEAD
+    steps:
+      - action: db.insert
+        table: leads
+    emit_state: LEAD_STATUS
+`
+	if err := os.WriteFile(manifestPath, []byte(manifestContent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := spine.NewFromFile(manifestPath, filepath.Join(dir, "open.db")); err == nil {
+		t.Fatal("expected startup to fail on an empty access key, got success")
+	} else if !strings.Contains(err.Error(), "empty key") {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// Positive control: the same manifest starts fine once the env var is set.
+	t.Setenv("SPINE_TEST_UNSET_KEY", "sk_ok_key")
+	eng, err := spine.NewFromFile(manifestPath, filepath.Join(dir, "ok.db"))
+	if err != nil {
+		t.Fatalf("manifest with a set key must load: %v", err)
+	}
+	eng.Close()
+}
+
 func setupAccessEngine(t *testing.T) (*spine.Engine, func()) {
 	t.Helper()
 	dir := t.TempDir()

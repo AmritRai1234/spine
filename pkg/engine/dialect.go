@@ -19,22 +19,32 @@ type dialect struct {
 	// rowIDCol names the implicit per-row identifier usable in SELECT lists
 	// ("rowid" on SQLite/libSQL, the engine's surrogate PK on PostgreSQL).
 	rowIDCol string
+	// idemInsertPrefix opens an idempotent single-row insert. SQLite/Turso use
+	// "INSERT OR IGNORE INTO"; PostgreSQL uses "INSERT INTO" plus
+	// idemConflictSuffix (" ON CONFLICT (...) DO NOTHING") — "OR IGNORE" is
+	// SQLite-only syntax and would be a syntax error on PG.
+	idemInsertPrefix   string
+	idemConflictSuffix string
 }
 
 var (
 	sqliteDialect = dialect{
-		name:        "sqlite3",
-		placeholder: func(int) string { return "?" },
-		autoIncPK:   `INTEGER PRIMARY KEY AUTOINCREMENT`,
-		listTables:  `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`,
-		rowIDCol:    `rowid`,
+		name:               "sqlite3",
+		placeholder:        func(int) string { return "?" },
+		autoIncPK:          `INTEGER PRIMARY KEY AUTOINCREMENT`,
+		listTables:         `SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'`,
+		rowIDCol:           `rowid`,
+		idemInsertPrefix:   `INSERT OR IGNORE INTO`,
+		idemConflictSuffix: ``,
 	}
 	postgresDialect = dialect{
-		name:        "pgx",
-		placeholder: func(n int) string { return "$" + strconv.Itoa(n) },
-		autoIncPK:   `BIGSERIAL PRIMARY KEY`,
-		listTables:  `SELECT table_name AS name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`,
-		rowIDCol:    `_spine_id`,
+		name:               "pgx",
+		placeholder:        func(n int) string { return "$" + strconv.Itoa(n) },
+		autoIncPK:          `BIGSERIAL PRIMARY KEY`,
+		listTables:         `SELECT table_name AS name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`,
+		rowIDCol:           `_spine_id`,
+		idemInsertPrefix:   `INSERT INTO`,
+		idemConflictSuffix: ` ON CONFLICT ("key") DO NOTHING`,
 	}
 )
 

@@ -801,6 +801,11 @@ spine version
 | `--db` | `spine.db` | SQLite database path or Turso URL |
 | `--api-key` | — | API key for authenticated endpoints |
 | `--rate-limit` | — | Requests per second (enables rate limiting) |
+| `--domain` | — | Enable **free auto-HTTPS** via Let's Encrypt; repeatable. Binds `:443` (or `--tls-port`) and `:80` for ACME challenges with HTTP→HTTPS redirect |
+| `--acme-email` | — | Optional Let's Encrypt account contact (expiry notices) |
+| `--cert-cache` | `spine_certs` | Certificate cache directory (persists issued certs across restarts) |
+| `--tls-cert` / `--tls-key` | — | Serve a provided PEM certificate instead of Let's Encrypt |
+| `--tls-port` | `443` | HTTPS listen port when `--domain` is set |
 
 ### Environment Variables
 
@@ -809,6 +814,32 @@ spine version
 | `SPINE_PORT` | Server port (overrides `--port`) |
 | `SPINE_DB` | Database path (overrides `--db`) |
 | `SPINE_API_KEY` | API key (overrides `--api-key`) |
+| `SPINE_TLS_DOMAINS` | Comma-separated domains (adds to `--domain` list) |
+| `SPINE_ACME_EMAIL` | ACME contact (overrides `--acme-email`) |
+| `SPINE_CERT_CACHE` | Cert cache dir (overrides `--cert-cache`) |
+| `SPINE_CORS_ORIGINS` | Comma-separated explicit origins → credentialed CORS allowlist (default: wildcard origin WITHOUT credentials; credentials + `*` is refused) |
+| `SPINE_WS_ORIGINS` | Comma-separated origins allowed for WebSocket upgrade (`*` = all) |
+| `SPINE_WS_MAX_CONNS` | Max concurrent WebSocket connections (default: 10000; excess upgrades get 503) |
+| `SPINE_ALLOW_UNSIGNED_WEBHOOKS` | `1` = accept unsigned webhooks when no secret is configured (default: fail closed with 503) |
+| `SPINE_WEBHOOK_SECRET_<PROVIDER>` (or `<PROVIDER>_WEBHOOK_SECRET`) | HMAC-SHA256 secret for a webhook provider |
+
+### Free Automatic HTTPS (Let's Encrypt)
+
+Any website built with Spine gets TLS certificates **free and automatic** via the ACME protocol. Point the domain's DNS at your host, open ports 80 + 443, and pass `--domain`:
+
+```bash
+spine serve app.spine --domain shop.example.com --acme-email you@example.com
+```
+
+Spine then:
+
+1. Provisions a trusted certificate from Let's Encrypt on first start (`HTTP-01` challenge on port 80)
+2. Serves HTTPS on `:443` with TLS 1.2+ only
+3. Auto-renews before expiry — certificates are cached in `spine_certs/`, so restarts never re-issue (Let's Encrypt rate limits are strict)
+4. Redirects all plain-HTTP traffic on port 80 to HTTPS
+5. Refuses issuance for any hostname outside the `--domain` list (prevents certificate-issuance abuse)
+
+Prefer your own certificates? Skip `--domain` and use `--tls-cert cert.pem --tls-key key.pem`.
 
 ### Database Drivers
 
@@ -883,13 +914,24 @@ Emit() → Contract Validation → Route Steps → Sharded Writer → Batch Flus
 
 6. **Graceful Shutdown**: Handles `SIGINT` / `SIGTERM` with 10-second drain timeout. Ensures in-flight requests complete and batch writer flushes before exit.
 
+7. **Free Automatic HTTPS (Let's Encrypt)**: Built-in ACME support (`--domain`) provisions and auto-renews trusted TLS certificates for any Spine site, caches them on disk, redirects HTTP→HTTPS, whitelists issuance to declared domains only, and enforces TLS 1.2+.
+
 7. **Durable Outbox Queue**: Outbound webhooks stored in `_spine_outbox` table. Pending retries survive process crashes and are automatically retried on restart.
+
+8. **Durable Batch Writes**: The batched writer never silently drops a batch — busy commits are retried, persistent failures spill to `_spine_write_spill` for replay, and `spine_commit_failures` / `spine_spill_writes` / `spine_lost_writes` counters are exposed on `/metrics`.
+
+9. **CORS Safe Defaults**: Credentials are off by default (wildcard origin). Setting `SPINE_CORS_ORIGINS` enables credentialed cross-origin against an explicit allowlist only — reflecting arbitrary origins with credentials is refused.
+
+10. **WebSocket Hardening**: Connections are capped (`SPINE_WS_MAX_CONNS`), unauthenticated sockets are closed with `4001` after a 5s auth deadline, event-log replay is auth-gated, and ping/pong keepalive reaps dead peers (45s pong wait).
 
 ---
 
 ## Performance & Benchmarks
 
-Measured on AMD Ryzen 7 5825U (16 threads):
+Measured on AMD Ryzen 7 5825U (16 threads). All numbers are **in-process**
+micro-benchmarks: they call `Bus.Emit` directly and exclude HTTP, WebSocket,
+and network I/O (see `tests/benchmark_test.go`). For end-to-end HTTP
+comparisons against a traditional server, run `benchmarks/run-benchmarks.ts`.
 
 | Benchmark | ops/sec | ns/op | B/op | allocs/op |
 |---|---|---|---|---|

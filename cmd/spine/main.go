@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -12,6 +13,7 @@ import (
 
 	spine "github.com/AmritRai1234/spine"
 	"github.com/AmritRai1234/spine/pkg/codegen"
+	"github.com/AmritRai1234/spine/pkg/engine"
 	"github.com/AmritRai1234/spine/pkg/manifest"
 	"github.com/AmritRai1234/spine/pkg/templates"
 )
@@ -94,11 +96,19 @@ func cmdServe(args []string) {
 		port         string
 		apiKey       string
 		rateLimit    float64
+		tlsDomains   []string
+		acmeEmail    string
+		certCache    string
+		tlsCert      string
+		tlsKey       string
+		tlsPort      string
 	)
 
 	// Defaults
 	dbPath = "spine.db"
 	port = "8080"
+	certCache = engine.DefaultCertCacheDir
+	tlsPort = "443"
 
 	// Parse flags manually for clean CLI UX
 	for i := 0; i < len(args); i++ {
@@ -111,17 +121,31 @@ Options:
   --db <path>         Database path (default: spine.db)
   --api-key <key>     Require API key for protected endpoints
   --rate-limit <rps>  Enable rate limiting at N requests/sec
+  --domain <name>     Enable free auto-HTTPS (Let's Encrypt); repeatable.
+                      Binds :443 (or --tls-port) for TLS and :80 for ACME
+                      challenges with HTTP→HTTPS redirect.
+  --acme-email <addr> Optional Let's Encrypt account contact
+  --cert-cache <dir>  Certificate cache directory (default: spine_certs)
+  --tls-cert <file>   Serve a provided PEM certificate instead of Let's Encrypt
+  --tls-key <file>    Private key for --tls-cert
+  --tls-port <port>   HTTPS listen port when --domain is set (default: 443)
   -h, --help          Show this help
 
 Environment:
   SPINE_API_KEY       API key (overrides --api-key)
   SPINE_PORT          Server port (overrides --port)
   SPINE_DB            Database path (overrides --db)
+  SPINE_TLS_DOMAINS   Comma-separated domains (adds to --domain list)
+  SPINE_ACME_EMAIL    ACME contact (overrides --acme-email)
+  SPINE_CERT_CACHE    Cert cache dir (overrides --cert-cache)
 
 Examples:
   spine serve app.spine
   spine serve app.spine --port 3000 --api-key secret123
   spine serve app.spine --db turso://mydb.turso.io --rate-limit 1000
+
+  # Free automatic HTTPS via Let's Encrypt (DNS must point at this host):
+  spine serve app.spine --domain shop.example.com --acme-email you@example.com
 `)
 			return
 		case "--port":
@@ -142,14 +166,47 @@ Examples:
 		case "--rate-limit":
 			i++
 			if i < len(args) {
-				fmt.Sscanf(args[i], "%f", &rateLimit)
+				if _, err := fmt.Sscanf(args[i], "%f", &rateLimit); err != nil {
+					fmt.Fprintf(os.Stderr, "Invalid --rate-limit value: %s\n", args[i])
+					return
+				}
+			}
+		case "--domain":
+			i++
+			if i < len(args) {
+				tlsDomains = append(tlsDomains, args[i])
+			}
+		case "--acme-email":
+			i++
+			if i < len(args) {
+				acmeEmail = args[i]
+			}
+		case "--cert-cache":
+			i++
+			if i < len(args) {
+				certCache = args[i]
+			}
+		case "--tls-cert":
+			i++
+			if i < len(args) {
+				tlsCert = args[i]
+			}
+		case "--tls-key":
+			i++
+			if i < len(args) {
+				tlsKey = args[i]
+			}
+		case "--tls-port":
+			i++
+			if i < len(args) {
+				tlsPort = args[i]
 			}
 		default:
 			if !strings.HasPrefix(args[i], "-") && manifestPath == "" {
 				manifestPath = args[i]
 			} else {
 				fmt.Fprintf(os.Stderr, "Unknown option: %s\n", args[i])
-				os.Exit(1)
+				return
 			}
 		}
 	}
@@ -164,11 +221,24 @@ Examples:
 	if v := os.Getenv("SPINE_API_KEY"); v != "" {
 		apiKey = v
 	}
+	if v := os.Getenv("SPINE_TLS_DOMAINS"); v != "" {
+		for _, d := range strings.Split(v, ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				tlsDomains = append(tlsDomains, d)
+			}
+		}
+	}
+	if v := os.Getenv("SPINE_ACME_EMAIL"); v != "" {
+		acmeEmail = v
+	}
+	if v := os.Getenv("SPINE_CERT_CACHE"); v != "" {
+		certCache = v
+	}
 
 	if manifestPath == "" {
 		fmt.Fprintln(os.Stderr, "Error: manifest file path required")
 		fmt.Fprintln(os.Stderr, "Usage: spine serve <manifest.spine>")
-		os.Exit(1)
+		return
 	}
 
 	// Parse manifest
@@ -180,7 +250,7 @@ Examples:
 	eng, err := spine.NewFromFile(manifestPath, dbPath)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "✗ Failed to initialize: %v\n", err)
-		os.Exit(1)
+		return
 	}
 	defer eng.Close()
 
@@ -198,15 +268,57 @@ Examples:
 		fmt.Printf("   rate:     %.0f req/s\n", rateLimit)
 	}
 
+	// TLS mode: Let's Encrypt (--domain) or provided cert (--tls-cert/--tls-key)
+	if len(tlsDomains) > 0 || tlsCert != "" || tlsKey != "" {
+		cfg := &engine.TLSConfig{
+			Domains:  tlsDomains,
+			Email:    acmeEmail,
+			CacheDir: certCache,
+			CertFile: tlsCert,
+			KeyFile:  tlsKey,
+		}
+		mode := "Let's Encrypt (auto-renewed)"
+		if tlsCert != "" {
+			mode = "provided certificate"
+		}
+		fmt.Printf("   https:    %v via %s\n", orFirst(tlsDomains, "(cert files)"), mode)
+		fmt.Printf("   tls port: :%s\n", tlsPort)
+		fmt.Println("  Press Ctrl+C to stop")
+
+		var err error
+		if len(tlsDomains) > 0 {
+			err = eng.ListenAndServeTLS(":"+tlsPort, cfg)
+		} else {
+			err = eng.ListenAndServeTLS(addrOf(port), cfg)
+		}
+		if err != nil && err != http.ErrServerClosed {
+			fmt.Fprintf(os.Stderr, "✗ Server error: %v\n", err)
+			return
+		}
+		fmt.Println("✓ Shutdown complete")
+		return
+	}
+
 	addr := ":" + port
 	fmt.Printf("\n✓ Listening on http://0.0.0.0%s\n", addr)
 	fmt.Println("  Press Ctrl+C to stop")
 
 	if err := eng.ListenAndServe(addr); err != nil && err != http.ErrServerClosed {
 		fmt.Fprintf(os.Stderr, "✗ Server error: %v\n", err)
-		os.Exit(1)
+		return
 	}
 	fmt.Println("✓ Shutdown complete")
+}
+
+func orFirst(list []string, fallback string) string {
+	if len(list) == 0 {
+		return fallback
+	}
+	return list[0]
+}
+
+func addrOf(port string) string {
+	return ":" + port
 }
 
 // ─── emit ────────────────────────────────────────────────────────────────────
@@ -823,6 +935,38 @@ SPINE_DB=spine.db
 	fmt.Printf("Run 'spine dev app.spine' to start your local dev server.\n")
 }
 
+// loadDotEnv reads KEY=VALUE pairs from a .env file into the process
+// environment. Existing environment variables always win; malformed lines are
+// skipped silently. Supports `export ` prefixes, blank lines and # comments.
+func loadDotEnv(path string) {
+	f, err := os.Open(path)
+	if err != nil {
+		return // No .env — nothing to do
+	}
+	defer f.Close()
+
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		line := strings.TrimSpace(sc.Text())
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		line = strings.TrimPrefix(line, "export ")
+		idx := strings.Index(line, "=")
+		if idx <= 0 {
+			continue
+		}
+		key := strings.TrimSpace(line[:idx])
+		val := strings.TrimSpace(line[idx+1:])
+		if len(val) >= 2 && (val[0] == '"' && val[len(val)-1] == '"' || val[0] == '\'' && val[len(val)-1] == '\'') {
+			val = val[1 : len(val)-1]
+		}
+		if _, exists := os.LookupEnv(key); !exists {
+			os.Setenv(key, val)
+		}
+	}
+}
+
 func cmdDev(args []string) {
 	var (
 		manifestPath string = "app.spine"
@@ -865,6 +1009,10 @@ Starts a hot-reloading development server (manifest + includes are watched).
 		fmt.Fprintf(os.Stderr, "✗ Manifest file '%s' not found. Run 'spine init' to create one.\n", manifestPath)
 		os.Exit(1)
 	}
+
+	// Auto-load .env from the manifest directory (does not override existing
+	// environment) — kills the manual `ADMIN_SECRET=… export` dance.
+	loadDotEnv(filepath.Join(filepath.Dir(manifestPath), ".env"))
 
 	fmt.Printf("\033[36m[SPINE DEV]\033[0m Starting Spine Dev Server on http://localhost:%s (hot-reload enabled)\n", port)
 	fmt.Printf("\033[36m[SPINE DEV]\033[0m Database: %s | Manifest: %s\n", dbPath, manifestPath)

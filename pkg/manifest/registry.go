@@ -5,7 +5,6 @@ import (
 	"strconv"
 	"strings"
 	"sync/atomic"
-	"unsafe"
 )
 
 // registryData holds the immutable snapshot — swapped atomically.
@@ -20,7 +19,7 @@ type registryData struct {
 // Registry holds the parsed schema indexed for fast event→route lookups.
 // Uses atomic pointer swap for lock-free reads on the hot path.
 type Registry struct {
-	data unsafe.Pointer // *registryData
+	data atomic.Pointer[registryData] // *registryData
 }
 
 // NewRegistry builds a Registry from a parsed schema.
@@ -55,12 +54,12 @@ func NewRegistry(schema *SpineSchema) *Registry {
 	}
 
 	reg := &Registry{}
-	atomic.StorePointer(&reg.data, unsafe.Pointer(d))
+	reg.data.Store(d)
 	return reg
 }
 
 func (r *Registry) load() *registryData {
-	return (*registryData)(atomic.LoadPointer(&r.data))
+	return r.data.Load()
 }
 
 // ValidatePayload checks a payload against the schema-defined types for an event.

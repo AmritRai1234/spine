@@ -34,7 +34,7 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 	switch step.Action {
 	case "db.insert":
 		if step.Table != "" {
-			return b.dbInsert(step.Table, eventName, payload)
+			return b.dbInsert(step, eventName, payload)
 		}
 	case "db.update":
 		if step.Table != "" {
@@ -64,8 +64,20 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		if step.Table != "" {
 			return b.dbDelete(step.Table, step.Where, eventName, payload)
 		}
+	case "db.lookup":
+		return b.dbLookup(step, eventName, payload)
+	case "db.adjust":
+		return b.dbAdjust(step, eventName, payload)
+	case "assert":
+		return b.assertCondition(step, eventName, payload)
+	case "unset":
+		return b.unsetFields(step, eventName, payload)
+	case "notify.webhook":
+		return b.notifyWebhook(step, eventName, payload)
 	case "set":
 		return b.setFields(step, eventName, payload)
+	case "math.calc":
+		return b.mathCalc(step, eventName, payload)
 	case "http.post":
 		return b.httpPost(step, eventName, payload)
 	case "log.write":
@@ -201,6 +213,56 @@ func (b *Bus) setFields(step *manifest.RouteStep, eventName string, payload map[
 	for key, val := range step.Config {
 		resolved := ResolveVariables(val, eventName, payload)
 		payload[key] = resolved
+	}
+	return nil
+}
+
+// unsetFields removes keys from the event payload. Config "fields" holds a
+// space-separated list of key names. Used after db.lookup to prune merged
+// helper columns (product_*, coupon_*) before a db.insert persists the payload.
+func (b *Bus) unsetFields(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
+	for _, field := range strings.Fields(step.Config["fields"]) {
+		delete(payload, field)
+	}
+	return nil
+}
+
+// assertCondition turns a guard expression into a hard failure: when the
+// condition does not hold the step errors (triggering on_failure), unlike an
+// `if:` which merely skips. This is what makes server-side guards — price
+// mismatches, oversold stock — reject a route instead of silently passing.
+func (b *Bus) assertCondition(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
+	cond := step.Config["condition"]
+	if cond == "" {
+		return fmt.Errorf("assert step requires 'condition' config")
+	}
+	if EvaluateCondition(cond, eventName, payload) {
+		return nil
+	}
+	// `message` is a parser-known step key (step.Message); Config fallback
+	// keeps hand-constructed steps working too.
+	msg := ResolveVariables(step.Message, eventName, payload)
+	if msg == "" {
+		msg = ResolveVariables(step.Config["message"], eventName, payload)
+	}
+	if msg == "" {
+		msg = cond
+	}
+	return fmt.Errorf("assert failed: %s", msg)
+}
+
+// notifyWebhook posts the event payload to a webhook URL, silently no-opping
+// when the URL resolves empty (e.g. $env.ALERT_WEBHOOK_URL not configured).
+// Failures flow through the durable outbox for retries, like http.post.
+func (b *Bus) notifyWebhook(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
+	targetURL := ResolveVariables(step.URL, eventName, payload)
+	if targetURL == "" {
+		return nil // Not configured — notifications disabled, never fail the route
+	}
+	post := *step
+	post.URL = targetURL
+	if err := b.httpPost(&post, eventName, payload); err != nil {
+		return err
 	}
 	return nil
 }

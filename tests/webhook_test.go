@@ -12,6 +12,10 @@ import (
 )
 
 func TestWebhookIngestion(t *testing.T) {
+	// Allow unsigned webhooks for backward-compatible test
+	os.Setenv("SPINE_ALLOW_UNSIGNED_WEBHOOKS", "1")
+	defer os.Unsetenv("SPINE_ALLOW_UNSIGNED_WEBHOOKS")
+
 	dir := t.TempDir()
 	manifestPath := filepath.Join(dir, "app.spine")
 	dbPath := filepath.Join(dir, "spine.db")

@@ -2,6 +2,8 @@ package engine
 
 import (
 	"encoding/json"
+	"log"
+	"strings"
 	"sync"
 	"time"
 
@@ -9,7 +11,8 @@ import (
 )
 
 // initOutboxTable creates the _spine_outbox table for persistent webhook retries.
-func (b *Bus) initOutboxTable() {
+// Returns an error so startup fails fast when the database is unwritable.
+func (b *Bus) initOutboxTable() error {
 	query := `CREATE TABLE IF NOT EXISTS "_spine_outbox" (
 		id ` + b.dialect.autoIncPK + `,
 		action TEXT NOT NULL,
@@ -20,10 +23,23 @@ func (b *Bus) initOutboxTable() {
 		next_retry_at TEXT NOT NULL,
 		created_at TEXT NOT NULL
 	)`
-	b.db.Exec(query)
-	b.db.Exec(`CREATE INDEX IF NOT EXISTS "idx_spine_outbox_status" ON "_spine_outbox"("status", "next_retry_at")`)
-	// Ensure step_data column exists on upgraded schemas
-	b.db.Exec(`ALTER TABLE "_spine_outbox" ADD COLUMN step_data TEXT DEFAULT ''`)
+	if _, err := b.db.Exec(query); err != nil {
+		return err
+	}
+	if _, err := b.db.Exec(`CREATE INDEX IF NOT EXISTS "idx_spine_outbox_status" ON "_spine_outbox"("status", "next_retry_at")`); err != nil {
+		return err
+	}
+	// Ensure step_data column exists on upgraded schemas. A duplicate-column
+	// error is tolerated (SQLite: "duplicate column name"; PostgreSQL:
+	// SQLSTATE 42701 "column ... already exists" — there is no portable
+	// ADD COLUMN IF NOT EXISTS).
+	if _, err := b.db.Exec(`ALTER TABLE "_spine_outbox" ADD COLUMN step_data TEXT DEFAULT ''`); err != nil {
+		msg := err.Error()
+		if !strings.Contains(msg, "duplicate column") && !strings.Contains(msg, "already exists") {
+			return err
+		}
+	}
+	return nil
 }
 
 // EnqueueOutboxStep enqueues a persistent retry task into _spine_outbox table with full RouteStep context.
@@ -69,10 +85,16 @@ func (b *Bus) enqueueOutboxStep(step *manifest.RouteStep, action string, payload
 	now := time.Now().UTC()
 	nextRetry := now.Add(time.Duration(backoffMs) * time.Millisecond).Format(time.RFC3339)
 
-	insertSQL := `INSERT INTO "_spine_outbox" (action, payload, step_data, attempts, status, next_retry_at, created_at) VALUES (?, ?, ?, 1, 'pending', ?, ?)`
+	insertSQL := `INSERT INTO "_spine_outbox" (action, payload, step_data, attempts, status, next_retry_at, created_at) VALUES (` + b.ph(1) + `, ` + b.ph(2) + `, ` + b.ph(3) + `, 1, 'pending', ` + b.ph(4) + `, ` + b.ph(5) + `)`
 	params := []interface{}{action, string(payloadBytes), stepDataStr, nextRetry, now.Format(time.RFC3339)}
 
-	b.writer.submitAny(dbTask{query: insertSQL, params: params})
+	if !b.writer.submitAny(dbTask{query: insertSQL, params: params}) {
+		// All shards saturated — fall back to a synchronous write so the
+		// outbox task is never silently lost.
+		if err := execWithRetry(b.db, insertSQL, params...); err != nil {
+			log.Printf("[outbox] enqueue fallback failed (outbox task lost): %v", err)
+		}
+	}
 
 	// Notify the processor to wake up immediately
 	select {

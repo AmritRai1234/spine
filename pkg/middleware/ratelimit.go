@@ -155,11 +155,14 @@ func (m *RateLimitManager) ExtractIP(r *http.Request) string {
 	m.trustedMu.RLock()
 	trustAll := m.trustedProxies["*"]
 	isTrusted := trustAll || m.trustedProxies[remoteIP]
-	proxyCount := len(m.trustedProxies)
 	m.trustedMu.RUnlock()
 
-	// If request comes from a trusted proxy (or trust mode is wildcard), parse proxy headers
-	if isTrusted || proxyCount == 0 {
+	// If request comes from a trusted proxy (or trust mode is wildcard), parse proxy headers.
+	// Proxy headers are NEVER honored when no trusted proxies are configured:
+	// X-Forwarded-For is trivially client-spoofable (MDN: security uses of
+	// X-Forwarded-For "must only use IP addresses added by a trusted proxy"),
+	// and honoring it by default lets anyone bypass or weaponize rate limits.
+	if isTrusted {
 		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
 			parts := strings.Split(xff, ",")
 			clientIP := strings.TrimSpace(parts[0])

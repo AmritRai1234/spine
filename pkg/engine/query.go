@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -364,8 +365,9 @@ func (b *Bus) GetEventLogs(eventName string, limit, offset int) ([]map[string]in
 
 // initEventTable creates the _spine_events system table for automatic event audit logging.
 // Statements are executed separately — some drivers (pgx extended protocol)
-// reject multi-statement strings.
-func (b *Bus) initEventTable() {
+// reject multi-statement strings. Returns an error so startup fails fast when
+// the database is unwritable.
+func (b *Bus) initEventTable() error {
 	query := `CREATE TABLE IF NOT EXISTS "_spine_events" (
 		id ` + b.dialect.autoIncPK + `,
 		event_name TEXT NOT NULL,
@@ -373,8 +375,11 @@ func (b *Bus) initEventTable() {
 		emitted_states TEXT,
 		created_at TEXT NOT NULL
 	)`
-	b.db.Exec(query)
-	b.db.Exec(`CREATE INDEX IF NOT EXISTS "idx_spine_events_name" ON "_spine_events"("event_name")`)
+	if _, err := b.db.Exec(query); err != nil {
+		return err
+	}
+	_, err := b.db.Exec(`CREATE INDEX IF NOT EXISTS "idx_spine_events_name" ON "_spine_events"("event_name")`)
+	return err
 }
 
 // logEventAudit enqueues an event emission to the _spine_events audit table.
@@ -396,6 +401,9 @@ func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitte
 
 	params := []interface{}{event, payloadStr, statesStr, nowStr}
 
-	b.writer.submitAny(dbTask{query: b.auditSQL, params: params})
-	// Non-blocking: submitAny silently drops if all shards saturated
+	if !b.writer.submitAny(dbTask{query: b.auditSQL, params: params}) {
+		// Non-blocking: audit is best-effort, but the drop is counted so it
+		// is visible on /metrics instead of being fully silent.
+		atomic.AddUint64(&b.droppedAudit, 1)
+	}
 }

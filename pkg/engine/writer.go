@@ -2,6 +2,8 @@ package engine
 
 import (
 	"database/sql"
+	"fmt"
+	"log"
 	"runtime"
 	"strings"
 	"sync/atomic"
@@ -126,20 +128,147 @@ func fnvHash(s string) uint32 {
 
 // execWithRetry retries a SQL statement up to 5 times on lock/busy errors.
 func execWithRetry(db *sql.DB, query string, params ...interface{}) error {
+	_, err := execWithRetryResult(db, query, params...)
+	return err
+}
+
+// execWithRetryResult is execWithRetry for statements whose sql.Result matters
+// (e.g. RowsAffected checks in db.adjust).
+func execWithRetryResult(db *sql.DB, query string, params ...interface{}) (sql.Result, error) {
 	var err error
+	var res sql.Result
 	for attempt := 0; attempt < 5; attempt++ {
-		_, err = db.Exec(query, params...)
+		res, err = db.Exec(query, params...)
 		if err == nil {
-			return nil
+			return res, nil
 		}
 		errStr := err.Error()
 		if strings.Contains(errStr, "locked") || strings.Contains(errStr, "busy") {
 			time.Sleep(time.Duration(10*(1<<attempt)) * time.Millisecond)
 			continue
 		}
-		return err
+		return nil, err
 	}
-	return err
+	return nil, err
+}
+
+// isLockBusyErr reports whether err is a SQLite/Turso lock or busy failure
+// ("database is locked", "database table is locked", "database is busy").
+// These are the only errors safe to retry at the whole-batch level: under WAL
+// a busy COMMIT means the transaction was NOT applied, so re-executing the
+// batch cannot duplicate rows.
+func isLockBusyErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	s := err.Error()
+	return strings.Contains(s, "locked") || strings.Contains(s, "busy")
+}
+
+// beginWithRetry begins a transaction, retrying on lock/busy failures with
+// exponential backoff. Only Begin is retried here — nothing has executed yet,
+// so a retry is always safe.
+func beginWithRetry(db *sql.DB) (*sql.Tx, error) {
+	var tx *sql.Tx
+	var err error
+	for attempt := 0; attempt < 5; attempt++ {
+		tx, err = db.Begin()
+		if err == nil {
+			return tx, nil
+		}
+		if !isLockBusyErr(err) {
+			return nil, err
+		}
+		time.Sleep(time.Duration(10*(1<<attempt)) * time.Millisecond)
+	}
+	return nil, err
+}
+
+// testCommitHook is a fault-injection seam for the batch writer (test-only).
+// Holds a *func() error or nil.
+var testCommitHook atomic.Value
+
+// SetCommitFailureHook installs (or clears, with nil) a hook invoked in place
+// of tx.Commit inside the batch writer. Test-only fault injection — used by
+// the durability suite to prove a failed commit is retried and, when it
+// persists, spilled rather than silently dropped.
+func SetCommitFailureHook(fn func() error) {
+	if fn == nil {
+		testCommitHook.Store((*func() error)(nil))
+		return
+	}
+	testCommitHook.Store(&fn)
+}
+
+// flushBatchOnce executes tasks in a single transaction, returning the first
+// fatal error (Begin/Commit). Per-statement errors are logged and do not abort
+// the batch (the tasks are independent writes).
+func flushBatchOnce(db *sql.DB, tasks []dbTask) error {
+	tx, err := beginWithRetry(db)
+	if err != nil {
+		return fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback() // no-op after a successful Commit
+
+	// Prepared statement cache within this transaction.
+	// Reusing stmts eliminates sqlite3_prepare_v2 overhead (31% of CPU).
+	stmtCache := make(map[string]*sql.Stmt, 8)
+	defer func() {
+		for _, s := range stmtCache {
+			s.Close()
+		}
+	}()
+
+	for _, task := range tasks {
+		stmt, ok := stmtCache[task.query]
+		if !ok {
+			stmt, err = tx.Prepare(task.query)
+			if err != nil {
+				// Fallback: direct exec
+				if _, execErr := tx.Exec(task.query, task.params...); execErr != nil {
+					log.Printf("[batch] exec error: %v", execErr)
+				}
+				continue
+			}
+			stmtCache[task.query] = stmt
+		}
+		if _, err := stmt.Exec(task.params...); err != nil {
+			log.Printf("[batch] exec error: %v", err)
+		}
+	}
+
+	if h, _ := testCommitHook.Load().(*func() error); h != nil {
+		if err := (*h)(); err != nil {
+			return fmt.Errorf("commit transaction: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("commit transaction: %w", err)
+	}
+	return nil
+}
+
+// flushBatchWithRetry executes tasks in a transaction, retrying the WHOLE
+// batch on lock/busy failures. This is safe under WAL: a busy COMMIT means the
+// transaction was NOT applied, so re-executing cannot duplicate rows. A
+// failed Commit leaves the transaction in an unknown state, so it is never
+// retried in place — only the full batch is. Non-busy errors return
+// immediately and the caller decides (spill) what to do with the batch.
+func flushBatchWithRetry(db *sql.DB, tasks []dbTask) error {
+	var lastErr error
+	for attempt := 0; attempt < 3; attempt++ {
+		lastErr = flushBatchOnce(db, tasks)
+		if lastErr == nil {
+			return nil
+		}
+		if !isLockBusyErr(lastErr) {
+			return lastErr
+		}
+		if attempt < 2 {
+			time.Sleep(time.Duration(10*(1<<attempt)) * time.Millisecond)
+		}
+	}
+	return lastErr
 }
 
 // deepCopyPayload creates a deep copy of a payload map using recursive structural
