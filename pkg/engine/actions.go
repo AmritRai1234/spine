@@ -88,6 +88,12 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		return b.emitToBridge(step, eventName, payload)
 	case "queue.publish":
 		return b.queuePublish(step, eventName, payload)
+	case "email.send":
+		return b.emailSend(step, eventName, payload)
+	case "email.broadcast":
+		return b.emailBroadcast(step, eventName, payload)
+	case "stripe.checkout":
+		return b.stripeCheckout(step, eventName, payload)
 	default:
 		if val, ok := b.customActions.Load(step.Action); ok {
 			if fn, isFn := val.(ActionFunc); isFn {

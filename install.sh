@@ -4,7 +4,7 @@ set -e
 # Spine One-Line Universal Installer Script
 # Usage: curl -fsSL https://raw.githubusercontent.com/AmritRai1234/spine/main/install.sh | bash
 
-SPINE_VERSION="2.3.0"
+SPINE_VERSION="3.0.0"
 INSTALL_DIR="/usr/local/bin"
 
 # Fallback to user local bin if /usr/local/bin is not writable

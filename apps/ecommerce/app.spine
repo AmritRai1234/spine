@@ -1,4 +1,6 @@
-spine_version: 1
+# Manifest schema version 3 — unlocks the money-movement tier
+# (stripe.checkout) on top of v2's email marketing tier.
+spine_version: 3
 
 # ── Access Control (RLAC) ─────────────────────────────────────────
 # admin:   full access, resolved from $ADMIN_SECRET env var at runtime
@@ -24,6 +26,9 @@ access:
       - PLACE_ORDER
       - ADD_ORDER_ITEM
       - VALIDATE_COUPON
+      - CREATE_CHECKOUT
+      - SUBSCRIBE_EMAIL
+      - UNSUBSCRIBE_EMAIL
 
 # ── Tables (auto-created with schema evolution) ───────────────────
 database:
@@ -37,6 +42,8 @@ database:
     - store_settings
     - shipping_zones
     - tax_rules
+    - subscribers
+    - payments
 
 # ── Nodes & Contracts ─────────────────────────────────────────────
 # owns_files = the AI-codability map: every frontend file belongs to
@@ -135,11 +142,20 @@ nodes:
         payload:
           cart_id: string
           code: string
+      # Tier-3 checkout: shopper requests a Stripe payment session for an
+      # existing order — sends only the order id, never dollar amounts.
+      - event: CREATE_CHECKOUT
+        payload:
+          order_id: string
     listens:
       - state: ORDER_CREATED
         payload:
           order_id: string
           status: string
+      - state: CHECKOUT_READY
+        payload:
+          order_id: string
+          checkout_url: string
       - state: ORDER_STATUS_CHANGED
         payload:
           order_id: string
@@ -222,6 +238,17 @@ nodes:
         payload:
           country: string
           rate: number
+      - event: RECORD_PAYMENT
+        payload:
+          order_id: string
+          provider: string
+          amount: number
+          # Optional extension columns ride along via schema evolution:
+          #   reference, currency, note
+      - event: REFUND_PAYMENT
+        payload:
+          order_id: string
+          amount: number
     listens:
       - state: ORDER_STATUS_CHANGED
         payload:
@@ -230,6 +257,32 @@ nodes:
       - state: STOCK_ADJUSTED
         payload:
           product_id: string
+      - state: PAYMENT_RECORDED
+        payload:
+          order_id: string
+
+  # Lightweight email marketing — engine actions `email.send` / `email.broadcast`
+  # deliver over plain SMTP configured by env (SMTP_HOST/PORT/USER/PASS/FROM).
+  # With SMTP_HOST unset every email step is a silent no-op, so dev never fails.
+  Marketing:
+    owns_files:
+      - web/src/pages/admin/AdminMarketing.tsx
+    emits:
+      - event: SUBSCRIBE_EMAIL
+        payload:
+          email: string
+      - event: UNSUBSCRIBE_EMAIL
+        payload:
+          email: string
+      - event: SEND_CAMPAIGN
+        payload:
+          subject: string
+          body: string
+    listens:
+      - state: SUBSCRIBER_SAVED
+        payload:
+          email: string
+      - state: CAMPAIGN_SENT
 
 # ── Routes (event → action pipelines) ─────────────────────────────
 routes:
@@ -408,6 +461,26 @@ routes:
         updated_at: $now
       - action: db.update
         table: orders
+      # Shipped notification: pull the order row (for the customer's email),
+      # mail only when it exists, then prune the lookup helper columns.
+      # optional: a status flip on a stale/unknown id still succeeds — the
+      # db.update above already landed, so this route must not half-fail.
+      - action: db.lookup
+        table: orders
+        key_column: id
+        value_expr: $event.payload.id
+        as: order_
+        if: "$event.payload.status == 'shipped'"
+        optional: true
+      - action: email.send
+        to: $event.payload.order_email
+        subject: "Order $event.payload.id has shipped"
+        body: "Good news — order $event.payload.id is on its way!\n\nTrack it any time under My Orders."
+        if: "$event.payload.order_email exists"
+        on_failure: EMAIL_FAILED
+      - action: unset
+        fields: "order_id order_cart_id order_email order_status order_created_at order_total order_coupon_code order_coupon_discount order_ship_name order_address1 order_city order_country order_zip"
+        if: "$event.payload.status == 'shipped'"
       - action: log.write
         message: "Order $event.payload.id → $event.payload.status (by $event.payload.actor)"
     emit: ORDER_STATUS_CHANGED
@@ -485,9 +558,51 @@ routes:
       - action: notify.webhook
         url: $env.ALERT_WEBHOOK_URL
         on_failure: NOTIFY_FAILED
+      # Order confirmation email to the shopper — silent no-op without SMTP.
+      - action: email.send
+        to: $event.payload.email
+        subject: "Order $event.payload.order_id confirmed"
+        body: "Thanks for your order!\n\nOrder: $event.payload.order_id\nSubtotal: $event.payload.subtotal\nShipping: $event.payload.shipping_cost\nTax: $event.payload.tax_amount\nTotal: $event.payload.total\n\nWe'll email you again when it ships."
+        on_failure: EMAIL_FAILED
       - action: log.write
         message: "Order placed for cart $event.payload.cart_id by $event.payload.email — total $event.payload.total (subtotal $event.payload.subtotal, shipping $event.payload.shipping_cost, tax $event.payload.tax_amount)"
     emit: ORDER_CREATED
+
+  # Order confirmation mail failure is non-fatal — the order is already saved
+  - on: EMAIL_FAILED
+    steps:
+      - action: log.write
+        message: "[WARN] Confirmation email failed for order: $event.payload.error"
+
+  # ── Tier 3: money movement ───────────────────────────────────────
+  # Shopper requests a Stripe Checkout Session for an existing order. The
+  # server pulls the VERIFIED order row itself — the client sends only the
+  # order id, never dollar amounts. CHECKOUT_READY carries the hosted-page
+  # URL for the redirect. Silent no-op without STRIPE_SECRET_KEY (dev), and
+  # failures route to CHECKOUT_FAILED like any checkout break.
+  - on: CREATE_CHECKOUT
+    on_failure: CHECKOUT_FAILED
+    steps:
+      - action: assert
+        condition: "$event.payload.order_id exists"
+        message: "order_id is required to start checkout"
+      - action: db.lookup
+        table: orders
+        key_column: id
+        value_expr: $event.payload.order_id
+        as: order_
+      - action: stripe.checkout
+        order_id: $event.payload.order_id
+        amount: $event.payload.order_total
+        customer_email: $event.payload.order_email
+        description: "Order $event.payload.order_id"
+        success_url: "$env.STORE_PUBLIC_URL/#/orders"
+        cancel_url: "$env.STORE_PUBLIC_URL/#/catalog"
+      # Prune looked-up helper columns so CHECKOUT_READY carries only what
+      # the storefront needs to redirect.
+      - action: unset
+        fields: "order_cart_id order_email order_status order_created_at order_updated_at order_total order_coupon_code order_coupon_discount order_subtotal order_shipping_cost order_tax_amount order_ship_name order_address1 order_city order_country order_zip"
+    emit: CHECKOUT_READY
 
   # Shopper applies a coupon at checkout — validated server-side, result
   # broadcast back so the cart math uses engine-sourced numbers only.
@@ -518,9 +633,62 @@ routes:
         message: "Coupon saved: $event.payload.code (percent_off=$event.payload.percent_off fixed_off=$event.payload.fixed_off)"
     emit: COUPON_SAVED
 
+  # ── Email marketing ──────────────────────────────────────────────
+  # Newsletter signup from the storefront footer. Upsert by email so a
+  # re-subscribe flips unsubscribed back to 0 instead of duplicating rows.
+  - on: SUBSCRIBE_EMAIL
+    steps:
+      - action: assert
+        condition: "$event.payload.email exists"
+        message: "email is required to subscribe"
+      - action: set
+        id: $uuid
+        created_at: $now
+        unsubscribed: 0
+      - action: db.upsert
+        table: subscribers
+        key: email
+      - action: log.write
+        message: "Newsletter subscriber: $event.payload.email"
+    emit: SUBSCRIBER_SAVED
+
+  # Opt-out — kept forever as an opted-out row so accidental re-imports of
+  # the address never restart marketing mail.
+  - on: UNSUBSCRIBE_EMAIL
+    steps:
+      - action: set
+        unsubscribed: 1
+        updated_at: $now
+      - action: db.update
+        table: subscribers
+        where: "email = '$event.payload.email'"
+      - action: log.write
+        message: "Newsletter opt-out: $event.payload.email"
+    emit: SUBSCRIBER_SAVED
+
+  # Admin broadcast — one step sends to every active subscriber. The engine
+  # resolves {{email}} per recipient and reports the delivered count back
+  # into the payload as `email_sent`.
+  - on: SEND_CAMPAIGN
+    steps:
+      - action: email.broadcast
+        table: subscribers
+        where: "unsubscribed = 0"
+        subject: $event.payload.subject
+        body: $event.payload.body
+      - action: log.write
+        message: "Campaign '$event.payload.subject' delivered to $event.payload.email_sent subscriber(s)"
+    emit: CAMPAIGN_SENT
+
   # Stripe test-mode webhook flips paid sessions to `paid`.
   # Configure the session with client_reference_id = <order_id>; the nested
   # path resolves through data.object.client_reference_id.
+  #
+  # Every capture also writes a row to the payments ledger — server-side
+  # facts only: the session id as reference, and the amount recomputed from
+  # Stripe's cents (the client never states dollar amounts). Duplicate
+  # deliveries are absorbed by the engine's durable idempotency stamp
+  # (_spine_idem keyed on the Stripe event id).
   - on: WEBHOOK_STRIPE
     if: "$event.payload.type == checkout.session.completed"
     steps:
@@ -530,9 +698,86 @@ routes:
         updated_at: $now
       - action: db.update
         table: orders
+      - action: math.calc
+        set: amount
+        expr: "$event.payload.data.object.amount_total / 100"
+      - action: set
+        id: $uuid
+        created_at: $now
+        order_id: $event.payload.data.object.client_reference_id
+        provider: stripe
+        reference: $event.payload.data.object.id
+        currency: $event.payload.data.object.currency
+        kind: payment
+        status: succeeded
+      # Prune the raw webhook envelope + order-update leftovers so only
+      # ledger columns persist.
+      - action: unset
+        fields: "type data _provider _idempotency_key object api_version created livemode request pending_webhook updated_at"
+      - action: db.insert
+        table: payments
       - action: log.write
-        message: "Stripe payment captured for order $event.payload.id"
+        message: "Stripe payment captured for order $event.payload.order_id — $event.payload.amount $event.payload.currency"
     emit: ORDER_STATUS_CHANGED
+
+  # ── Payment ledger (manual/offline money movement) ───────────────
+  # RECORD_PAYMENT books an inbound payment (cash, transfer, POS…); the
+  # provider/reference/note fields come from the payload. Refunds are booked
+  # by REFUND_PAYMENT as negative rows, so net received per order is a plain
+  # SUM(amount) over the ledger.
+  - on: RECORD_PAYMENT
+    steps:
+      - action: assert
+        condition: "$event.payload.order_id exists"
+        message: "order_id is required to record a payment"
+      - action: assert
+        condition: "$event.payload.amount > 0"
+        message: "payment amount must be positive"
+      - action: set
+        id: $uuid
+        created_at: $now
+        kind: payment
+        status: succeeded
+      - action: db.insert
+        table: payments
+      - action: log.write
+        message: "Payment recorded for order $event.payload.order_id — $event.payload.amount via $event.payload.provider"
+    emit: PAYMENT_RECORDED
+
+  # Refunds never exceed net received — the ledger sum guards the ceiling.
+  # Refund rows store a NEGATIVE amount, so net received per order stays a
+  # plain SUM(amount) over the ledger.
+  - on: REFUND_PAYMENT
+    steps:
+      - action: assert
+        condition: "$event.payload.order_id exists"
+        message: "order_id is required to record a refund"
+      - action: assert
+        condition: "$event.payload.amount > 0"
+        message: "refund amount must be positive"
+      - action: db.sum
+        table: payments
+        column: amount
+        where: "order_id = '$event.payload.order_id'"
+        as: net_paid
+      - action: assert
+        condition: "$event.payload.net_paid >= $event.payload.amount"
+        message: "refund of $event.payload.amount exceeds net paid ($event.payload.net_paid) for order $event.payload.order_id"
+      - action: math.calc
+        set: amount
+        expr: "-$event.payload.amount"
+      - action: set
+        id: $uuid
+        created_at: $now
+        kind: refund
+        status: succeeded
+      - action: unset
+        fields: "net_paid"
+      - action: db.insert
+        table: payments
+      - action: log.write
+        message: "Refund recorded for order $event.payload.order_id — $event.payload.amount"
+    emit: PAYMENT_RECORDED
 
   # Admin saves a store setting (KV)
   - on: SAVE_SETTING

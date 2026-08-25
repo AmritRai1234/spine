@@ -74,11 +74,17 @@ export default function App() {
     return () => window.removeEventListener("hashchange", onHash)
   }, [])
 
-  function joinNewsletter(e: FormEvent) {
+  async function joinNewsletter(e: FormEvent) {
     e.preventDefault()
-    if (!newsletterEmail.trim()) return
-    toast.success("You're on the list — first drops land soon.")
-    setNewsletterEmail("")
+    const email = newsletterEmail.trim()
+    if (!email) return
+    try {
+      await spine.emit("SUBSCRIBE_EMAIL", { email })
+      toast.success("You're on the list — first drops land soon.")
+      setNewsletterEmail("")
+    } catch {
+      toast.error("Could not subscribe right now — try again soon.")
+    }
   }
 
   // Cart badge refreshes on every CART_UPDATED broadcast

@@ -1,11 +1,17 @@
 package tests
 
 import (
+	"bytes"
 	"encoding/json"
+	"io"
+	"net"
+	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -15,7 +21,7 @@ import (
 // The ecommerce app manifest — kept in sync with apps/ecommerce/app.spine.
 // CI parses it against a temp DB and pins every public contract plus the
 // Phase-1 integrity rules (stock math, price-guard rejection, cancel-restock).
-const ecommerceManifest = `spine_version: 1
+const ecommerceManifest = `spine_version: 3
 
 database:
   tables:
@@ -28,6 +34,8 @@ database:
     - store_settings
     - shipping_zones
     - tax_rules
+    - subscribers
+    - payments
 
 access:
   - role: admin
@@ -46,6 +54,9 @@ access:
       - PLACE_ORDER
       - ADD_ORDER_ITEM
       - VALIDATE_COUPON
+      - SUBSCRIBE_EMAIL
+      - UNSUBSCRIBE_EMAIL
+      - CREATE_CHECKOUT
 
 nodes:
   Catalog:
@@ -86,6 +97,9 @@ nodes:
         payload:
           cart_id: string
           code: string
+      - event: CREATE_CHECKOUT
+        payload:
+          order_id: string
 
   Storefront:
     emits:
@@ -136,6 +150,35 @@ nodes:
         payload:
           country: string
           rate: number
+      - event: RECORD_PAYMENT
+        payload:
+          order_id: string
+          provider: string
+          amount: number
+      - event: REFUND_PAYMENT
+        payload:
+          order_id: string
+          amount: number
+
+  # Stripe reaches the engine through POST /webhook/stripe ingestion.
+  Payments:
+    emits:
+      - event: WEBHOOK_STRIPE
+        payload:
+          type: string
+
+  Marketing:
+    emits:
+      - event: SUBSCRIBE_EMAIL
+        payload:
+          email: string
+      - event: UNSUBSCRIBE_EMAIL
+        payload:
+          email: string
+      - event: SEND_CAMPAIGN
+        payload:
+          subject: string
+          body: string
 
 routes:
   - on: PUBLISH_PRODUCT
@@ -267,6 +310,21 @@ routes:
         updated_at: $now
       - action: db.update
         table: orders
+      - action: db.lookup
+        table: orders
+        key_column: id
+        value_expr: $event.payload.id
+        as: order_
+        if: "$event.payload.status == 'shipped'"
+        optional: true
+      - action: email.send
+        to: $event.payload.order_email
+        subject: "Order $event.payload.id has shipped"
+        body: "Good news — order $event.payload.id is on its way!"
+        if: "$event.payload.order_email exists"
+      - action: unset
+        fields: "order_id order_cart_id order_email order_status order_created_at order_total"
+        if: "$event.payload.status == 'shipped'"
     emit: ORDER_STATUS_CHANGED
 
   - on: PLACE_ORDER
@@ -319,6 +377,10 @@ routes:
         fields: "coupon_active coupon_percent_off coupon_fixed_off coupon_created_at tax_rate"
       - action: db.insert
         table: orders
+      - action: email.send
+        to: $event.payload.email
+        subject: "Order $event.payload.order_id confirmed"
+        body: "Total: $event.payload.total"
     emit: ORDER_CREATED
 
   - on: VALIDATE_COUPON
@@ -342,6 +404,39 @@ routes:
         key: code
     emit: COUPON_SAVED
 
+  - on: SUBSCRIBE_EMAIL
+    steps:
+      - action: assert
+        condition: "$event.payload.email exists"
+        message: "email is required to subscribe"
+      - action: set
+        id: $uuid
+        created_at: $now
+        unsubscribed: 0
+      - action: db.upsert
+        table: subscribers
+        key: email
+    emit: SUBSCRIBER_SAVED
+
+  - on: UNSUBSCRIBE_EMAIL
+    steps:
+      - action: set
+        unsubscribed: 1
+        updated_at: $now
+      - action: db.update
+        table: subscribers
+        where: "email = '$event.payload.email'"
+    emit: SUBSCRIBER_SAVED
+
+  - on: SEND_CAMPAIGN
+    steps:
+      - action: email.broadcast
+        table: subscribers
+        where: "unsubscribed = 0"
+        subject: $event.payload.subject
+        body: $event.payload.body
+    emit: CAMPAIGN_SENT
+
   - on: SAVE_SHIPPING_ZONE
     steps:
       - action: set
@@ -359,6 +454,107 @@ routes:
         table: tax_rules
         key: country
     emit: TAX_RULE_SAVED
+
+  - on: WEBHOOK_STRIPE
+    if: "$event.payload.type == checkout.session.completed"
+    steps:
+      - action: set
+        id: $event.payload.data.object.client_reference_id
+        status: paid
+        updated_at: $now
+      - action: db.update
+        table: orders
+      - action: math.calc
+        set: amount
+        expr: "$event.payload.data.object.amount_total / 100"
+      - action: set
+        id: $uuid
+        created_at: $now
+        order_id: $event.payload.data.object.client_reference_id
+        provider: stripe
+        reference: $event.payload.data.object.id
+        currency: $event.payload.data.object.currency
+        kind: payment
+        status: succeeded
+      - action: unset
+        fields: "type data _provider _idempotency_key object api_version created livemode request pending_webhook updated_at"
+      - action: db.insert
+        table: payments
+    emit: ORDER_STATUS_CHANGED
+
+  - on: RECORD_PAYMENT
+    steps:
+      - action: assert
+        condition: "$event.payload.order_id exists"
+        message: "order_id is required to record a payment"
+      - action: assert
+        condition: "$event.payload.amount > 0"
+        message: "payment amount must be positive"
+      - action: set
+        id: $uuid
+        created_at: $now
+        kind: payment
+        status: succeeded
+      - action: db.insert
+        table: payments
+    emit: PAYMENT_RECORDED
+
+  - on: REFUND_PAYMENT
+    steps:
+      - action: assert
+        condition: "$event.payload.order_id exists"
+        message: "order_id is required to record a refund"
+      - action: assert
+        condition: "$event.payload.amount > 0"
+        message: "refund amount must be positive"
+      - action: db.sum
+        table: payments
+        column: amount
+        where: "order_id = '$event.payload.order_id'"
+        as: net_paid
+      - action: assert
+        condition: "$event.payload.net_paid >= $event.payload.amount"
+        message: "refund exceeds net paid"
+      - action: math.calc
+        set: amount
+        expr: "-$event.payload.amount"
+      - action: set
+        id: $uuid
+        created_at: $now
+        kind: refund
+        status: succeeded
+      - action: unset
+        fields: "net_paid"
+      - action: db.insert
+        table: payments
+    emit: PAYMENT_RECORDED
+
+  - on: CREATE_CHECKOUT
+    on_failure: CHECKOUT_FAILED
+    steps:
+      - action: assert
+        condition: "$event.payload.order_id exists"
+        message: "order_id is required to start checkout"
+      - action: db.lookup
+        table: orders
+        key_column: id
+        value_expr: $event.payload.order_id
+        as: order_
+      - action: stripe.checkout
+        order_id: $event.payload.order_id
+        amount: $event.payload.order_total
+        customer_email: $event.payload.order_email
+        description: "Order $event.payload.order_id"
+        success_url: "$env.STORE_PUBLIC_URL/#/orders"
+        cancel_url: "$env.STORE_PUBLIC_URL/#/catalog"
+      - action: unset
+        fields: "order_cart_id order_email order_status order_created_at order_updated_at order_total order_coupon_code order_coupon_discount order_subtotal order_shipping_cost order_tax_amount order_ship_name order_address1 order_city order_country order_zip"
+    emit: CHECKOUT_READY
+
+  - on: CHECKOUT_FAILED
+    steps:
+      - action: log.write
+        message: "[ALERT] checkout session failed for order: $event.payload.error"
 `
 
 func setupEcommerceEngine(t *testing.T) (*spine.Engine, func()) {
@@ -1042,5 +1238,444 @@ func TestEcommerceStaffRoleCanFulfilOnly(t *testing.T) {
 	handler.ServeHTTP(rr, req)
 	if rr.Code != 403 {
 		t.Fatalf("staff publish not forbidden: HTTP %d body=%s", rr.Code, rr.Body.String())
+	}
+}
+
+// TestEcommerceEmailMarketing covers the full marketing + transactional flow
+// against a fake SMTP server: newsletter subscribe/opt-out persistence,
+// broadcast filtering (unsubscribed rows never receive mail), {{email}}
+// templating, order confirmation, and shipped notification.
+func TestEcommerceEmailMarketing(t *testing.T) {
+	server := &fakeSMTPServer{}
+	hostPort := server.start(t)
+	host, port, _ := net.SplitHostPort(hostPort)
+	t.Setenv("SMTP_HOST", host)
+	t.Setenv("SMTP_PORT", port)
+	t.Setenv("SMTP_FROM", "store@spine.dev")
+
+	eng, cleanup := setupEcommerceEngine(t)
+	defer cleanup()
+	bus := eng.Bus
+
+	// ── Newsletter lifecycle ──
+	for _, e := range []string{"fan@example.com", "ghost@example.com"} {
+		if res, err := bus.Emit("SUBSCRIBE_EMAIL", map[string]interface{}{"email": e}); err != nil || res["status"] != "ok" {
+			t.Fatalf("subscribe %s failed: %v %v", e, err, res)
+		}
+	}
+	waitUntil(t, "subscribers", func() bool {
+		var n int
+		bus.DB().QueryRow(`SELECT COUNT(*) FROM subscribers`).Scan(&n)
+		return n == 2
+	})
+
+	// Opt-out — row stays, flag flips; resubscribing must re-activate.
+	if res, err := bus.Emit("UNSUBSCRIBE_EMAIL", map[string]interface{}{"email": "ghost@example.com"}); err != nil || res["status"] != "ok" {
+		t.Fatalf("unsubscribe failed: %v %v", err, res)
+	}
+	waitUntil(t, "opt-out", func() bool {
+		var n int
+		bus.DB().QueryRow(`SELECT COUNT(*) FROM subscribers WHERE unsubscribed = 1 AND email = 'ghost@example.com'`).Scan(&n)
+		return n == 1
+	})
+	if res, err := bus.Emit("SUBSCRIBE_EMAIL", map[string]interface{}{"email": "ghost@example.com"}); err != nil {
+		t.Fatalf("resubscribe failed: %v", err)
+	} else if res["status"] != "ok" {
+		t.Fatalf("resubscribe rejected: %v", res)
+	}
+	var active int
+	waitUntil(t, "resubscribe reactivates", func() bool {
+		bus.DB().QueryRow(`SELECT COUNT(*) FROM subscribers WHERE email = 'ghost@example.com' AND unsubscribed = 0`).Scan(&active)
+		return active == 1
+	})
+	var rowCount int
+	bus.DB().QueryRow(`SELECT COUNT(*) FROM subscribers`).Scan(&rowCount)
+	if rowCount != 2 {
+		t.Fatalf("resubscribe duplicated rows: want 2, got %d", rowCount)
+	}
+
+	// Re-opt-out so the broadcast filter has something to exclude.
+	bus.Emit("UNSUBSCRIBE_EMAIL", map[string]interface{}{"email": "ghost@example.com"})
+	waitUntil(t, "second opt-out", func() bool {
+		var n int
+		bus.DB().QueryRow(`SELECT COUNT(*) FROM subscribers WHERE unsubscribed = 1`).Scan(&n)
+		return n == 1
+	})
+
+	// ── Campaign broadcast: only active subscribers get mail ──
+	if res, err := bus.Emit("SEND_CAMPAIGN", map[string]interface{}{
+		"subject": "Flash sale for {{email}}",
+		"body":    "Hey {{email}}, 20% off today only",
+	}); err != nil || res["status"] != "ok" {
+		t.Fatalf("campaign failed: %v %v", err, res)
+	}
+	msgs := server.waitCount(t, 1)
+	if len(msgs) != 1 {
+		t.Fatalf("broadcast should deliver exactly 1 mail, got %d", len(msgs))
+	}
+	data := strings.ReplaceAll(msgs[0].data, "\r\n", "\n")
+	if !strings.Contains(data, "To: fan@example.com") ||
+		!strings.Contains(data, "Subject: Flash sale for fan@example.com") ||
+		!strings.Contains(data, "Hey fan@example.com, 20% off today only") {
+		t.Errorf("campaign mail wrong:\n%s", data)
+	}
+
+	// ── Transactional: order confirmation + shipped notification ──
+	productID := publishProduct(t, bus, "mail-sku", 12.0, 9)
+	orderID := "ord-mail-1"
+	if res, err := bus.Emit("ADD_ORDER_ITEM", map[string]interface{}{
+		"order_id": orderID, "product_id": productID,
+		"name": "Product mail-sku", "price": 12.0, "qty": 1,
+	}); err != nil || res["status"] != "ok" {
+		t.Fatalf("add item failed: %v %v", err, res)
+	}
+	if res, err := bus.Emit("PLACE_ORDER", map[string]interface{}{
+		"cart_id": "cart-mail", "email": "shopper@example.com",
+		"order_id": orderID, "country": "*",
+	}); err != nil || res["status"] != "ok" {
+		t.Fatalf("place order failed: %v %v", err, res)
+	}
+	msgs = server.waitCount(t, 2)
+	confirmation := msgs[1].data
+	if !strings.Contains(confirmation, "To: shopper@example.com") ||
+		!strings.Contains(confirmation, "Subject: Order "+orderID+" confirmed") {
+		t.Errorf("order confirmation missing/wrong:\n%s", confirmation)
+	}
+
+	if res, err := bus.Emit("UPDATE_ORDER_STATUS", map[string]interface{}{
+		"id": orderID, "status": "shipped", "actor": "ops",
+	}); err != nil || res["status"] != "ok" {
+		t.Fatalf("ship order failed: %v %v", err, res)
+	}
+	msgs = server.waitCount(t, 3)
+	shipped := msgs[2].data
+	if !strings.Contains(shipped, "To: shopper@example.com") ||
+		!strings.Contains(shipped, "Subject: Order "+orderID+" has shipped") {
+		t.Errorf("shipped notification missing/wrong:\n%s", shipped)
+	}
+}
+
+// TestEcommerceEmailSilentWhenUnconfigured proves the dev experience: with no
+// SMTP_HOST the whole flow above still succeeds, mails are simply skipped.
+func TestEcommerceEmailSilentWhenUnconfigured(t *testing.T) {
+	os.Unsetenv("SMTP_HOST")
+
+	eng, cleanup := setupEcommerceEngine(t)
+	defer cleanup()
+	bus := eng.Bus
+
+	if res, err := bus.Emit("SUBSCRIBE_EMAIL", map[string]interface{}{"email": "a@example.com"}); err != nil || res["status"] != "ok" {
+		t.Fatalf("subscribe failed: %v %v", err, res)
+	}
+	waitUntil(t, "subscriber row", func() bool {
+		var n int
+		bus.DB().QueryRow(`SELECT COUNT(*) FROM subscribers`).Scan(&n)
+		return n == 1
+	})
+	if res, err := bus.Emit("SEND_CAMPAIGN", map[string]interface{}{"subject": "s", "body": "b"}); err != nil || res["status"] != "ok" {
+		t.Fatalf("campaign must not fail without SMTP: %v %v", err, res)
+	}
+}
+
+// TestEcommercePaymentTracking covers the payments ledger end to end:
+// Stripe capture books a server-derived ledger row (and flips the order to
+// paid), duplicate webhook deliveries are absorbed by idempotency, manual
+// payments book rows, and refunds can never exceed net received.
+func TestEcommercePaymentTracking(t *testing.T) {
+	t.Setenv("SPINE_ALLOW_UNSIGNED_WEBHOOKS", "1") // test mode — no signing secret
+
+	eng, cleanup := setupEcommerceEngine(t)
+	defer cleanup()
+	bus := eng.Bus
+	handler := eng.HTTPHandler()
+
+	// Real checkout: 1 × $12.00, country "*" → no shipping/tax → total 12.
+	productID := publishProduct(t, bus, "pay-sku", 12.0, 5)
+	orderID := "ord-pay-1"
+	if res, err := bus.Emit("ADD_ORDER_ITEM", map[string]interface{}{
+		"order_id": orderID, "product_id": productID,
+		"name": "Product pay-sku", "price": 12.0, "qty": 1,
+	}); err != nil || res["status"] != "ok" {
+		t.Fatalf("add item failed: %v %v", err, res)
+	}
+	if res, err := bus.Emit("PLACE_ORDER", map[string]interface{}{
+		"cart_id": "cart-pay", "email": "buyer@example.com",
+		"order_id": orderID, "country": "*",
+	}); err != nil || res["status"] != "ok" {
+		t.Fatalf("place order failed: %v %v", err, res)
+	}
+
+	stripeBody := func(evtID string) map[string]interface{} {
+		return map[string]interface{}{
+			"type": "checkout.session.completed",
+			"id":   evtID,
+			"data": map[string]interface{}{
+				"object": map[string]interface{}{
+					"client_reference_id": orderID,
+					"amount_total":        1200, // cents — Stripe reports integers
+					"id":                  "cs_test_1",
+					"currency":            "usd",
+				},
+			},
+		}
+	}
+	postWebhook := func(body map[string]interface{}) *httptest.ResponseRecorder {
+		b, _ := json.Marshal(body)
+		req := httptest.NewRequest("POST", "/webhook/stripe", bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		rr := httptest.NewRecorder()
+		handler.ServeHTTP(rr, req)
+		return rr
+	}
+
+	// Capture + duplicate delivery of the same Stripe event.
+	if rr := postWebhook(stripeBody("evt_pay_1")); rr.Code != 200 {
+		t.Fatalf("stripe webhook failed: HTTP %d body=%s", rr.Code, rr.Body.String())
+	}
+	if rr := postWebhook(stripeBody("evt_pay_1")); rr.Code != 200 {
+		t.Fatalf("duplicate webhook rejected: HTTP %d body=%s", rr.Code, rr.Body.String())
+	}
+	waitUntil(t, "order flipped paid", func() bool {
+		var st string
+		bus.DB().QueryRow(`SELECT status FROM orders WHERE id = ?`, orderID).Scan(&st)
+		return st == "paid"
+	})
+	var n int
+	var amount float64
+	waitUntil(t, "ledger row from stripe", func() bool {
+		bus.DB().QueryRow(`SELECT COUNT(*) FROM payments WHERE order_id = ?`, orderID).Scan(&n)
+		return n == 1
+	})
+	bus.DB().QueryRow(`SELECT amount FROM payments WHERE order_id = ? AND kind = 'payment'`, orderID).Scan(&amount)
+	if amount != 12.0 {
+		t.Fatalf("ledger amount = %v, want 12.00 (cents converted)", amount)
+	}
+	var provider, reference string
+	bus.DB().QueryRow(`SELECT provider, reference FROM payments WHERE order_id = ?`, orderID).Scan(&provider, &reference)
+	if provider != "stripe" || reference != "cs_test_1" {
+		t.Fatalf("provider/reference = %s/%s, want stripe/cs_test_1", provider, reference)
+	}
+	// The raw Stripe envelope must never leak into ledger columns.
+	for _, junk := range []string{"data", "type"} {
+		var has int
+		bus.DB().QueryRow(`SELECT COUNT(*) FROM pragma_table_info('payments') WHERE name = ?`, junk).Scan(&has)
+		if has > 0 {
+			t.Fatalf("webhook envelope column %q leaked into payments", junk)
+		}
+	}
+
+	// Manual offline payment (cash on delivery top-up).
+	if res, err := bus.Emit("RECORD_PAYMENT", map[string]interface{}{
+		"order_id": orderID, "provider": "cash", "amount": 8.0, "reference": "receipt-42",
+	}); err != nil || res["status"] != "ok" {
+		t.Fatalf("record payment failed: %v %v", err, res)
+	}
+	waitUntil(t, "manual payment row", func() bool {
+		bus.DB().QueryRow(`SELECT COUNT(*) FROM payments WHERE order_id = ? AND provider = 'cash'`, orderID).Scan(&n)
+		return n == 1
+	})
+
+	// Over-refund must be refused by the ledger-sum guard.
+	if res, _ := bus.Emit("REFUND_PAYMENT", map[string]interface{}{"order_id": orderID, "amount": 21.0}); res["status"] == "ok" {
+		t.Fatalf("over-refund accepted: %v", res)
+	}
+	// Partial refund books a negative row; net drops accordingly.
+	if res, err := bus.Emit("REFUND_PAYMENT", map[string]interface{}{"order_id": orderID, "amount": 5.0}); err != nil || res["status"] != "ok" {
+		t.Fatalf("refund failed: %v %v", err, res)
+	}
+	waitUntil(t, "refund row", func() bool {
+		bus.DB().QueryRow(`SELECT COUNT(*) FROM payments WHERE order_id = ? AND kind = 'refund'`, orderID).Scan(&n)
+		return n == 1
+	})
+	var net float64
+	bus.DB().QueryRow(`SELECT SUM(amount) FROM payments WHERE order_id = ?`, orderID).Scan(&net)
+	if net != 15.0 {
+		t.Fatalf("net paid = %v, want 15.00 (12 + 8 − 5)", net)
+	}
+}
+
+// fakeStripeServer stands in for the Stripe Checkout Sessions API.
+type fakeStripeServer struct {
+	mu       sync.Mutex
+	requests []capturedStripeRequest
+}
+
+type capturedStripeRequest struct {
+	auth string
+	form url.Values
+}
+
+func (s *fakeStripeServer) start(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		form, err := url.ParseQuery(string(body))
+		if err != nil {
+			w.WriteHeader(400)
+			return
+		}
+		s.mu.Lock()
+		s.requests = append(s.requests, capturedStripeRequest{auth: r.Header.Get("Authorization"), form: form})
+		n := len(s.requests)
+		s.mu.Unlock()
+		if n == 2 { // scripted failure mode for the error-path test
+			w.WriteHeader(402)
+			w.Write([]byte(`{"error":{"message":"Your card was declined."}}`))
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.Write([]byte(`{"id":"cs_test_9","url":"https://checkout.stripe.com/pay/cs_test_9"}`))
+	}))
+	t.Cleanup(srv.Close)
+	return srv.URL
+}
+
+func (s *fakeStripeServer) count() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.requests)
+}
+
+// TestEcommerceStripeCheckout covers the tier-3 money-movement flow: a
+// shopper-supplied order id produces a real Sessions API call whose amount
+// comes from the server-verified order row (dollars → cents), and the
+// CHECKOUT_READY state carries the hosted-page URL back for redirect. Also
+// proves dev-safety (no key ⇒ silent no-op) and that Stripe errors fail the
+// route instead of emitting a dead URL.
+func TestEcommerceStripeCheckout(t *testing.T) {
+	stripe := &fakeStripeServer{}
+	t.Setenv("STRIPE_SECRET_KEY", "sk_test_abc123")
+	t.Setenv("STRIPE_API_BASE", stripe.start(t))
+	t.Setenv("STORE_PUBLIC_URL", "https://shop.example.com")
+
+	eng, cleanup := setupEcommerceEngine(t)
+	defer cleanup()
+	bus := eng.Bus
+
+	productID := publishProduct(t, bus, "co-sku", 12.0, 5)
+	orderID := "ord-co-1"
+	if res, err := bus.Emit("ADD_ORDER_ITEM", map[string]interface{}{
+		"order_id": orderID, "product_id": productID,
+		"name": "Product co-sku", "price": 12.0, "qty": 1,
+	}); err != nil || res["status"] != "ok" {
+		t.Fatalf("add item failed: %v %v", err, res)
+	}
+	if res, err := bus.Emit("PLACE_ORDER", map[string]interface{}{
+		"cart_id": "cart-co", "email": "payer@example.com",
+		"order_id": orderID, "country": "*",
+	}); err != nil || res["status"] != "ok" {
+		t.Fatalf("place order failed: %v %v", err, res)
+	}
+
+
+	waitUntil(t, "order row flushed", func() bool {
+		var st string
+		return bus.DB().QueryRow(`SELECT status FROM orders WHERE id = ?`, orderID).Scan(&st) == nil
+	})
+
+	res, err := bus.Emit("CREATE_CHECKOUT", map[string]interface{}{"order_id": orderID})
+	if err != nil || res["status"] != "ok" {
+		t.Fatalf("create checkout failed: %v %v", err, res)
+	}
+
+	if got := stripe.count(); got != 1 {
+		t.Fatalf("expected exactly 1 Sessions API call, got %d", got)
+	}
+	req := stripe.requests[0]
+	if req.auth != "Bearer sk_test_abc123" {
+		t.Errorf("Authorization = %q, want bearer secret", req.auth)
+	}
+	for k, want := range map[string]string{
+		"mode":                                        "payment",
+		"client_reference_id":                         orderID,
+		"line_items[0][price_data][unit_amount]":      "1200", // $12.00 → cents, server-side
+		"line_items[0][price_data][currency]":         "usd",
+		"line_items[0][quantity]":                     "1",
+		"customer_email":                              "payer@example.com",
+		"success_url":                                 "https://shop.example.com/#/orders",
+	} {
+		if req.form.Get(k) != want {
+			t.Errorf("form %s = %q, want %q", k, req.form.Get(k), want)
+		}
+	}
+}
+
+// The no-key dev path must stay silent and harmless — no API call, no route
+// failure — matching email/webhook action semantics.
+func TestEcommerceStripeCheckoutSilentWithoutKey(t *testing.T) {
+	stripe := &fakeStripeServer{}
+	t.Setenv("STRIPE_SECRET_KEY", "")
+	t.Setenv("STRIPE_API_BASE", stripe.start(t))
+	t.Setenv("STORE_PUBLIC_URL", "https://shop.example.com")
+
+	eng, cleanup := setupEcommerceEngine(t)
+	defer cleanup()
+	bus := eng.Bus
+
+	productID := publishProduct(t, bus, "nk-sku", 5.0, 5)
+	orderID := "ord-nk-1"
+	bus.Emit("ADD_ORDER_ITEM", map[string]interface{}{
+		"order_id": orderID, "product_id": productID,
+		"name": "Product nk-sku", "price": 5.0, "qty": 1,
+	})
+	bus.Emit("PLACE_ORDER", map[string]interface{}{
+		"cart_id": "cart-nk", "email": "x@example.com",
+		"order_id": orderID, "country": "*",
+	})
+
+
+	waitUntil(t, "order row flushed", func() bool {
+		var st string
+		return bus.DB().QueryRow(`SELECT status FROM orders WHERE id = ?`, orderID).Scan(&st) == nil
+	})
+	if res, err := bus.Emit("CREATE_CHECKOUT", map[string]interface{}{"order_id": orderID}); err != nil || res["status"] != "ok" {
+		t.Fatalf("checkout without key must not fail: %v %v", err, res)
+	}
+	if got := stripe.count(); got != 0 {
+		t.Fatalf("no-key engine must not call Stripe, got %d calls", got)
+	}
+}
+
+// A Stripe-side rejection must fail the route into CHECKOUT_FAILED — never
+// emit a dead checkout URL to the storefront.
+func TestEcommerceStripeCheckoutErrorSurfaces(t *testing.T) {
+	stripe := &fakeStripeServer{}
+	t.Setenv("STRIPE_SECRET_KEY", "sk_test_abc123")
+	t.Setenv("STRIPE_API_BASE", stripe.start(t)) // 2nd request returns 402 declined
+	t.Setenv("STORE_PUBLIC_URL", "https://shop.example.com")
+
+	eng, cleanup := setupEcommerceEngine(t)
+	defer cleanup()
+	bus := eng.Bus
+
+	productID := publishProduct(t, bus, "dc-sku", 3.0, 5)
+	orderID := "ord-dc-1"
+	bus.Emit("ADD_ORDER_ITEM", map[string]interface{}{
+		"order_id": orderID, "product_id": productID,
+		"name": "Product dc-sku", "price": 3.0, "qty": 1,
+	})
+	bus.Emit("PLACE_ORDER", map[string]interface{}{
+		"cart_id": "cart-dc", "email": "x@example.com",
+		"order_id": orderID, "country": "*",
+	})
+
+	// Request #1 succeeds; request #2 hits the scripted decline.
+	waitUntil(t, "order row flushed", func() bool {
+		var st string
+		return bus.DB().QueryRow(`SELECT status FROM orders WHERE id = ?`, orderID).Scan(&st) == nil
+	})
+	if res, err := bus.Emit("CREATE_CHECKOUT", map[string]interface{}{"order_id": orderID}); err != nil || res["status"] != "ok" {
+		t.Fatalf("first checkout should succeed: %v %v", err, res)
+	}
+	res, err := bus.Emit("CREATE_CHECKOUT", map[string]interface{}{"order_id": orderID})
+	if err == nil && res["status"] == "ok" {
+		t.Fatalf("declined session must fail the route, got ok: %v", res)
+	}
+	if emitted, ok := res["emitted_states"].([]string); ok {
+		for _, s := range emitted {
+			if s == "CHECKOUT_READY" {
+				t.Errorf("CHECKOUT_READY broadcast despite Stripe failure: %v", emitted)
+			}
+		}
 	}
 }

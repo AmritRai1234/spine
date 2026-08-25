@@ -521,7 +521,9 @@ func (b *Bus) dbSum(table string, column string, whereExpr string, as string, ev
 // expression, e.g. "$event.payload.product_id") and merges every column of the
 // row into the event payload. An optional "as" config prefixes merged keys
 // ("as: product_" turns price → product_price) to avoid clobbering event fields.
-// No matching row → error, so route on_failure machinery handles it.
+// Config "optional: true" tolerates a missing row (nothing merges, step passes)
+// for notification-style lookups; default behaviour errors so route on_failure
+// machinery handles it.
 func (b *Bus) dbLookup(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
 	keyColumn := step.Config["key_column"]
 	valueExpr := step.Config["value_expr"]
@@ -542,6 +544,9 @@ func (b *Bus) dbLookup(step *manifest.RouteStep, eventName string, payload map[s
 		return fmt.Errorf("db.lookup failed on '%s': %w", safeTable, err)
 	}
 	if len(rows) == 0 {
+		if step.Config["optional"] == "true" {
+			return nil
+		}
 		return fmt.Errorf("db.lookup: no row in '%s' where %s = %v", safeTable, safeKeyCol, value)
 	}
 
@@ -656,6 +661,28 @@ func resolveInt(expr string, eventName string, payload map[string]interface{}) (
 		return strconv.ParseInt(strings.TrimSpace(v), 10, 64)
 	default:
 		return 0, fmt.Errorf("not an integer expression")
+	}
+}
+
+// resolveFloat evaluates a numeric expression: literal or $-prefixed template.
+// Accepts the same payload kinds as resolveInt plus decimal strings — dollar
+// amounts arrive as JSON numbers but manifest literals are strings.
+func resolveFloat(expr string, eventName string, payload map[string]interface{}) (float64, error) {
+	switch v := ResolveValue(expr, eventName, payload).(type) {
+	case int:
+		return float64(v), nil
+	case int32:
+		return float64(v), nil
+	case int64:
+		return float64(v), nil
+	case uint64:
+		return float64(v), nil
+	case float64:
+		return v, nil
+	case string:
+		return strconv.ParseFloat(strings.TrimSpace(v), 64)
+	default:
+		return 0, fmt.Errorf("not a numeric expression")
 	}
 }
 

@@ -5,6 +5,7 @@ import {
   Globe,
   LayoutDashboard,
   Lock,
+  Mail,
   ScrollText,
   Settings,
   ShoppingCart,
@@ -25,6 +26,7 @@ const Dashboard = lazy(() => import("@/pages/admin/Dashboard"))
 const AdminProducts = lazy(() => import("@/pages/admin/AdminProducts"))
 const AdminOrders = lazy(() => import("@/pages/admin/AdminOrders"))
 const AdminCustomers = lazy(() => import("@/pages/admin/AdminCustomers"))
+const AdminMarketing = lazy(() => import("@/pages/admin/AdminMarketing"))
 const AdminAnalytics = lazy(() => import("@/pages/admin/AdminAnalytics"))
 const AdminEvents = lazy(() => import("@/pages/admin/AdminEvents"))
 const AdminSettings = lazy(() => import("@/pages/admin/AdminSettings"))
@@ -61,7 +63,10 @@ const NAV_GROUPS: NavGroup[] = [
   },
   {
     title: "Commerce",
-    items: [{ id: "shipping", label: "Shipping & Tax", icon: <Truck className="h-4 w-4" />, adminOnly: true }],
+    items: [
+      { id: "shipping", label: "Shipping & Tax", icon: <Truck className="h-4 w-4" />, adminOnly: true },
+      { id: "marketing", label: "Marketing", icon: <Mail className="h-4 w-4" />, adminOnly: true },
+    ],
   },
   {
     title: "Settings",
@@ -179,6 +184,7 @@ export default function AdminLayout({ tab, onTab, onLock, role = "admin", onStor
             {activeTab === "products" && <AdminProducts />}
             {activeTab === "orders" && <AdminOrders />}
             {activeTab === "customers" && <AdminCustomers />}
+            {activeTab === "marketing" && <AdminMarketing />}
             {activeTab === "analytics" && <AdminAnalytics />}
             {activeTab === "settings" && <AdminSettings />}
             {activeTab === "shipping" && <AdminShippingTax />}

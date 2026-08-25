@@ -679,6 +679,25 @@ func validateSchema(file string, schema *SpineSchema) error {
 		return parseError(file, 0, "missing required 'spine_version' declaration")
 	}
 
+	// Unsupported manifest format: refuse versions newer than this engine
+	// speaks (or negative garbage) — a manifest written for a future runtime
+	// must fail loudly at startup, not misbehave silently.
+	if schema.SpineVersion < 1 || schema.SpineVersion > MaxSupportedSpineVersion {
+		return parseError(file, 0, "unsupported 'spine_version: %d' — this engine supports manifest schema versions 1 to %d", schema.SpineVersion, MaxSupportedSpineVersion)
+	}
+
+	// Capability tiers: gated actions demand the manifest declare at least
+	// the version that introduced them.
+	for _, route := range schema.Routes {
+		for j, step := range route.Steps {
+			if minV, gated := actionMinVersion[step.Action]; gated && schema.SpineVersion < minV {
+				return parseError(file, 0,
+					"route '%s', step %d: action '%s' requires 'spine_version: %d' (manifest declares %d) — raise spine_version to unlock it",
+					route.OnEvent, j+1, step.Action, minV, schema.SpineVersion)
+			}
+		}
+	}
+
 	// Build set of known emitted events from nodes
 	knownEvents := make(map[string]bool)
 	for _, node := range schema.Nodes {

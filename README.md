@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://raw.githubusercontent.com/AmritRai1234/spine/main/assets/logo.png?v=2" width="200" alt="Spine Logo"><br>
   <strong>SPINE</strong><br>
-  <em>Declarative Event-Driven Backend Engine (v2.3.0)</em>
+  <em>Declarative Event-Driven Backend Engine (v3.0.0)</em>
 </p>
 
 <p align="center">
@@ -17,7 +17,7 @@
 
 **Spine** is a high-performance, declarative event-driven runtime and orchestration engine written in Go. It replaces complex API controllers and scattered database handlers with a single, type-safe `.spine` manifest file.
 
-With Spine, you declare database tables, event nodes, and multi-step action routes in code. The runtime automatically handles type contract validation, high-throughput database persistence (SQLite WAL / Turso libSQL), outbox webhook retries, full-text search (`fts.search`), multi-tenancy isolation (`tenant:`), cloud deployment generation (`spine deploy`), starter templates (`spine init --template`), and real-time WebSocket state broadcasting.
+With Spine, you declare database tables, event nodes, and multi-step action routes in code. The runtime automatically handles type contract validation, high-throughput database persistence (SQLite WAL / Turso libSQL), durable outbox webhook retries, full-text search (`fts.search`), multi-tenancy isolation (`tenant:`), email marketing & transactional mail (`email.send`, `email.broadcast`), Stripe Checkout payments (`stripe.checkout`), real-time WebSocket state broadcasting, and cloud deployment generation (`spine deploy`).
 
 ```
 Client Event → Load Balancer → Spine Node (RLAC Auth & Rate Limit) → Event Bus → PubSub Backplane → Batched DB / WebSocket
@@ -32,6 +32,7 @@ Client Event → Load Balancer → Spine Node (RLAC Auth & Rate Limit) → Event
 - [Quick Start](#quick-start)
 - [CLI Reference](#cli-reference)
 - [Building a Website with Spine](#building-a-website-with-spine)
+- [E-Commerce Template (Storefront + Admin + Email + Payments)](#e-commerce-template-storefront--admin--email--payments)
 - [The `.spine` Manifest Specification](#the-spine-manifest-specification)
 - [HTTP & WebSocket API Reference](#http--websocket-api-reference)
 - [Go SDK / Embedding Guide](#go-sdk--embedding-guide)
@@ -350,6 +351,9 @@ ws.onmessage = (event) => {
 | `age: number` in payload | Creates `REAL` column (not TEXT), enables numeric sorting |
 | `emit: USER_REGISTERED` | Broadcasts to all WebSocket clients instantly |
 | `?where=active:1` | Returns filtered rows with parameterized SQL (injection-safe) |
+| `- action: email.send` | Delivers transactional mail over SMTP (dev-safe no-op without config) |
+| `- action: stripe.checkout` | Creates a Stripe Checkout Session from the verified order total |
+| `- cron: 5m` on a route | Fires the pipeline on schedule — digests, abandoned carts, cleanups |
 
 ### Frontend with Vite + shadcn/ui (native template)
 
@@ -374,12 +378,42 @@ Because both layers hot-reload independently — `.spine` manifests via `spine d
 
 ---
 
+## E-Commerce Template (Storefront + Admin + Email + Payments)
+
+A complete, production-shaped store shipped in `apps/ecommerce/` — storefront, admin panel, email marketing, and a payments ledger, all driven by one `app.spine` manifest (`spine_version: 3`).
+
+```bash
+cd apps/ecommerce
+cp .env.example .env   # if present — otherwise set secrets per README below
+./run.sh               # hot-reload backend + seeded catalog + Vite dev server
+```
+
+**What's inside**
+
+| Domain | Highlights |
+|---|---|
+| Storefront | Catalog, variants, live cart drawer, checkout, email-keyed order tracking |
+| Admin panel (`#/admin`) | Dashboard & analytics, products, orders, customers, shipping/tax, settings, event log — role-gated (admin/staff) via RLAC keys |
+| Email marketing | Footer newsletter signup → `subscribers` table; opt-out-safe campaigns with `{{email}}` templating; order confirmation + shipped notifications |
+| Payments | Stripe Checkout sessions created server-side; append-only payments ledger with duplicate-webhook absorption and over-refund protection |
+
+**The money flow (tier 3 in action)**
+
+1. Shopper clicks **Pay now** on an unpaid order → `CREATE_CHECKOUT {order_id}` — the client sends *only* the order id, never dollar amounts
+2. The engine looks up the verified order row, creates a Stripe Checkout Session (`stripe.checkout`), and broadcasts `CHECKOUT_READY` with the hosted-page URL
+3. Stripe's webhook (`POST /webhook/stripe`, HMAC-verified, idempotent by event id) flips the order to `paid` and books a ledger row with the amount recomputed from Stripe's cents
+4. Admins can book manual payments (`RECORD_PAYMENT`) and refunds (`REFUND_PAYMENT`); net received is always `SUM(amount)` per order
+
+Required env for payments/email: `STRIPE_SECRET_KEY`, `STORE_PUBLIC_URL`, `SMTP_HOST` (+ `SMTP_FROM`). All three degrade to safe no-ops when unset, so development never fails on missing integrations.
+
+---
+
 ## The `.spine` Manifest Specification
 
 ### Structure
 
 ```yaml
-spine_version: 1          # Required. Manifest format version.
+spine_version: 1          # Required. Manifest format + capability tier (see below).
 
 includes:                  # Optional. Import other .spine files.
   - auth.spine
@@ -456,10 +490,55 @@ routes:
 | `db.upsert` | Insert or update on conflict | `table` (required), `key` (conflict column, default: `id`). Fails explicitly if `key` is missing from payload. |
 | `db.delete` | Delete rows matching `where:` (parameterized), or by payload `id` | `table`, `where` (optional) |
 | `db.sum` | Sum a numeric column into the payload (`0` on empty tables) | `table`, `column` (required); `where`, `as` (optional, default `sum_result`) |
+| `db.lookup` | Merge one row's columns into the payload (optionally prefixed via `as:`) | `table`, `key_column`, `value_expr` (required); `as`, `optional: true` (tolerate missing row) |
+| `db.adjust` | Atomic relative update (`SET col = col + delta`) with optional floor guard for stock/balance math | `table`, `column`, `by`, `where` (required); `floor` (optional) |
 | `set` | Inject computed fields into the payload | Any `key: value` pairs (supports `$uuid`, `$now`, etc.) |
+| `unset` | Remove keys from the payload (prunes lookup helper columns before inserts) | `fields` — space-separated key list |
+| `assert` | Hard server-side guard; failing the condition aborts the route into `on_failure` | `condition` (required), `message` (optional) |
 | `log.write` | Write a log message with template variables | `message` (required) |
 | `http.post` | Send an HTTP POST webhook | `url` (required) |
+| `notify.webhook` | Like `http.post`, but silently no-ops when the URL resolves empty (e.g. unset `$env`) | `url` (required) |
+| `fts.search` | Full-text search over a table (FTS5 on SQLite, LIKE fallback elsewhere); results land in payload as `fts_results` | `table`, query via `config.query`/`where`/`input` |
+| `emit_to` | Broadcast the event to an external stream target | `stream` (or `table`) |
+| `queue.publish` | Publish the payload to a topic over WebSocket state | `table` = topic (default: current event) |
 | `emit` | Emit a chained event | `event`, `payload` (optional) |
+| `email.send` | Transactional email over SMTP (silent no-op when `SMTP_HOST` unset) — tier 2 | `to`, `subject`, `body` (required); `from`, `html: true`, `unsubscribe_url` (optional) |
+| `email.broadcast` | Marketing send to every row of a recipients table; `{{email}}` templating, count lands in payload as `email_sent` — tier 2 | `table` (required); `where`, `subject`, `body`, `from`, `html`, `unsubscribe_url`, `email_column` (optional) |
+| `stripe.checkout` | Create a Stripe Checkout Session; payload gains `checkout_url` + `checkout_session_id`. Amounts are DOLLARS, converted to cents server-side. Silent no-op when `STRIPE_SECRET_KEY` unset. Tier 3 | `order_id`, `amount`, `success_url`, `cancel_url` (required); `currency` (default `usd`), `description`, `customer_email` (optional) |
+
+#### Email Marketing
+
+Lightweight mail support with zero dependencies — plain SMTP via env vars:
+
+| Variable | Description |
+|---|---|
+| `SMTP_HOST` | SMTP relay hostname — **unset disables all email** (dev-safe no-op) |
+| `SMTP_PORT` | Port (default `587`, STARTTLS) |
+| `SMTP_USER` / `SMTP_PASS` | Credentials (optional) |
+| `SMTP_FROM` | Default sender address |
+
+```yaml
+routes:
+  # Transactional — order confirmation
+  - on: ORDER_PLACED
+    steps:
+      - action: email.send
+        to: $event.payload.email
+        subject: "Order $event.payload.order_id confirmed"
+        body: "Thanks for shopping with us!\nTotal: $event.payload.total"
+
+  # Marketing — broadcast to a subscribers table, skipping opt-outs
+  - on: SEND_CAMPAIGN
+    steps:
+      - action: email.broadcast
+        table: subscribers
+        where: "unsubscribed = 0"
+        subject: "Sale time, {{email}}"
+        body: "Hey {{email}}, 20% off this week"
+```
+
+Subjects are newline-stripped (header-injection safe) and RFC 2047 B-encoded for UTF-8;
+`unsubscribe_url` adds a per-recipient `List-Unsubscribe` header.
 
 ### Template Variables
 
@@ -753,17 +832,22 @@ spine/
 ├── pkg/
 │   ├── engine/          # Core runtime execution engine
 │   │   ├── bus.go       # Event dispatch, sharded batch writer, SQL caching
-│   │   ├── engine.go    # HTTP server mux, graceful shutdown & health probes
+│   │   ├── engine.go    # HTTP server mux, webhook ingestion, graceful shutdown
+│   │   ├── actions.go   # Built-in action dispatcher (db.*, set, assert, …)
+│   │   ├── email.go     # email.send / email.broadcast — SMTP marketing & transactional mail
+│   │   ├── stripe.go    # stripe.checkout — Stripe Checkout Session creation (tier 3)
 │   │   ├── hub.go       # Async WebSocket broadcasting hub
 │   │   ├── outbox.go    # Notification-driven outbox retry queue
 │   │   ├── pubsub.go    # Pluggable PubSub backplane interface (in-process adapter; Redis/NATS planned)
 │   │   ├── optimizer.go # Self-tuning adaptive batch size & interval optimizer
 │   │   ├── cond.go      # Dynamic condition evaluator (if: guards)
+│   │   ├── math.go      # Safe arithmetic evaluator for server-side totals
 │   │   ├── vars.go      # Template variable resolver ($now, $uuid, $event)
 │   │   ├── query.go     # Table inspector & event audit query API
 │   │   └── migrations.go# Versioned schema migration tracker
 │   ├── manifest/        # Declarative .spine language parser & AST
 │   │   ├── parser.go    # Multi-file manifest parser with validation
+│   │   ├── features.go  # Version capability tiers + action gate table
 │   │   ├── registry.go  # Lock-free atomic route & node registry
 │   │   └── schema.go    # AST struct definitions
 │   ├── codegen/         # TypeScript type generation from manifests
@@ -774,7 +858,7 @@ spine/
 ├── examples/
 │   └── app.spine        # Full example manifest
 ├── sdk/                 # Python & TypeScript client SDKs
-├── tests/               # 85 tests across 33 files
+├── tests/               # 158 tests across 42 files (unit, integration, e2e, benchmarks)
 ├── web/                 # Developer web dashboard
 ├── spine.go             # Public Go library API facade
 ├── Dockerfile           # Multi-stage Docker build
@@ -822,6 +906,10 @@ spine version
 | `SPINE_WS_MAX_CONNS` | Max concurrent WebSocket connections (default: 10000; excess upgrades get 503) |
 | `SPINE_ALLOW_UNSIGNED_WEBHOOKS` | `1` = accept unsigned webhooks when no secret is configured (default: fail closed with 503) |
 | `SPINE_WEBHOOK_SECRET_<PROVIDER>` (or `<PROVIDER>_WEBHOOK_SECRET`) | HMAC-SHA256 secret for a webhook provider |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | SMTP relay for `email.send` / `email.broadcast` — host unset = email disabled (silent no-op) |
+| `STRIPE_SECRET_KEY` | Secret key (`sk_test_…`) for `stripe.checkout` — unset = Stripe actions disabled (silent no-op) |
+| `STRIPE_API_BASE` | Override the Stripe API origin (default `https://api.stripe.com`; useful for tests/proxies) |
+| `STORE_PUBLIC_URL` | Absolute store origin used by the e-commerce template to build Stripe `success_url`/`cancel_url` |
 
 ### Free Automatic HTTPS (Let's Encrypt)
 
@@ -957,7 +1045,7 @@ go test ./tests/ -bench=. -benchmem -count=3
 
 ## Tests
 
-**100% of test suites passing cleanly** across 33 test files:
+**100% of test suites passing cleanly** across 42 test files (158 tests), including in-process fake SMTP and Stripe servers so the email and payment tiers are tested end-to-end without external dependencies:
 
 | Suite | Coverage |
 |---|---|
@@ -974,7 +1062,9 @@ go test ./tests/ -bench=. -benchmem -count=3
 | `metrics_test.go` | Prometheus `/metrics` and `/admin/usage` |
 | `dialect_test.go` | Per-backend SQL generation (SQLite pipeline, upsert conflicts, auto-PK DDL) |
 | `db_actions_test.go` | Built-in actions: insert/upsert/update/sum/set, typed columns |
-| `parser_test.go` | Manifest parsing, validation & error suggestions |
+| `parser_test.go` | Manifest parsing, validation & version-tier gating |
+| `email_test.go` | `email.send`/`email.broadcast`: delivery, templating, injection guards, opt-out filtering |
+| `ecommerce_test.go` | Full store flow: stock math, price guards, coupons, marketing campaigns, payments ledger, Stripe checkout |
 | `e2e_test.go` | End-to-end HTTP/WebSocket integration flows |
 
 ```bash
@@ -997,6 +1087,23 @@ The `.spine` manifest parser includes production-grade hardening:
 - **Tab tolerance**: Tabs normalized to 2-space equivalents
 - **Mixed whitespace detection**: Rejects ambiguous tab+space indentation
 - **Post-parse semantic validation**: Catches missing `spine_version`, empty routes, unknown events
+
+#### Manifest Versions & Capability Tiers
+
+`spine_version` is both a format contract and a feature gate. The engine refuses versions newer than it supports, and gated actions demand the manifest declare at least the version that introduced them — so a manifest using a newer feature on an older runtime fails loudly at startup with the exact fix named:
+
+| `spine_version` | Unlocks |
+|---|---|
+| `1` | Classic tier: all `db.*`, `set`/`unset`, `assert`, `math.calc`, `http.post`, `notify.webhook`, `log.write`, `fts.search`, `emit_to`, `queue.publish`, cron routes |
+| `2` | v1 + email marketing: `email.send`, `email.broadcast` |
+| `3` | v2 + money movement: `stripe.checkout` (Stripe Checkout Session creation) |
+
+```
+route 'SEND_MAIL', step 1: action 'email.send' requires 'spine_version: 2'
+(manifest declares 1) — raise spine_version to unlock it
+```
+
+Actions not in the gate table (including Go plugin actions registered via `RegisterAction`) are available at every version.
 - **Unknown top-level key detection**: Catches typos like `routs:` with suggestions
 
 ---

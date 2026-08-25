@@ -64,6 +64,20 @@ export interface OrderRow {
   total?: number
 }
 
+// Payments ledger row — refunds carry a NEGATIVE amount so net received is
+// always SUM(amount) per order.
+export interface PaymentRow {
+  id: string
+  order_id: string
+  amount: number
+  kind: string // "payment" | "refund"
+  status: string
+  provider?: string
+  reference?: string
+  currency?: string
+  created_at: string
+}
+
 export interface OrderItemRow {
   id: string
   order_id: string

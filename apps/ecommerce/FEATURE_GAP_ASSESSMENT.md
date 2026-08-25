@@ -41,8 +41,8 @@ Priority: **P0** launch-tier (missing = lost sales) · **P1** first-90-days · *
 | 2.7 | Server-calculated totals (shipping/tax/discount) | [x] | `math.calc` + `db.sum` (Phase 6) |
 | 2.8 | Coupons: percent | [x] | server-verified |
 | 2.9 | Coupons: fixed-amount, free-shipping, usage limits | [ ] | P1 |
-| 2.10 | **Real payment capture (Stripe Checkout / PayPal)** | [ ] | P0 — webhook flip exists; no session creation |
-| 2.11 | Order confirmation email | [ ] | P1 — SMTP bridge (CEO epic 2) |
+| 2.10 | **Real payment capture (Stripe Checkout / PayPal)** | [~] | payments ledger done: Stripe webhook + manual payments/refunds tracked with idempotency + over-refund guard; session *creation* still open |
+| 2.11 | Order confirmation email | [x] | `email.send` in `PLACE_ORDER` + shipped notification; SMTP env bridge, silent no-op without `SMTP_HOST` |
 | 2.12 | Failed-payment recovery | [ ] | P2 |
 | 2.13 | Abandoned-cart recovery | [ ] | P1 (5–15% recovery per research) |
 | 2.14 | Free-shipping progress bar | [ ] | P2 (needs threshold config) |
@@ -81,7 +81,7 @@ Priority: **P0** launch-tier (missing = lost sales) · **P1** first-90-days · *
 
 | # | Feature | Status | Notes |
 |---|---------|--------|-------|
-| 5.1 | Email capture (newsletter) | [~] | UI only; not wired to a list |
+| 5.1 | Email capture (newsletter) | [x] | `subscribers` table + footer form wired to `SUBSCRIBE_EMAIL`; admin Marketing tab broadcasts via `email.broadcast` with opt-out filtering |
 | 5.2 | New-order notification webhook | [x] | `ALERT_WEBHOOK_URL` + durable outbox |
 | 5.3 | Discounts: flash sales, bundles, gift cards | [ ] | P2 |
 | 5.4 | Loyalty/points | [ ] | P2 |

@@ -1,9 +1,10 @@
-import { useCallback, useEffect, useState } from "react"
-import { Ban, ChevronDown, ChevronLeft, ChevronRight, Download, Eye } from "lucide-react"
+import { useCallback, useEffect, useState, type FormEvent } from "react"
+import { Ban, ChevronDown, ChevronLeft, ChevronRight, Download, Eye, HandCoins } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
+import { Input } from "@/components/ui/input"
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -32,13 +33,20 @@ import {
   statusColor,
   type OrderItemRow,
   type OrderRow,
+  type PaymentRow,
 } from "@/types"
 
 const PAGE_SIZE = 25
 
+const PAYMENT_PROVIDERS = ["cash", "card", "transfer", "stripe", "other"]
+
 export default function AdminOrders() {
   const [orders, setOrders] = useState<OrderRow[] | null>(null)
   const [itemsByOrder, setItemsByOrder] = useState<Record<string, OrderItemRow[]>>({})
+  const [payments, setPayments] = useState<PaymentRow[]>([])
+  const [payAmount, setPayAmount] = useState("")
+  const [payProvider, setPayProvider] = useState(PAYMENT_PROVIDERS[0])
+  const [payReference, setPayReference] = useState("")
   const [filter, setFilter] = useState<string>("all")
   const [page, setPage] = useState(0)
   const [hasMore, setHasMore] = useState(false)
@@ -46,6 +54,7 @@ export default function AdminOrders() {
 
   const createdTick = useSpineStateTick("ORDER_CREATED")
   const statusTick = useSpineStateTick("ORDER_STATUS_CHANGED")
+  const paymentTick = useSpineStateTick("PAYMENT_RECORDED")
 
   // Server-side pagination: orders page from the engine (limit/offset),
   // then one targeted items query per visible order — no 500-row slurp.
@@ -85,6 +94,27 @@ export default function AdminOrders() {
   useEffect(() => {
     setPage(0) // filter change resets paging
   }, [filter])
+
+  // Payments ledger for the open order detail — reloads on live
+  // PAYMENT_RECORDED broadcasts (Stripe webhook or manual booking).
+  const loadPayments = useCallback(async (orderId: string) => {
+    try {
+      const res = await adminClient().queryTable("payments", {
+        where: `order_id:${orderId}`,
+        limit: 100,
+      })
+      setPayments((res.rows ?? []) as unknown as PaymentRow[])
+    } catch {
+      setPayments([])
+    }
+  }, [])
+
+  useEffect(() => {
+    if (detail) loadPayments(detail.id)
+    else setPayments([])
+  }, [detail, loadPayments, paymentTick])
+
+  const netPaid = payments.reduce((s, p) => s + Number(p.amount), 0)
 
   // Phase 6: prefer the SERVER-computed order.total; older rows fall back to
   // summing line items (line_total when present, else price × qty).
@@ -127,6 +157,42 @@ export default function AdminOrders() {
       actor: "admin@panel",
     })
     toast.success(`Order ${shortId(order.id)} → ${status}`)
+  }
+
+  async function recordPayment(e: FormEvent) {
+    e.preventDefault()
+    if (!detail) return
+    const amt = Number(payAmount)
+    if (!Number.isFinite(amt) || amt <= 0) {
+      toast.error("Enter a positive amount")
+      return
+    }
+    const res = await adminClient().emit("RECORD_PAYMENT", {
+      order_id: detail.id,
+      provider: payProvider,
+      amount: amt,
+      reference: payReference.trim() || undefined,
+    })
+    if (res.status === "ok") {
+      toast.success(`Recorded ${money(amt)} ${payProvider} payment`)
+      setPayAmount("")
+      setPayReference("")
+      loadPayments(detail.id)
+    } else {
+      toast.error("Engine rejected the payment")
+    }
+  }
+
+  async function refundNet() {
+    if (!detail || netPaid <= 0) return
+    const amt = Number(netPaid.toFixed(2))
+    const res = await adminClient().emit("REFUND_PAYMENT", { order_id: detail.id, amount: amt })
+    if (res.status === "ok") {
+      toast.success(`Refunded ${money(amt)}`)
+      loadPayments(detail.id)
+    } else {
+      toast.error("Refund exceeds net paid — engine refused it")
+    }
   }
 
   /**
@@ -327,6 +393,86 @@ export default function AdminOrders() {
                   <span>{money(orderTotal(detail.id))}</span>
                 </div>
               </div>
+
+              {/* Payments ledger — refunds are negative rows, net = SUM(amount) */}
+              <div className="space-y-3 rounded-md border p-3">
+                <div className="flex items-center justify-between">
+                  <p className="text-sm font-medium">Payments</p>
+                  <span
+                    className={`text-xs font-medium tabular-nums ${
+                      netPaid >= orderTotal(detail.id) ? "text-green-600" : "text-amber-600"
+                    }`}
+                  >
+                    {money(netPaid)} of {money(orderTotal(detail.id))} received
+                  </span>
+                </div>
+                <div className="max-h-40 space-y-1 overflow-y-auto text-sm">
+                  {payments.map((p) => {
+                    const isRefund = Number(p.amount) < 0 || p.kind === "refund"
+                    return (
+                      <div key={p.id} className="flex items-center justify-between border-b py-1.5 last:border-0">
+                        <div className="min-w-0">
+                          <p className="flex items-center gap-1.5 capitalize">
+                            <Badge variant={isRefund ? "destructive" : "secondary"} className="h-4 px-1 text-[10px]">
+                              {p.kind}
+                            </Badge>
+                            {p.provider ?? "—"}
+                            {p.reference && (
+                              <code className="truncate text-[10px] text-muted-foreground">{p.reference}</code>
+                            )}
+                          </p>
+                          <p className="text-[10px] text-muted-foreground">{timeAgo(p.created_at)}</p>
+                        </div>
+                        <span className={`tabular-nums ${isRefund ? "text-red-600" : ""}`}>
+                          {isRefund ? "−" : "+"}{money(Math.abs(Number(p.amount)))}
+                        </span>
+                      </div>
+                    )
+                  })}
+                  {payments.length === 0 && (
+                    <p className="py-2 text-center text-xs text-muted-foreground">
+                      No payments recorded yet.
+                    </p>
+                  )}
+                </div>
+                <form onSubmit={recordPayment} className="flex flex-wrap gap-2 border-t pt-2">
+                  <select
+                    value={payProvider}
+                    onChange={(e) => setPayProvider(e.target.value)}
+                    className="h-8 rounded-md border bg-background px-2 text-xs capitalize"
+                  >
+                    {PAYMENT_PROVIDERS.filter((p) => p !== "stripe").map((p) => (
+                      <option key={p} value={p}>{p}</option>
+                    ))}
+                  </select>
+                  <Input
+                    type="number"
+                    step="0.01"
+                    min="0"
+                    placeholder="Amount"
+                    className="h-8 w-24 text-xs"
+                    value={payAmount}
+                    onChange={(e) => setPayAmount(e.target.value)}
+                    required
+                  />
+                  <Input
+                    placeholder="Ref (optional)"
+                    className="h-8 w-28 text-xs"
+                    value={payReference}
+                    onChange={(e) => setPayReference(e.target.value)}
+                  />
+                  <Button type="submit" size="sm" variant="outline" className="ml-auto h-8">
+                    Record payment
+                  </Button>
+                </form>
+                {netPaid > 0 && (
+                  <Button size="sm" variant="outline" className="w-full" onClick={refundNet}>
+                    <HandCoins className="mr-1 h-4 w-4" />
+                    Refund {money(netPaid)}
+                  </Button>
+                )}
+              </div>
+
               <div className="flex flex-wrap gap-2 pt-2">
                 {ORDER_STATUSES.filter((s) => s !== detail.status).map((s) => (
                   <Button key={s} size="sm" variant={s === "cancelled" ? "destructive" : "outline"} className="capitalize" onClick={() => { setStatus(detail, s); setDetail({ ...detail, status: s }) }}>

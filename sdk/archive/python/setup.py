@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name="spine-engine",
-    version="2.3.0",
+    version="3.0.0",
     description="Python Client SDK for Spine — Declarative Event-Driven Backend Engine",
     author="Amrit Rai",
     author_email="amritrai@example.com",

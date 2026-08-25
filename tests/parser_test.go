@@ -333,6 +333,149 @@ func TestEmptyManifest(t *testing.T) {
 	}
 }
 
+// --- Manifest schema version tiers ---
+// spine_version is both a format contract and a capability tier: gated
+// actions demand the declared version, and versions newer than this engine
+// fail loudly at startup instead of best-effort parsing.
+
+func TestSupportedManifestVersionAccepted(t *testing.T) {
+	for _, v := range []string{"1", "2", "3"} {
+		dir := t.TempDir()
+		path := writeManifest(t, dir, "v.spine", "spine_version: "+v+"\n\ndatabase:\n  tables:\n    - items\n\nnodes:\n  N:\n    emits:\n      - event: EV\n        payload:\n          name: string\n\nroutes:\n  - on: EV\n    steps:\n      - action: db.insert\n        table: items\n")
+
+		schema, err := manifest.ParseManifest(path)
+		if err != nil {
+			t.Fatalf("spine_version %s must parse, got error: %v", v, err)
+		}
+		want := 1
+		if v == "2" {
+			want = 2
+		}
+		if v == "3" {
+			want = 3
+		}
+		if schema.SpineVersion != want {
+			t.Errorf("expected SpineVersion %d, got %d", want, schema.SpineVersion)
+		}
+	}
+}
+
+func TestUnsupportedManifestVersionRejected(t *testing.T) {
+	// Note: "0" is excluded — Sscanf reduces it to the zero value, which the
+	// parser reports as a *missing* spine_version (covered by TestEmptyManifest).
+	for _, v := range []string{"4", "99", "-1"} {
+		dir := t.TempDir()
+		path := writeManifest(t, dir, "future.spine", "spine_version: "+v+"\n")
+		_, err := manifest.ParseManifest(path)
+		if err == nil {
+			t.Fatalf("spine_version %s must be rejected, got nil error", v)
+		}
+		if !strings.Contains(err.Error(), "unsupported") || !strings.Contains(err.Error(), "versions 1 to 3") {
+			t.Errorf("spine_version %s: wrong error message: %s", v, err.Error())
+		}
+	}
+}
+
+// stripe.checkout is tier 3 — legal in a v3 manifest, refused below it.
+func TestTierThreeActionGating(t *testing.T) {
+	checkoutRoute := `
+nodes:
+  N:
+    emits:
+      - event: PAY
+        payload:
+          order_id: string
+
+routes:
+  - on: PAY
+    steps:
+      - action: stripe.checkout
+        order_id: $event.payload.order_id
+        amount: 12.00
+        success_url: "https://shop.example.com/#/orders"
+        cancel_url: "https://shop.example.com/#/catalog"
+`
+	v3dir := t.TempDir()
+	v3Path := writeManifest(t, v3dir, "v3.spine", "spine_version: 3\n"+checkoutRoute)
+	if _, err := manifest.ParseManifest(v3Path); err != nil {
+		t.Fatalf("v3 manifest using stripe.checkout must parse, got: %v", err)
+	}
+
+	v2dir := t.TempDir()
+	v2Path := writeManifest(t, v2dir, "v2.spine", "spine_version: 2\n"+checkoutRoute)
+	_, err := manifest.ParseManifest(v2Path)
+	if err == nil {
+		t.Fatal("v2 manifest using stripe.checkout must be rejected")
+	}
+	for _, want := range []string{"stripe.checkout", "spine_version: 3"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q: %s", want, err.Error())
+		}
+	}
+}
+
+func TestGatedActionRequiresNewerVersion(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "gated.spine", `spine_version: 1
+
+nodes:
+  N:
+    emits:
+      - event: NOTIFY
+        payload:
+          email: string
+
+routes:
+  - on: NOTIFY
+    steps:
+      - action: email.send
+        to: $event.payload.email
+        subject: hi
+        body: yo
+`)
+
+	_, err := manifest.ParseManifest(path)
+	if err == nil {
+		t.Fatal("v1 manifest using email.send must be rejected")
+	}
+	for _, want := range []string{"email.send", "spine_version: 2"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error missing %q: %s", want, err.Error())
+		}
+	}
+}
+
+func TestGatedActionUnlockedAtV2(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "unlocked.spine", `spine_version: 2
+
+database:
+  tables:
+    - subscribers
+
+nodes:
+  N:
+    emits:
+      - event: CAMPAIGN
+        payload:
+          subject: string
+          body: string
+
+routes:
+  - on: CAMPAIGN
+    steps:
+      - action: email.broadcast
+        table: subscribers
+        where: "unsubscribed = 0"
+        subject: $event.payload.subject
+        body: $event.payload.body
+`)
+
+	if _, err := manifest.ParseManifest(path); err != nil {
+		t.Fatalf("v2 manifest using email.broadcast must parse, got: %v", err)
+	}
+}
+
 // --- Test 8: Route with no steps produces error ---
 
 func TestRouteWithNoSteps(t *testing.T) {

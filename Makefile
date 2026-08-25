@@ -1,6 +1,6 @@
 # Spine Makefile — Build, Test & Install Automation
 
-VERSION := 2.3.0
+VERSION := 3.0.0
 BINARY_NAME := spine
 INSTALL_PATH := /usr/local/bin
 

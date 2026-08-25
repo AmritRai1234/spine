@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react"
-import { ChevronDown, PackageSearch } from "lucide-react"
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent } from "react"
+import { ChevronDown, CreditCard, PackageSearch } from "lucide-react"
+import { toast } from "sonner"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -138,6 +139,43 @@ function OrderCard({
   onToggle: () => void
 }) {
   const [items, setItems] = useState<OrderItemRow[] | null>(null)
+  const [paying, setPaying] = useState(false)
+  const payTimer = useRef<number | null>(null)
+
+  useEffect(() => () => {
+    if (payTimer.current !== null) window.clearTimeout(payTimer.current)
+  }, [])
+
+  // Pay now: ask the engine for a Stripe Checkout Session (tier-3 action —
+  // the server derives the amount from the verified order row). The engine
+  // answers with a CHECKOUT_READY broadcast carrying the hosted-page URL.
+  function payNow() {
+    setPaying(true)
+    const off = spine.onState("CHECKOUT_READY", (data) => {
+      if (String((data as Record<string, unknown>)?.order_id) !== order.id) return
+      if (payTimer.current !== null) window.clearTimeout(payTimer.current)
+      off()
+      setPaying(false)
+      const url = String((data as Record<string, unknown>)?.checkout_url ?? "")
+      if (url) {
+        toast.success("Redirecting to secure checkout…")
+        window.location.href = url
+      } else {
+        toast.error("Online payment isn't configured for this store yet.")
+      }
+    })
+    payTimer.current = window.setTimeout(() => {
+      off()
+      setPaying(false)
+      toast.error("Checkout didn't start — try again shortly.")
+    }, 10_000)
+    spine.emit("CREATE_CHECKOUT", { order_id: order.id }).catch(() => {
+      if (payTimer.current !== null) window.clearTimeout(payTimer.current)
+      off()
+      setPaying(false)
+      toast.error("Could not reach the store — try again shortly.")
+    })
+  }
 
   useEffect(() => {
     if (!expanded || items !== null) return
@@ -227,6 +265,12 @@ function OrderCard({
                 <span>Total</span>
                 <span>{money(total)}</span>
               </div>
+              {order.status === "pending" && (
+                <Button className="mt-2 w-full" onClick={payNow} disabled={paying}>
+                  <CreditCard className="mr-2 h-4 w-4" />
+                  {paying ? "Starting checkout…" : "Pay now with card"}
+                </Button>
+              )}
             </>
           )}
         </CardContent>
