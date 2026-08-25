@@ -1,14 +1,14 @@
 <p align="center">
   <img src="https://raw.githubusercontent.com/AmritRai1234/spine/main/assets/logo.png?v=2" width="200" alt="Spine Logo"><br>
   <strong>SPINE</strong><br>
-  <em>Declarative Event-Driven Backend Engine (v5.0 Complete)</em>
+  <em>Declarative Event-Driven Backend Engine (v2.3.0)</em>
 </p>
 
 <p align="center">
-  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/throughput-277K%20emit%2Fs-brightgreen?style=flat-square" alt="Throughput"></a>
+  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/throughput-274K%20emit%2Fs-brightgreen?style=flat-square" alt="Throughput"></a>
   <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/latency-3.6μs-blue?style=flat-square" alt="Latency"></a>
-  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/allocs-31%20per%20emit-purple?style=flat-square" alt="Allocs"></a>
-  <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-v1.24-00ADD8?style=flat-square&logo=go" alt="Go"></a>
+  <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/allocs-28%20per%20emit-purple?style=flat-square" alt="Allocs"></a>
+  <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-v1.25-00ADD8?style=flat-square&logo=go" alt="Go"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPLv3-blue?style=flat-square" alt="License"></a>
   <a href="#tests"><img src="https://img.shields.io/badge/tests-100%25%20pass-brightgreen?style=flat-square" alt="Tests"></a>
 </p>
@@ -737,7 +737,8 @@ Spine adapts the **Blackboard Architectural Pattern** for high-performance event
                 ▼                      ▼                      ▼
  ┌─────────────────────────────┐ ┌───────────────────┐ ┌─────────────────────────────┐
  │    PubSub Backplane         │ │ DB Outbox Queue   │ │   Turso / libSQL Primary    │
- │ (Redis Streams / NATS)      │ │ (_spine_outbox)   │ │   (Multi-Region Replicas)   │
+ │ (pluggable interface;       │ │ (_spine_outbox)   │ │   (Multi-Region Replicas)   │
+ │  Redis/NATS planned)        │ │                   │ │                             │
  └─────────────────────────────┘ └───────────────────┘ └─────────────────────────────┘
 ```
 
@@ -755,7 +756,7 @@ spine/
 │   │   ├── engine.go    # HTTP server mux, graceful shutdown & health probes
 │   │   ├── hub.go       # Async WebSocket broadcasting hub
 │   │   ├── outbox.go    # Notification-driven outbox retry queue
-│   │   ├── pubsub.go    # Local & distributed PubSub backplane (Redis/NATS)
+│   │   ├── pubsub.go    # Pluggable PubSub backplane interface (in-process adapter; Redis/NATS planned)
 │   │   ├── optimizer.go # Self-tuning adaptive batch size & interval optimizer
 │   │   ├── cond.go      # Dynamic condition evaluator (if: guards)
 │   │   ├── vars.go      # Template variable resolver ($now, $uuid, $event)
@@ -765,12 +766,15 @@ spine/
 │   │   ├── parser.go    # Multi-file manifest parser with validation
 │   │   ├── registry.go  # Lock-free atomic route & node registry
 │   │   └── schema.go    # AST struct definitions
+│   ├── codegen/         # TypeScript type generation from manifests
+│   ├── templates/       # Project scaffolding (chat, dashboard, iot, shadcn)
 │   └── middleware/      # Security & access control middleware
 │       ├── auth.go      # Timing-safe API key & Bearer token verification
 │       └── ratelimit.go # 64-shard token-bucket rate limiter
 ├── examples/
 │   └── app.spine        # Full example manifest
-├── tests/               # 24 tests across 11 files
+├── sdk/                 # Python & TypeScript client SDKs
+├── tests/               # 85 tests across 33 files
 ├── web/                 # Developer web dashboard
 ├── spine.go             # Public Go library API facade
 ├── Dockerfile           # Multi-stage Docker build
@@ -889,12 +893,17 @@ Measured on AMD Ryzen 7 5825U (16 threads):
 
 | Benchmark | ops/sec | ns/op | B/op | allocs/op |
 |---|---|---|---|---|
-| **EmitSingle** (full pipeline) | 277,000 | 3,611 | 1,419 | 31 |
-| **EmitParallel** (16 goroutines) | 215,000 | 4,636 | 1,429 | 30 |
-| **EmitWithValidation** (typed) | 225,000 | 4,439 | 1,813 | 35 |
-| **RegistryLookup** (lock-free) | 17,700,000 | 66 | 7 | 1 |
-| **ParseSmallManifest** (3 nodes) | 75,900 | 15,348 | 8,966 | 89 |
-| **ParseLargeManifest** (20 nodes) | 20,400 | 56,400 | 50,900 | 592 |
+| **EmitSingle** (full pipeline) | 274,000 | 3,655 | 1,405 | 28 |
+| **EmitE2ELatency** (p50/p95/p99) | 285,000 | 3,512 (p50 1.2μs / p99 4.9μs) | 1,395 | 27 |
+| **EmitParallel** (16 goroutines) | 200,000 | 5,003 | 1,406 | 27 |
+| **EmitWithValidation** (typed) | 222,000 | 4,491 | 1,818 | 33 |
+| **EmitWithUUID** ($uuid gen) | 140,000 | 7,133 | 2,499 | 39 |
+| **EmitParallelSteps** (multi-step) | 70,000 | 14,219 | 3,297 | 63 |
+| **RegistryLookup** (lock-free) | 14,900,000 | 67 | 7 | 1 |
+| **QueryTableRows** (DB read) | 23,400 | 42,749 | 20,229 | 283 |
+| **ParseSmallManifest** (3 nodes) | 66,200 | 15,100 | 8,966 | 89 |
+| **ParseLargeManifest** (20 nodes) | 17,800 | 56,254 | 50,899 | 592 |
+| **ParseWithIncludes** (multi-file) | 29,600 | 33,745 | 17,668 | 107 |
 
 Run benchmarks yourself:
 
@@ -906,7 +915,7 @@ go test ./tests/ -bench=. -benchmem -count=3
 
 ## Tests
 
-**100% of test suites passing cleanly** across 25+ test files:
+**100% of test suites passing cleanly** across 33 test files:
 
 | Suite | Coverage |
 |---|---|
@@ -921,7 +930,10 @@ go test ./tests/ -bench=. -benchmem -count=3
 | `webhook_test.go` | Webhook ingestion (`POST /webhook/:provider`) |
 | `fts_test.go` | Full-text search (`fts.search`) |
 | `metrics_test.go` | Prometheus `/metrics` and `/admin/usage` |
-| `roadmap_completion_test.go` | Full end-to-end 5-Year Roadmap feature parity verification |
+| `dialect_test.go` | Per-backend SQL generation (SQLite pipeline, upsert conflicts, auto-PK DDL) |
+| `db_actions_test.go` | Built-in actions: insert/upsert/update/sum/set, typed columns |
+| `parser_test.go` | Manifest parsing, validation & error suggestions |
+| `e2e_test.go` | End-to-end HTTP/WebSocket integration flows |
 
 ```bash
 # Run all tests
