@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react"
-import { CreditCard, Percent, Save, Store } from "lucide-react"
+import { CreditCard, Globe, Percent, Save, Store } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -33,6 +33,10 @@ export default function AdminSettings() {
 
   const [couponCode, setCouponCode] = useState("")
   const [couponPercent, setCouponPercent] = useState("")
+
+  const [domainInput, setDomainInput] = useState("")
+  const [connectedDomains, setConnectedDomains] = useState<string[] | null>(null) // null = unavailable
+  const [domainBusy, setDomainBusy] = useState(false)
 
   const tick = useSpineStateTick("SETTING_SAVED")
 
@@ -105,6 +109,38 @@ export default function AdminSettings() {
       setCouponPercent("")
     } else {
       toast.error(res.error ?? "Coupon failed")
+    }
+  }
+
+  async function connectDomain(e: FormEvent) {
+    e.preventDefault()
+    const domain = domainInput.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0]
+    if (!domain || !domain.includes(".")) {
+      toast.error("Enter a hostname like shop.example.com")
+      return
+    }
+    setDomainBusy(true)
+    try {
+      const res = await adminClient().emit("DOMAIN_CONNECT", { domain })
+      if (res.status === "ok") {
+        setConnectedDomains((prev) => (prev?.includes(domain) ? prev : [...(prev ?? []), domain]))
+        setDomainInput("")
+        toast.success(`${domain} connected — certificate is issued on first visit`)
+      } else {
+        toast.error(res.error ?? "Could not connect that domain")
+      }
+    } finally {
+      setDomainBusy(false)
+    }
+  }
+
+  async function disconnectDomain(domain: string) {
+    const res = await adminClient().emit("DOMAIN_DISCONNECT", { domain })
+    if (res.status === "ok") {
+      setConnectedDomains((prev) => (prev ?? []).filter((d) => d !== domain))
+      toast.success(`${domain} disconnected`)
+    } else {
+      toast.error(res.error ?? "Disconnect failed")
     }
   }
 
@@ -198,6 +234,62 @@ export default function AdminSettings() {
                 Connect Stripe
               </Button>
             </form>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <Globe className="h-4 w-4" /> Domains
+          </CardTitle>
+          <CardDescription>
+            Connect a custom domain: point its DNS A record at this server, then
+            add it here. A free Let&apos;s Encrypt certificate is issued
+            automatically on the first visit — no restart needed.
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {connectedDomains === null ? (
+            <p className="text-sm text-muted-foreground">
+              Domain connect is available when the server runs with{" "}
+              <code className="rounded bg-muted px-1">--domain</code> (Let&apos;s Encrypt mode).
+            </p>
+          ) : (
+            <div className="space-y-3">
+              {connectedDomains.length > 0 && (
+                <ul className="space-y-2">
+                  {connectedDomains.map((d) => (
+                    <li key={d} className="flex items-center gap-3">
+                      <Badge>connected · {d}</Badge>
+                      <Button variant="outline" size="sm" onClick={() => disconnectDomain(d)}>
+                        Disconnect
+                      </Button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <form onSubmit={connectDomain} className="flex items-end gap-3">
+                <label className="flex-1 space-y-1.5">
+                  <span className="text-sm font-medium">Domain</span>
+                  <Input
+                    value={domainInput}
+                    onChange={(e) => setDomainInput(e.target.value)}
+                    placeholder="shop.example.com"
+                    disabled={domainBusy}
+                    required
+                  />
+                </label>
+                <Button type="submit" variant="outline" disabled={domainBusy}>
+                  {domainBusy ? "Checking DNS…" : "Connect domain"}
+                </Button>
+              </form>
+              <p className="text-xs text-muted-foreground">
+                DNS must resolve to this server before connecting. Certificates
+                are cached and renewed automatically; connections reset when the
+                server restarts.
+              </p>
+            </div>
           )}
         </CardContent>
       </Card>

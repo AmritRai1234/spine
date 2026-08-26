@@ -2,6 +2,7 @@ package e2e
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"io"
 	"net"
@@ -172,6 +173,12 @@ nodes:
           stripe_secret: string
           webhook_secret: string
       - event: STRIPE_DISCONNECT
+      - event: DOMAIN_CONNECT
+        payload:
+          domain: string
+      - event: DOMAIN_DISCONNECT
+        payload:
+          domain: string
 
   Marketing:
     emits:
@@ -572,6 +579,17 @@ routes:
       - action: stripe.connect
         mode: disconnect
     emit: STRIPE_DISCONNECTED
+
+  - on: DOMAIN_CONNECT
+    steps:
+      - action: domain.connect
+    emit: DOMAIN_CONNECTED
+
+  - on: DOMAIN_DISCONNECT
+    steps:
+      - action: domain.connect
+        mode: disconnect
+    emit: DOMAIN_DISCONNECTED
 `
 
 func setupEcommerceEngine(t *testing.T) (*spine.Engine, func()) {
@@ -1739,6 +1757,72 @@ func TestEcommerceStripeRuntimeConnect(t *testing.T) {
 	if got := stripe.count(); got != before {
 		t.Fatalf("post-disconnect must make zero Stripe calls, got delta %d", got-before)
 	}
+}
+
+// domain.connect: TLS-off mode refuses; ACME mode accepts a valid resolvable
+// hostname into the allowlist and rejects junk input. Disconnect drops it.
+func TestEcommerceDomainConnect(t *testing.T) {
+	eng, cleanup := setupEcommerceEngine(t)
+	defer cleanup()
+	bus := eng.Bus
+
+	// Plain-HTTP mode (tests never call ListenAndServeTLS) → refuse loudly.
+	if _, err := bus.Emit("DOMAIN_CONNECT", map[string]interface{}{"domain": "shop.example.com"}); err == nil {
+		t.Fatalf("domain.connect without TLS mode must fail")
+	}
+
+	// Simulate an ACME deployment (same path setDomainMode takes at startup).
+	setEngineDomainMode := func(m string) { eng.SetDomainMode(m) }
+	setEngineDomainMode("acme")
+	t.Cleanup(func() { setEngineDomainMode("") })
+
+	// Invalid input is rejected before any DNS work.
+	for _, bad := range []string{"", "not a domain", "*.example.com"} {
+		payload := map[string]interface{}{}
+		if bad != "" {
+			payload["domain"] = bad
+		}
+		if _, err := bus.Emit("DOMAIN_CONNECT", payload); err == nil {
+			t.Fatalf("invalid domain %q must fail", bad)
+		}
+	}
+
+	// A real public hostname that resolves elsewhere must fail verification
+	// (network required: skip when there is no egress at all).
+	if _, err := bus.Emit("DOMAIN_CONNECT", map[string]interface{}{"domain": "example.com"}); err != nil && !hasEgress() {
+		t.Skipf("no network egress to exercise DNS verification: %v", err)
+	} else if err == nil {
+		t.Fatalf("example.com does not point at the test host — connect should have been rejected")
+	}
+
+	// Trust mode (operator escape hatch, used by embedders/tests): skips live
+	// DNS checks and accepts a normalizing-pasted URL too.
+	t.Setenv("SPINE_TRUST_DOMAIN_ON_CONNECT", "1")
+	res, err := bus.Emit("DOMAIN_CONNECT", map[string]interface{}{"domain": "https://Shop.Example.com/store"})
+	if err != nil || res["status"] != "ok" {
+		t.Fatalf("trust-mode connect failed: %v %v", err, res)
+	}
+	ok, domains := bus.DomainConnection()
+	if !ok || len(domains) != 1 || domains[0] != "shop.example.com" {
+		t.Fatalf("expected [shop.example.com], got ok=%v %v", ok, domains)
+	}
+
+	// Disconnect removes it again.
+	if res, err := bus.Emit("DOMAIN_DISCONNECT", map[string]interface{}{"domain": "shop.example.com"}); err != nil || res["status"] != "ok" {
+		t.Fatalf("disconnect failed: %v %v", err, res)
+	}
+	if _, domains := bus.DomainConnection(); len(domains) != 0 {
+		t.Fatalf("post-disconnect expected no domains, got %v", domains)
+	}
+}
+
+// hasEgress reports whether this machine could plausibly perform DNS lookups
+// and outbound HTTPS at all (used to keep the domain test hermetic offline).
+func hasEgress() bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	addrs, err := net.DefaultResolver.LookupHost(ctx, "example.com")
+	return err == nil && len(addrs) > 0
 }
 
 // A Stripe-side rejection must fail the route into CHECKOUT_FAILED — never

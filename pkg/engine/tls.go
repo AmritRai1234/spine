@@ -79,9 +79,21 @@ func newACMEManager(cfg *TLSConfig) (*autocert.Manager, error) {
 		Prompt:     autocert.AcceptTOS,
 		Email:      cfg.Email,
 		Cache:      autocert.DirCache(cacheDir),
-		HostPolicy: autocert.HostWhitelist(keysOf(allowed)...),
+		HostPolicy: acmeDynamicHostPolicy(keysOf(allowed)),
 	}
 	return m, nil
+}
+
+// acmeDynamicHostPolicy returns a HostPolicy that accepts the startup domain
+// list PLUS any hostname the admin connects at runtime via domain.connect
+// (checked in the same order: exact, lowercase match; wildcards never pass).
+func acmeDynamicHostPolicy(static []string) autocert.HostPolicy {
+	return func(ctx context.Context, host string) error {
+		if acmeHostAllowed(host, static) {
+			return nil
+		}
+		return fmt.Errorf("acme/autocert: host %q not configured (connect it from the admin panel or restart with --domain %s)", host, host)
+	}
 }
 
 func keysOf(m map[string]bool) []string {
@@ -149,6 +161,7 @@ func (e *Engine) ListenAndServeTLS(addr string, cfg *TLSConfig) error {
 
 	switch {
 	case len(cfg.Domains) > 0:
+		setDomainMode("acme")
 		m, err := newACMEManager(cfg)
 		if err != nil {
 			return err
@@ -166,6 +179,7 @@ func (e *Engine) ListenAndServeTLS(addr string, cfg *TLSConfig) error {
 		)
 		log.Printf("[spine] ACME enabled for %v (cert cache: %s)", cfg.Domains, orDefault(cfg.CacheDir, DefaultCertCacheDir))
 	case cfg.CertFile != "" && cfg.KeyFile != "":
+		setDomainMode("byocert")
 		// State the TLS floor explicitly instead of relying on the Go
 		// server default: TLS 1.2 minimum, HTTP/2 negotiated.
 		srv.TLSConfig = &tls.Config{

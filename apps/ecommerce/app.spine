@@ -199,6 +199,14 @@ nodes:
           stripe_secret: string
           webhook_secret: string
       - event: STRIPE_DISCONNECT
+      # Admin panel "Connect domain" — DNS is verified server-side, then the
+      # hostname joins the live ACME allowlist (session-only, like Stripe).
+      - event: DOMAIN_CONNECT
+        payload:
+          domain: string
+      - event: DOMAIN_DISCONNECT
+        payload:
+          domain: string
     listens:
       - state: ORDER_STATUS_CHANGED
         payload:
@@ -995,6 +1003,21 @@ routes:
       - action: stripe.connect
         mode: disconnect
     emit: STRIPE_DISCONNECTED
+
+  # Admin connects a custom domain from the panel. The engine verifies DNS,
+  # then adds the host to the live Let's Encrypt allowlist (process memory —
+  # restart clears it; startup --domain flags re-apply).
+  - on: DOMAIN_CONNECT
+    steps:
+      - action: domain.connect
+    emit: DOMAIN_CONNECTED
+
+  # Admin disconnects a runtime domain (empty payload drops all of them).
+  - on: DOMAIN_DISCONNECT
+    steps:
+      - action: domain.connect
+        mode: disconnect
+    emit: DOMAIN_DISCONNECTED
 
   # Admin saves a flat shipping rate for a country ("*" = default zone).
   # Missing zone at checkout = free shipping (0).
