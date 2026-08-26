@@ -292,8 +292,14 @@ func (e *Engine) SetWebhookSecret(provider, secret string) {
 	}
 }
 
-// GetWebhookSecret returns the configured secret for a provider.
+// GetWebhookSecret returns the configured secret for a provider. Stripe also
+// consults the runtime override installed by stripe.connect (env still wins).
 func (e *Engine) GetWebhookSecret(provider string) string {
+	if provider == "stripe" {
+		if s := stripeActiveWebhookSecret(); s != "" {
+			return s
+		}
+	}
 	e.webhookMu.RLock()
 	defer e.webhookMu.RUnlock()
 	return e.webhookSecrets[provider]

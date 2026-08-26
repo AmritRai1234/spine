@@ -167,6 +167,11 @@ nodes:
       - event: WEBHOOK_STRIPE
         payload:
           type: string
+      - event: STRIPE_CONNECT
+        payload:
+          stripe_secret: string
+          webhook_secret: string
+      - event: STRIPE_DISCONNECT
 
   Marketing:
     emits:
@@ -556,6 +561,17 @@ routes:
     steps:
       - action: log.write
         message: "[ALERT] checkout session failed for order: $event.payload.error"
+
+  - on: STRIPE_CONNECT
+    steps:
+      - action: stripe.connect
+    emit: STRIPE_CONNECTED
+
+  - on: STRIPE_DISCONNECT
+    steps:
+      - action: stripe.connect
+        mode: disconnect
+    emit: STRIPE_DISCONNECTED
 `
 
 func setupEcommerceEngine(t *testing.T) (*spine.Engine, func()) {
@@ -1645,6 +1661,83 @@ func TestEcommerceStripeCheckoutSilentWithoutKey(t *testing.T) {
 	}
 	if got := stripe.count(); got != 0 {
 		t.Fatalf("no-key engine must not call Stripe, got %d calls", got)
+	}
+}
+
+// Runtime Stripe connect: the admin panel's "Connect Stripe" flow installs a
+// secret key in engine memory via stripe.connect — no env var, no restart —
+// and checkout then works. Disconnect returns the engine to the silent
+// no-op state. Env keys keep precedence in all cases.
+func TestEcommerceStripeRuntimeConnect(t *testing.T) {
+	stripe := &fakeStripeServer{}
+	t.Setenv("STRIPE_SECRET_KEY", "")
+	t.Setenv("STRIPE_API_BASE", stripe.start(t))
+	t.Setenv("STORE_PUBLIC_URL", "https://shop.example.com")
+
+	eng, cleanup := setupEcommerceEngine(t)
+	defer cleanup()
+	bus := eng.Bus
+
+	productID := publishProduct(t, bus, "rc-sku", 7.0, 5)
+	orderID := "ord-rc-1"
+	bus.Emit("ADD_ORDER_ITEM", map[string]interface{}{
+		"order_id": orderID, "product_id": productID,
+		"name": "Product rc-sku", "price": 7.0, "qty": 1,
+	})
+	bus.Emit("PLACE_ORDER", map[string]interface{}{
+		"cart_id": "cart-rc", "email": "x@example.com",
+		"order_id": orderID, "country": "*",
+	})
+	waitUntil(t, "order row flushed", func() bool {
+		var st string
+		return bus.DB().QueryRow(`SELECT status FROM orders WHERE id = ?`, orderID).Scan(&st) == nil
+	})
+
+	// Without a key (and without connecting) — no API call.
+	if _, err := bus.Emit("CREATE_CHECKOUT", map[string]interface{}{"order_id": orderID}); err != nil {
+		t.Fatalf("pre-connect checkout must not fail: %v", err)
+	}
+	if got := stripe.count(); got != 0 {
+		t.Fatalf("no runtime connect yet — expected 0 Stripe calls, got %d", got)
+	}
+
+	// Connect through the admin event path (malformed key rejected first).
+	if _, err := bus.Emit("STRIPE_CONNECT", map[string]interface{}{
+		"stripe_secret":  "not-a-stripe-key",
+		"webhook_secret": "",
+	}); err == nil {
+		t.Fatalf("malformed key must fail the route")
+	}
+
+	res, err := bus.Emit("STRIPE_CONNECT", map[string]interface{}{
+		"stripe_secret":  "sk_test_fakeRUNTIMEkey000000000000000000",
+		"webhook_secret": "",
+	})
+	if err != nil || res["status"] != "ok" {
+		t.Fatalf("stripe.connect failed: %v %v", err, res)
+	}
+
+	if _, err := bus.Emit("CREATE_CHECKOUT", map[string]interface{}{"order_id": orderID}); err != nil {
+		t.Fatalf("post-connect checkout failed: %v", err)
+	}
+	if got := stripe.count(); got != 1 {
+		t.Fatalf("after connect expected exactly 1 Stripe call, got %d", got)
+	}
+	req := stripe.requests[0]
+	if req.auth != "Bearer sk_test_fakeRUNTIMEkey000000000000000000" {
+		t.Errorf("Authorization = %q — runtime key not used for the Sessions call", req.auth)
+	}
+
+	// Disconnect restores the silent no-op.
+	if res, err := bus.Emit("STRIPE_DISCONNECT", map[string]interface{}{}); err != nil || res["status"] != "ok" {
+		t.Fatalf("disconnect failed: %v %v", err, res)
+	}
+	before := stripe.count()
+	if _, err := bus.Emit("CREATE_CHECKOUT", map[string]interface{}{"order_id": orderID}); err != nil {
+		t.Fatalf("post-disconnect checkout must not fail: %v", err)
+	}
+	if got := stripe.count(); got != before {
+		t.Fatalf("post-disconnect must make zero Stripe calls, got delta %d", got-before)
 	}
 }
 

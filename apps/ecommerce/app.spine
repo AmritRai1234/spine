@@ -192,6 +192,13 @@ nodes:
       - event: WEBHOOK_STRIPE
         payload:
           type: string
+      # Admin panel "Connect Stripe" — credentials ride only through memory:
+      # stripe.connect installs them in-process; nothing is persisted.
+      - event: STRIPE_CONNECT
+        payload:
+          stripe_secret: string
+          webhook_secret: string
+      - event: STRIPE_DISCONNECT
     listens:
       - state: ORDER_STATUS_CHANGED
         payload:
@@ -972,6 +979,22 @@ routes:
       - action: log.write
         message: "Setting saved: $event.payload.key"
     emit: SETTING_SAVED
+
+  # Admin connects Stripe from the panel. The engine installs the secret key
+  # and (optional) webhook signing secret in process memory for the lifetime
+  # of this run — env vars keep precedence, nothing is written to disk or DB.
+  # Only a masked label (mode + last 4) is broadcast back.
+  - on: STRIPE_CONNECT
+    steps:
+      - action: stripe.connect
+    emit: STRIPE_CONNECTED
+
+  # Admin disconnects runtime credentials (restart also clears them).
+  - on: STRIPE_DISCONNECT
+    steps:
+      - action: stripe.connect
+        mode: disconnect
+    emit: STRIPE_DISCONNECTED
 
   # Admin saves a flat shipping rate for a country ("*" = default zone).
   # Missing zone at checkout = free shipping (0).

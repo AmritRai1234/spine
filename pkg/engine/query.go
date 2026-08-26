@@ -453,6 +453,16 @@ func (b *Bus) initEventTable() error {
 // caller can stamp the state broadcasts with the audit id — the reconnect
 // replay cursor. Without clients the write stays batched (throughput).
 func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitted []string) int64 {
+	// Secret hygiene: credential-bearing fields are masked before the payload
+	// hits the durable audit log. stripe.connect is an admin event whose
+	// payload would otherwise persist a live Stripe key in _spine_events.
+	if s, ok := payload["stripe_secret"].(string); ok {
+		payload["stripe_secret"] = maskStripeKey(s)
+	}
+	if s, ok := payload["webhook_secret"].(string); ok && s != "" {
+		payload["webhook_secret"] = "••••" + s[max(0, len(s)-4):]
+	}
+
 	buf := auditBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	json.NewEncoder(buf).Encode(payload)

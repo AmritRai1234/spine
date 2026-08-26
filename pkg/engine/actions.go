@@ -98,6 +98,8 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		return b.dbFanout(step, eventName, payload)
 	case "stripe.checkout":
 		return b.stripeCheckout(step, eventName, payload)
+	case "stripe.connect":
+		return b.stripeConnect(step, eventName, payload)
 	default:
 		if val, ok := b.customActions.Load(step.Action); ok {
 			if fn, isFn := val.(ActionFunc); isFn {

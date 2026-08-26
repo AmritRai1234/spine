@@ -11,6 +11,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/AmritRai1234/spine/pkg/manifest"
 )
@@ -42,9 +43,116 @@ import (
 
 const stripeDefaultAPIBase = "https://api.stripe.com"
 
+// Runtime-configurable Stripe credentials, set via the stripe.connect action
+// (admin panel "Connect Stripe"). Environment wins: STRIPE_SECRET_KEY /
+// SPINE_WEBHOOK_SECRET_STRIPE keep precedence so ops-level configuration can
+// never be silently overridden from the UI. Values are ephemeral — they live
+// until process restart, which keeps them out of the database entirely.
+var (
+	stripeSecretOverride     atomic.Pointer[string]
+	stripeWebhookOverride    atomic.Pointer[string]
+	stripeConnectedLabel     atomic.Pointer[string] // masked hint for dashboards
+)
+
+// SetStripeSecret installs a runtime secret key for stripe.checkout and a
+// matching webhook signing secret. Empty webhook secret leaves current value.
+func (b *Bus) SetStripeSecret(secret, webhookSecret string) {
+	if secret != "" {
+		s := secret
+		stripeSecretOverride.Store(&s)
+		label := maskStripeKey(secret)
+		stripeConnectedLabel.Store(&label)
+	}
+	if webhookSecret != "" {
+		w := webhookSecret
+		stripeWebhookOverride.Store(&w)
+	}
+}
+
+// StripeConnection reports whether checkout is configured and returns a
+// masked label (mode + last 4 chars) safe for dashboard display.
+func (b *Bus) StripeConnection() (connected bool, label string) {
+	if l := stripeConnectedLabel.Load(); l != nil {
+		return true, *l
+	}
+	if s := os.Getenv("STRIPE_SECRET_KEY"); strings.HasPrefix(s, "sk_") {
+		return true, maskStripeKey(s)
+	}
+	return false, ""
+}
+
+// stripeActiveSecret resolves the effective secret key: env first, then the
+// runtime override installed by stripe.connect.
+func stripeActiveSecret() string {
+	if s := os.Getenv("STRIPE_SECRET_KEY"); s != "" {
+		return s
+	}
+	if p := stripeSecretOverride.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+// stripeActiveWebhookSecret mirrors stripeActiveSecret for signing secrets.
+func stripeActiveWebhookSecret() string {
+	for _, env := range []string{"SPINE_WEBHOOK_SECRET_STRIPE", "STRIPE_WEBHOOK_SECRET"} {
+		if v := os.Getenv(env); v != "" {
+			return v
+		}
+	}
+	if p := stripeWebhookOverride.Load(); p != nil {
+		return *p
+	}
+	return ""
+}
+
+func maskStripeKey(key string) string {
+	mode := "live"
+	if strings.Contains(key[:min(8, len(key))], "test") || !strings.HasPrefix(key, "sk_live") {
+		mode = "test"
+	}
+	tail := key
+	if len(key) > 4 {
+		tail = key[len(key)-4:]
+	}
+	return mode + " ••••" + tail
+}
+
+// stripeConnect implements the `stripe.connect` action: install runtime
+// credentials carried by an admin event.
+//
+//	payload: { stripe_secret: "sk_test_…", webhook_secret?: "whsec_…" }
+//
+// Never logs the values. Emits nothing itself; the manifest route broadcasts
+// a masked-only connected state afterwards.
+func (b *Bus) stripeConnect(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
+	connecting := strings.ToLower(ResolveVariables(step.Config["mode"], eventName, payload)) != "disconnect"
+
+	var secret, hook string
+	if connecting {
+		secret = strings.TrimSpace(ResolveVariables("$event.payload.stripe_secret", eventName, payload))
+		hook = strings.TrimSpace(ResolveVariables("$event.payload.webhook_secret", eventName, payload))
+		if !strings.HasPrefix(secret, "sk_test_") && !strings.HasPrefix(secret, "sk_live_") &&
+			!strings.HasPrefix(secret, "rk_") {
+			return fmt.Errorf("stripe.connect requires payload 'stripe_secret' starting with sk_test_/sk_live_/rk_")
+		}
+	}
+
+	b.SetStripeSecret(secret, hook)
+
+	if connecting {
+		log.Printf("[stripe] runtime credentials connected (%s)", maskStripeKey(secret))
+	} else {
+		stripeSecretOverride.Store(nil)
+		stripeConnectedLabel.Store(nil)
+		log.Printf("[stripe] runtime credentials disconnected")
+	}
+	return nil
+}
+
 // stripeCheckout implements the `stripe.checkout` action.
 func (b *Bus) stripeCheckout(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
-	secret := os.Getenv("STRIPE_SECRET_KEY")
+	secret := stripeActiveSecret()
 	if secret == "" {
 		log.Printf("[stripe] STRIPE_SECRET_KEY not set — stripe.checkout skipped (payments disabled)")
 		return nil

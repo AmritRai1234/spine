@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react"
-import { Percent, Save, Store } from "lucide-react"
+import { CreditCard, Percent, Save, Store } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -27,6 +27,10 @@ export default function AdminSettings() {
   const [lowStock, setLowStock] = useState("")
   const [loaded, setLoaded] = useState(false)
 
+  const [stripeKey, setStripeKey] = useState("")
+  const [stripeHook, setStripeHook] = useState("")
+  const [connectedLabel, setConnectedLabel] = useState("")
+
   const [couponCode, setCouponCode] = useState("")
   const [couponPercent, setCouponPercent] = useState("")
 
@@ -50,6 +54,38 @@ export default function AdminSettings() {
     await saveSetting("currency_symbol", currency.trim() || "$")
     await saveSetting("low_stock_threshold", String(Number(lowStock) || 10))
     toast.success("Settings saved")
+  }
+
+  async function connectStripe(e: FormEvent) {
+    e.preventDefault()
+    const secret = stripeKey.trim()
+    if (!secret.startsWith("sk_test_") && !secret.startsWith("sk_live_") && !secret.startsWith("rk_")) {
+      toast.error("Enter a Stripe secret key (sk_test_… or sk_live_…)")
+      return
+    }
+    const res = await adminClient().emit("STRIPE_CONNECT", {
+      stripe_secret: secret,
+      webhook_secret: stripeHook.trim(),
+    })
+    if (res.status === "ok") {
+      const tail = secret.slice(-4)
+      setConnectedLabel(`${secret.startsWith("sk_live") ? "live" : "test"} ••••${tail}`)
+      setStripeKey("")
+      setStripeHook("")
+      toast.success("Stripe connected — checkout is live for this session")
+    } else {
+      toast.error(res.error ?? "Could not connect Stripe")
+    }
+  }
+
+  async function disconnectStripe() {
+    const res = await adminClient().emit("STRIPE_DISCONNECT", {})
+    if (res.status === "ok") {
+      setConnectedLabel("")
+      toast.success("Stripe disconnected")
+    } else {
+      toast.error(res.error ?? "Disconnect failed")
+    }
   }
 
   async function createCoupon(e: FormEvent) {
@@ -105,6 +141,61 @@ export default function AdminSettings() {
               </div>
               <Button type="submit" className="w-full">
                 <Save className="mr-2 h-4 w-4" /> Save settings
+              </Button>
+            </form>
+          )}
+        </CardContent>
+      </Card>
+
+      <Card>
+        <CardHeader>
+          <CardTitle className="flex items-center gap-2 text-base">
+            <CreditCard className="h-4 w-4" /> Stripe payments
+          </CardTitle>
+          <CardDescription>
+            Paste a secret key from dashboard.stripe.com → Developers → API keys to
+            turn on checkout. Only a masked hint is stored — the key itself lives in
+            engine memory for this session (env vars still take precedence).
+          </CardDescription>
+        </CardHeader>
+        <CardContent>
+          {connectedLabel ? (
+            <div className="flex flex-wrap items-center gap-3">
+              <Badge>connected · {connectedLabel}</Badge>
+              <Button variant="outline" size="sm" onClick={disconnectStripe}>
+                Disconnect
+              </Button>
+              <span className="text-xs text-muted-foreground">
+                Card payments collect automatically at checkout.
+              </span>
+            </div>
+          ) : (
+            <form onSubmit={connectStripe} className="space-y-3">
+              <label className="block space-y-1.5">
+                <span className="text-sm font-medium">Secret key</span>
+                <Input
+                  type="password"
+                  value={stripeKey}
+                  onChange={(e) => setStripeKey(e.target.value)}
+                  placeholder="sk_test_…"
+                  autoComplete="off"
+                  required
+                />
+              </label>
+              <label className="block space-y-1.5">
+                <span className="text-sm font-medium">
+                  Webhook signing secret <span className="text-muted-foreground">(optional)</span>
+                </span>
+                <Input
+                  type="password"
+                  value={stripeHook}
+                  onChange={(e) => setStripeHook(e.target.value)}
+                  placeholder="whsec_…"
+                  autoComplete="off"
+                />
+              </label>
+              <Button type="submit" variant="outline" className="w-full">
+                Connect Stripe
               </Button>
             </form>
           )}
