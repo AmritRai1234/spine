@@ -49,8 +49,7 @@ routes:
 		t.Errorf("expected route parallel: true")
 	}
 
-	dbPath := "test_parallel.db"
-	defer os.Remove(dbPath)
+	dbPath := filepath.Join(t.TempDir(), "parallel.db")
 
 	reg := manifest.NewRegistry(schema)
 	hub := engine.NewHub()

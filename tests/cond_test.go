@@ -12,6 +12,7 @@ func TestEvaluateCondition(t *testing.T) {
 		"age":    25,
 		"email":  "alex@example.com",
 		"status": "active",
+		"title":  "big > small",
 	}
 
 	tests := []struct {
@@ -41,6 +42,21 @@ func TestEvaluateCondition(t *testing.T) {
 		{"-2.50 == -2.5", true}, // negative trailing zero — equal floats
 		{"007 != 7", true},      // leading zeros != — not equal
 		{"15.0 != 7", true},     // decimal != int — different numbers
+
+		// P3-4: single '=' is an alias for '=='
+		{"$event.payload.status = active", true},
+		{"$event.payload.status = 'inactive'", false},
+		{"$event.payload.age = 25", true},
+
+		// P3-4: operators inside quoted values must not split the condition
+		{"$event.payload.title contains 'big > small'", true},
+		{"$event.payload.title contains 'small > big'", false},
+
+		// P3-4: numeric comparisons between non-numeric operands are FALSE
+		// (no silent lexicographic fallback), unless both sides are quoted.
+		{"$event.payload.status > 'active'", false},
+		{"'abc' > '100'", true}, // quoted both sides — explicit string compare
+		{"'100' < 'abc'", true},
 	}
 
 	for _, tt := range tests {

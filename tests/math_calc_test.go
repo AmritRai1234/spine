@@ -118,8 +118,20 @@ func TestMathCalcRejectsInjection(t *testing.T) {
 	if err == nil {
 		t.Fatal("injected expression accepted")
 	}
-	if !strings.Contains(err.Error(), "unexpected character") {
-		t.Fatalf("expected parser rejection, got: %v", err)
+	if !strings.Contains(err.Error(), "must be a plain number") {
+		t.Fatalf("expected operand rejection, got: %v", err)
+	}
+
+	// Regression: an expression-shaped payload value ("0 + 9999") used to be
+	// spliced into the expression as text, letting a client forge computed
+	// totals (expr "1 + $event.payload.b" with b="0 + 9999" computed 10000).
+	// Payload values are operands, never expression text — this must fail.
+	_, err = eng.Bus.Emit("CALC_INJECT", map[string]interface{}{"b": "0 + 9999"})
+	if err == nil {
+		t.Fatal("expression-shaped operand accepted")
+	}
+	if !strings.Contains(err.Error(), "must be a plain number") {
+		t.Fatalf("expected operand rejection for '0 + 9999', got: %v", err)
 	}
 
 	// Table must still exist and be empty.

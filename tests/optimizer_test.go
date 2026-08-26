@@ -20,8 +20,11 @@ func TestAdaptiveOptimizer(t *testing.T) {
 		opt.RecordRequest()
 	}
 
-	// Wait for tune loop interval
-	time.Sleep(150 * time.Millisecond)
+	// Wait for the tune loop to react (poll — fixed sleeps are flaky)
+	deadline := time.Now().Add(5 * time.Second)
+	for opt.GetBatchSize() < 1000 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
 
 	if batchSize := opt.GetBatchSize(); batchSize < 1000 {
 		t.Errorf("expected batch size >= 1000 under high load, got %d", batchSize)

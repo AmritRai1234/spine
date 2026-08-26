@@ -840,3 +840,308 @@ routes:
 		t.Errorf("error should say event is not declared, got: %s", err.Error())
 	}
 }
+
+// --- Test 15: Root routes may reference events declared in included files ---
+
+func TestRootRouteReferencingIncludedEvent(t *testing.T) {
+	dir := t.TempDir()
+
+	eventsContent := `spine_version: 1
+
+nodes:
+  SharedNode:
+    emits:
+      - event: SHARED_EVENT
+        payload:
+          email: string
+`
+	writeManifest(t, dir, "events.spine", eventsContent)
+
+	// The root file routes on an event declared ONLY in the included file.
+	// Previously validation ran before the include merge, so this failed
+	// with a misleading "route references event ... (possible typo?)" error.
+	mainContent := `spine_version: 1
+
+includes:
+  - events.spine
+
+database:
+  tables:
+    - logs
+
+routes:
+  - on: SHARED_EVENT
+    steps:
+      - action: db.insert
+        table: logs
+`
+	mainPath := writeManifest(t, dir, "main.spine", mainContent)
+
+	schema, err := manifest.ParseManifest(mainPath)
+	if err != nil {
+		t.Fatalf("root route referencing an included event must parse, got: %v", err)
+	}
+	if len(schema.Nodes) != 1 || len(schema.Routes) != 1 {
+		t.Errorf("expected 1 merged node and 1 route, got %d nodes / %d routes", len(schema.Nodes), len(schema.Routes))
+	}
+}
+
+// --- Test 16: Node names must be unique across includes ---
+
+func TestDuplicateNodeNameAcrossIncludes(t *testing.T) {
+	dir := t.TempDir()
+
+	writeManifest(t, dir, "a.spine", `spine_version: 1
+nodes:
+  DupNode:
+    emits:
+      - event: EVENT_A
+`)
+	writeManifest(t, dir, "b.spine", `spine_version: 1
+nodes:
+  DupNode:
+    emits:
+      - event: EVENT_B
+`)
+
+	mainPath := writeManifest(t, dir, "main.spine", `spine_version: 1
+includes:
+  - a.spine
+  - b.spine
+routes:
+  - on: EVENT_A
+    steps:
+      - action: log.write
+`)
+	_, err := manifest.ParseManifest(mainPath)
+	if err == nil {
+		t.Fatal("duplicate node name across includes must fail, got nil error")
+	}
+	if !strings.Contains(err.Error(), "already defined") {
+		t.Errorf("expected duplicate-node error, got: %v", err)
+	}
+}
+
+// --- Test 17: Fail-closed boolean parsing (read_only / parallel) ---
+
+func TestBooleanFlagParsing(t *testing.T) {
+	dir := t.TempDir()
+
+	// "True" (capitalized) must parse as TRUE — previously exact-match
+	// `v == "true"` silently turned it into false (read-only role became
+	// writable with no warning).
+	upperPath := writeManifest(t, dir, "upper.spine", `spine_version: 1
+database:
+  tables:
+    - data
+access:
+  - role: admin
+    key: sk_admin
+    read_only: True
+routes:
+  - on: ANY_EVENT
+    steps:
+      - action: db.insert
+        table: data
+`)
+	schema, err := manifest.ParseManifest(upperPath)
+	if err != nil {
+		t.Fatalf("'True' must be accepted as true, got: %v", err)
+	}
+	if len(schema.Access) != 1 || !schema.Access[0].ReadOnly {
+		t.Errorf("read_only: True must parse to true, got %+v", schema.Access)
+	}
+
+	// Non-boolean values must fail loudly, not silently default to false.
+	badPath := writeManifest(t, dir, "bad.spine", `spine_version: 1
+database:
+  tables:
+    - data
+access:
+  - role: admin
+    key: sk_admin
+    read_only: yes
+routes:
+  - on: ANY_EVENT
+    steps:
+      - action: db.insert
+        table: data
+`)
+	_, err = manifest.ParseManifest(badPath)
+	if err == nil {
+		t.Fatal("read_only: yes must be a parse error, got nil")
+	}
+	if !strings.Contains(err.Error(), "invalid boolean value") {
+		t.Errorf("expected invalid-boolean error, got: %v", err)
+	}
+
+	// Same fail-closed behavior for route parallel.
+	parPath := writeManifest(t, dir, "par.spine", `spine_version: 1
+database:
+  tables:
+    - data
+nodes:
+  N:
+    emits:
+      - event: EVT
+routes:
+  - on: EVT
+    parallel: True
+    steps:
+      - action: log.write
+`)
+	schema, err = manifest.ParseManifest(parPath)
+	if err != nil {
+		t.Fatalf("parallel: True must be accepted, got: %v", err)
+	}
+	if len(schema.Routes) != 1 || !schema.Routes[0].Parallel {
+		t.Errorf("parallel: True must parse to true, got %+v", schema.Routes)
+	}
+
+	// "1" is a valid strconv.ParseBool literal (true) — fail-closed, not an
+	// error. A genuinely non-boolean value ("yes") must be a parse error.
+	parOnePath := writeManifest(t, dir, "parone.spine", `spine_version: 1
+database:
+  tables:
+    - data
+nodes:
+  N:
+    emits:
+      - event: EVT
+routes:
+  - on: EVT
+    parallel: 1
+    steps:
+      - action: log.write
+`)
+	schema, err = manifest.ParseManifest(parOnePath)
+	if err != nil {
+		t.Fatalf("parallel: 1 must be accepted as true, got: %v", err)
+	}
+	if len(schema.Routes) != 1 || !schema.Routes[0].Parallel {
+		t.Errorf("parallel: 1 must parse to true, got %+v", schema.Routes)
+	}
+
+	parBadPath := writeManifest(t, dir, "parbad.spine", `spine_version: 1
+database:
+  tables:
+    - data
+nodes:
+  N:
+    emits:
+      - event: EVT
+routes:
+  - on: EVT
+    parallel: yes
+    steps:
+      - action: log.write
+`)
+	_, err = manifest.ParseManifest(parBadPath)
+	if err == nil {
+		t.Fatal("parallel: yes must be a parse error, got nil")
+	}
+}
+
+// --- Test 18: Duplicate event declarations must agree on payload shape ---
+
+func TestDuplicateEventShapeConflict(t *testing.T) {
+	dir := t.TempDir()
+
+	// Identical re-declarations (two nodes emitting the same event with the
+	// same shape) are legitimate and must parse.
+	okPath := writeManifest(t, dir, "ok.spine", `spine_version: 1
+database:
+  tables:
+    - data
+nodes:
+  A:
+    emits:
+      - event: SHARED
+        payload:
+          email: string
+  B:
+    emits:
+      - event: SHARED
+        payload:
+          email: string
+routes:
+  - on: SHARED
+    steps:
+      - action: log.write
+`)
+	if _, err := manifest.ParseManifest(okPath); err != nil {
+		t.Fatalf("identical duplicate event declarations must parse, got: %v", err)
+	}
+
+	// Conflicting shapes must fail: the registry (last-wins) and codegen
+	// (most-fields) would otherwise generate divergent contracts.
+	conflictPath := writeManifest(t, dir, "conflict.spine", `spine_version: 1
+database:
+  tables:
+    - data
+nodes:
+  A:
+    emits:
+      - event: SHARED
+        payload:
+          email: string
+  B:
+    emits:
+      - event: SHARED
+        payload:
+          email: number
+routes:
+  - on: SHARED
+    steps:
+      - action: log.write
+`)
+	_, err := manifest.ParseManifest(conflictPath)
+	if err == nil {
+		t.Fatal("conflicting duplicate event shapes must fail, got nil")
+	}
+	if !strings.Contains(err.Error(), "conflicting payload shapes") {
+		t.Errorf("expected conflicting-shapes error, got: %v", err)
+	}
+}
+
+// --- Test 19: Inline comments must not corrupt declared field types ---
+
+func TestInlineCommentDoesNotCorruptFieldType(t *testing.T) {
+	dir := t.TempDir()
+	path := writeManifest(t, dir, "comment.spine", `spine_version: 1
+database:
+  tables:
+    - data
+nodes:
+  N:
+    emits:
+      - event: WITH_COMMENT
+        payload:
+          email: string # primary contact
+          count: number
+routes:
+  - on: WITH_COMMENT
+    steps:
+      - action: db.insert
+        table: data
+`)
+	schema, err := manifest.ParseManifest(path)
+	if err != nil {
+		t.Fatalf("parse failed: %v", err)
+	}
+	// The comment must be stripped: the type must be exactly "string", not
+	// "string # primary contact" (which silently disabled type checks).
+	emailType := ""
+	for _, e := range schema.Nodes[0].Emits {
+		if e.Event == "WITH_COMMENT" {
+			for _, f := range e.Fields {
+				if f.Name == "email" {
+					emailType = f.FieldType
+				}
+			}
+		}
+	}
+	if emailType != "string" {
+		t.Errorf("expected field type 'string', got %q (comment corrupted the type)", emailType)
+	}
+}

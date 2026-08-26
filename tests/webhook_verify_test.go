@@ -521,12 +521,11 @@ func TestWSOriginSameOriginAllowed(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	// If same-origin is allowed, the upgrade should be attempted
-	// (it will fail because client doesn't handle WS upgrade, but status should be 101 or similar upgrade attempt)
-	if resp.StatusCode == 403 {
-		t.Errorf("Same-origin WebSocket request was blocked (got 403)")
+	// Same-origin must reach the upgrade: 101 (handshake started) or 400
+	// (handshake failed at the protocol level) — never 403, 426, or 5xx.
+	if resp.StatusCode != http.StatusSwitchingProtocols && resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("Same-origin WS request must be allowed (got %d)", resp.StatusCode)
 	}
-	t.Logf("Same-origin WS response status: %d", resp.StatusCode)
 }
 
 func TestWSOriginForeignOriginDenied(t *testing.T) {
@@ -582,10 +581,9 @@ func TestWSOriginAllowlistedOriginAllowed(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 403 {
-		t.Errorf("Allowlisted origin was blocked (got 403)")
+	if resp.StatusCode != http.StatusSwitchingProtocols && resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("Allowlisted-origin WS request must be allowed (got %d)", resp.StatusCode)
 	}
-	t.Logf("Allowlisted origin WS response status: %d", resp.StatusCode)
 }
 
 func TestWSOriginNoOriginAllowed(t *testing.T) {
@@ -609,10 +607,9 @@ func TestWSOriginNoOriginAllowed(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 403 {
-		t.Errorf("No-Origin WS request was blocked (got 403)")
+	if resp.StatusCode != http.StatusSwitchingProtocols && resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("No-Origin WS request must be allowed (got %d)", resp.StatusCode)
 	}
-	t.Logf("No-Origin WS response status: %d", resp.StatusCode)
 }
 
 func TestWSOriginWildcardAllowlist(t *testing.T) {
@@ -639,8 +636,7 @@ func TestWSOriginWildcardAllowlist(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode == 403 {
-		t.Errorf("Wildcard allowlisted origin was blocked (got 403)")
+	if resp.StatusCode != http.StatusSwitchingProtocols && resp.StatusCode != http.StatusBadRequest {
+		t.Errorf("Wildcard-allowlisted origin WS request must be allowed (got %d)", resp.StatusCode)
 	}
-	t.Logf("Wildcard allowlist WS response status: %d", resp.StatusCode)
 }

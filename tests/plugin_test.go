@@ -104,9 +104,13 @@ routes:
 		t.Fatalf("failed to emit TRIGGER_CUSTOM event: %v", err)
 	}
 
-	time.Sleep(50 * time.Millisecond)
-
-	if atomic.LoadUint64(&pluginExecCount) != 1 {
-		t.Errorf("expected custom plugin action 'custom.audit' to execute 1 time, got %d", pluginExecCount)
+	// Poll: the route runs synchronously through execStep, so the counter
+	// must reach 1 well within the deadline (a fixed sleep was flaky under load).
+	deadline := time.Now().Add(5 * time.Second)
+	for atomic.LoadUint64(&pluginExecCount) < 1 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := atomic.LoadUint64(&pluginExecCount); got != 1 {
+		t.Errorf("expected custom plugin action 'custom.audit' to execute 1 time, got %d", got)
 	}
 }

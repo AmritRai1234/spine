@@ -158,6 +158,103 @@ routes:
 	}
 }
 
+// TestOutboxRetryLoopBounded is the regression test for the self-perpetuating
+// outbox retry loop: a persistently failing webhook must NOT spawn a new
+// outbox row per retry. With the old code, every worker retry re-enqueued a
+// fresh row (attempts=1) via execStep, bypassing max_retries and growing the
+// table exponentially. Now the table must hold exactly the one original row
+// and terminate in 'failed' after max_retries.
+func TestOutboxRetryLoopBounded(t *testing.T) {
+	dir := t.TempDir()
+	manifestContent := `spine_version: 1
+
+database:
+  outbox:
+    max_workers: 2
+    max_retries: 2
+    backoff_ms: 10
+
+nodes:
+  - name: DeadNode
+    emits:
+      - event: TRIGGER_DEAD_WEBHOOK
+        payload:
+          msg: string
+
+routes:
+  - on: TRIGGER_DEAD_WEBHOOK
+    steps:
+      - action: http.post
+        url: "http://127.0.0.1:59999/dead_endpoint"
+        max_attempts: 1
+`
+	manifestPath := filepath.Join(dir, "outbox_loop.spine")
+	dbPath := filepath.Join(dir, "outbox_loop.db")
+	if err := os.WriteFile(manifestPath, []byte(manifestContent), 0644); err != nil {
+		t.Fatalf("Failed to write test manifest: %v", err)
+	}
+
+	eng, err := spine.NewFromFile(manifestPath, dbPath)
+	if err != nil {
+		t.Fatalf("Failed to initialize engine: %v", err)
+	}
+	defer eng.Close()
+
+	bus := eng.Bus
+
+	if _, err := bus.Emit("TRIGGER_DEAD_WEBHOOK", map[string]interface{}{"msg": "boom"}); err == nil {
+		t.Fatal("expected emit to fail (dead webhook endpoint), got nil error")
+	}
+
+	// The failed emit enqueues exactly one outbox row — asynchronously through
+	// the batch writer, so poll until it appears.
+	var count int
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := bus.DB().QueryRow(`SELECT count(*) FROM "_spine_outbox"`).Scan(&count); err != nil {
+			t.Fatalf("failed to count outbox rows: %v", err)
+		}
+		if count >= 1 {
+			break
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	if count != 1 {
+		t.Fatalf("expected exactly 1 outbox row after failed emit, got %d", count)
+	}
+
+	// Drive the worker until the row terminates (max_retries exhausted).
+	deadline = time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		var status string
+		if err := bus.DB().QueryRow(`SELECT status FROM "_spine_outbox" LIMIT 1`).Scan(&status); err != nil {
+			t.Fatalf("failed to read outbox status: %v", err)
+		}
+		if status == "failed" {
+			break
+		}
+		bus.NotifyOutbox()
+		time.Sleep(150 * time.Millisecond)
+	}
+
+	var status string
+	var attempts int
+	if err := bus.DB().QueryRow(`SELECT status, attempts FROM "_spine_outbox" LIMIT 1`).Scan(&status, &attempts); err != nil {
+		t.Fatalf("failed to read outbox row: %v", err)
+	}
+	if status != "failed" {
+		t.Fatalf("expected outbox row to terminate as 'failed', got status=%q attempts=%d", status, attempts)
+	}
+
+	// Regression assertion: the retry loop must never have spawned extra rows.
+	if err := bus.DB().QueryRow(`SELECT count(*) FROM "_spine_outbox"`).Scan(&count); err != nil {
+		t.Fatalf("failed to count outbox rows: %v", err)
+	}
+	if count != 1 {
+		t.Errorf("outbox row count must stay bounded — self-perpetuating retry loop spawned %d rows (want 1)", count)
+	}
+}
+
 func TestOutboxConfigParsing(t *testing.T) {
 	tmpDir := t.TempDir()
 	spineFile := filepath.Join(tmpDir, "outbox.spine")
@@ -225,10 +322,15 @@ routes:
 		t.Fatalf("emit failed: %v", err)
 	}
 
-	// Verify outbox schema has step_data column
+	// Verify outbox schema has step_data column AND that a plain db.insert
+	// route never enqueues an outbox row (the previous scan was never
+	// asserted — a vacuous test).
 	var count int
 	err = eng.Bus.DB().QueryRow(`SELECT count(*) FROM "_spine_outbox"`).Scan(&count)
 	if err != nil {
 		t.Fatalf("failed to query outbox table: %v", err)
+	}
+	if count != 0 {
+		t.Errorf("expected 0 outbox rows for a db.insert-only route, got %d", count)
 	}
 }

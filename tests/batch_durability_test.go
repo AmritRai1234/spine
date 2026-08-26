@@ -6,6 +6,7 @@ package tests
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -57,6 +58,24 @@ func durabilityRowCount(t *testing.T, eng *spine.Engine) int {
 		t.Fatalf("count rows: %v", err)
 	}
 	return n
+}
+
+// waitForTableRows polls until table has at least want rows (generic —
+// waitForRow counts the durability engine's dedicated table).
+func waitForTableRows(t *testing.T, eng *spine.Engine, table string, want int) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		var n int
+		err := eng.Bus.DB().QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, table)).Scan(&n)
+		if err == nil && n >= want {
+			return
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	var n int
+	_ = eng.Bus.DB().QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, table)).Scan(&n)
+	t.Fatalf("timed out: expected >= %d rows in %s, got %d", want, table, n)
 }
 
 func waitForRow(t *testing.T, eng *spine.Engine, timeout time.Duration, want int) {

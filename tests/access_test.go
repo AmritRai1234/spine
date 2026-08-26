@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
-	"time"
 
 	spine "github.com/AmritRai1234/spine"
 )
@@ -219,8 +218,8 @@ func TestAccessTenantFilteredRows(t *testing.T) {
 		"email": "other@test.com", "source": "other_company",
 	})
 
-	// Wait for batch writer to flush
-	time.Sleep(100 * time.Millisecond)
+	// Wait for batch writer to flush (poll)
+	waitForTableRows(t, eng, "leads", 3)
 
 	// Admin sees all rows
 	rr := doGet(handler, "sk_admin_secret", "/tables/leads")

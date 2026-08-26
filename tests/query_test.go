@@ -6,7 +6,6 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	spine "github.com/AmritRai1234/spine"
 )
@@ -53,8 +52,8 @@ routes:
 		}
 	}
 
-	// Wait briefly for batch writer
-	time.Sleep(50 * time.Millisecond)
+	// Wait for batch writer (poll — fixed sleeps are flaky under load)
+	waitForTableRows(t, engine, "users", 3)
 
 	// Test 1: GetTables
 	tables, err := engine.Bus.GetTables()
@@ -132,8 +131,8 @@ routes:
 		}
 	}
 
-	// Wait for batch writer flush
-	time.Sleep(100 * time.Millisecond)
+	// Wait for batch writer flush (poll)
+	waitForTableRows(t, engine, "clips", 5)
 
 	// QueryWhere for project_a — should return 3 rows
 	rows, err := engine.Bus.QueryWhere("clips", "project_id", "proj_a", 100, 0)
@@ -210,7 +209,7 @@ routes:
 	} {
 		engine.Bus.Emit("ADD_TASK", task)
 	}
-	time.Sleep(100 * time.Millisecond)
+	waitForTableRows(t, engine, "tasks", 3)
 
 	handler := engine.HTTPHandler()
 

@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"sort"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -459,13 +460,9 @@ routes:
 }
 
 func sortDurations(d []time.Duration) {
-	for i := 0; i < len(d); i++ {
-		for j := i + 1; j < len(d); j++ {
-			if d[i] > d[j] {
-				d[i], d[j] = d[j], d[i]
-			}
-		}
-	}
+	// The old hand-rolled selection sort was O(n²) — with ~285K samples per
+	// benchmark run that is ~4×10^10 comparisons, stalling CI's -bench step.
+	sort.Slice(d, func(i, j int) bool { return d[i] < d[j] })
 }
 
 // ============================================================

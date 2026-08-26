@@ -2,6 +2,7 @@ package tests
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/AmritRai1234/spine/pkg/engine"
@@ -56,8 +57,7 @@ routes:
 		t.Errorf("expected route condition '$event.payload.score == 15.0', got '%s'", schema.Routes[1].IfCondition)
 	}
 
-	dbPath := "test_cond.db"
-	defer os.Remove(dbPath)
+	dbPath := filepath.Join(t.TempDir(), "cond.db")
 
 	reg := manifest.NewRegistry(schema)
 	hub := engine.NewHub()

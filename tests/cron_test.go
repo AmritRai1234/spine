@@ -37,12 +37,20 @@ routes:
 	}
 	defer eng.Close()
 
-	// Wait 2.5 seconds for cron ticker to execute at least once
-	time.Sleep(2500 * time.Millisecond)
-
-	rows, err := eng.Bus.GetTableRows("cron_logs", 10, 0)
-	if err != nil {
-		t.Fatalf("Failed to query cron_logs table: %v", err)
+	// Poll up to 10s for the cron ticker to execute at least once — a fixed
+	// sleep here is flaky under load and the race detector (the tick is 1s,
+	// so the write can land just after a short sleep).
+	deadline := time.Now().Add(10 * time.Second)
+	var rows []map[string]interface{}
+	for time.Now().Before(deadline) {
+		rows, err = eng.Bus.GetTableRows("cron_logs", 10, 0)
+		if err != nil {
+			t.Fatalf("Failed to query cron_logs table: %v", err)
+		}
+		if len(rows) > 0 {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
 
 	if len(rows) == 0 {
