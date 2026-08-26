@@ -1,5 +1,8 @@
 <p align="center">
-  <img src="https://raw.githubusercontent.com/AmritRai1234/spine/main/assets/logo.png?v=3" width="200" alt="Spine Logo"><br>
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/AmritRai1234/spine/main/assets/logo-light.png?v=3">
+    <img src="https://raw.githubusercontent.com/AmritRai1234/spine/main/assets/logo.png?v=3" width="200" alt="Spine Logo">
+  </picture><br>
   <strong>SPINE</strong><br>
   <em>Declarative Event-Driven Backend Engine (v3.0.1)</em>
 </p>
