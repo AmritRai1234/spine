@@ -363,7 +363,10 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 						continue
 					}
 					if v, ok := kvValue(trimmed, "tenant"); ok {
-						curAccess.Tenant = unquote(v)
+						// Single-tenant engine: `tenant:` under an access role
+						// is inert metadata. Accept it (backward compat) but
+						// do not store a field that implies row isolation.
+						_ = unquote(v)
 						state = sAccessEntry
 						continue
 					}

@@ -10,7 +10,6 @@ import (
 // AccessContext holds the resolved permissions for an authenticated request.
 type AccessContext struct {
 	Role     string
-	Tenant   string // Tenant isolation context
 	ReadOnly bool
 	Filter   string   // WHERE clause to inject on table queries
 	Events   []string // nil = all events allowed
@@ -89,7 +88,6 @@ func (ar *AccessResolver) Resolve(apiKey string) *AccessContext {
 
 	return &AccessContext{
 		Role:     matched.Role,
-		Tenant:   matched.Tenant,
 		ReadOnly: matched.ReadOnly,
 		Filter:   matched.Filter,
 		Events:   matched.Events,

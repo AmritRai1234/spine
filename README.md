@@ -17,7 +17,7 @@
 
 **Spine** is a high-performance, declarative event-driven runtime and orchestration engine written in Go. It replaces complex API controllers and scattered database handlers with a single, type-safe `.spine` manifest file.
 
-With Spine, you declare database tables, event nodes, and multi-step action routes in code. The runtime automatically handles type contract validation, high-throughput database persistence (SQLite WAL / Turso libSQL), durable outbox webhook retries, full-text search (`fts.search`), multi-tenancy isolation (`tenant:`), email marketing & transactional mail (`email.send`, `email.broadcast`), Stripe Checkout payments (`stripe.checkout`), real-time WebSocket state broadcasting, and cloud deployment generation (`spine deploy`).
+With Spine, you declare database tables, event nodes, and multi-step action routes in code. The runtime automatically handles type contract validation, high-throughput database persistence (SQLite WAL / Turso libSQL), durable outbox webhook retries, full-text search (`fts.search`), email marketing & transactional mail (`email.send`, `email.broadcast`), Stripe Checkout payments (`stripe.checkout`), real-time WebSocket state broadcasting, and cloud deployment generation (`spine deploy`).
 
 ```
 Client Event → Load Balancer → Spine Node (RLAC Auth & Rate Limit) → Event Bus → PubSub Backplane → Batched DB / WebSocket
@@ -1062,7 +1062,7 @@ go test ./tests/ -bench=. -benchmem -count=3
 | `idempotency_test.go` | `_idempotency_key` deduplication |
 | `cron_test.go` | Scheduled cron event worker |
 | `overlay_test.go` | `SPINE_ENV` environment overlay layering |
-| `tenant_test.go` | Multi-tenancy context isolation (`tenant:`) |
+| `tenant_test.go` | Manifest `tenant:` label parsing (metadata; single-tenant engine) |
 | `webhook_test.go` | Webhook ingestion (`POST /webhook/:provider`) |
 | `fts_test.go` | Full-text search (`fts.search`) |
 | `metrics_test.go` | Prometheus `/metrics` and `/admin/usage` |
