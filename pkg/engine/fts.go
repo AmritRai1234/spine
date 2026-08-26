@@ -107,7 +107,7 @@ func (b *Bus) ensureFTS(table string) error {
 	}
 
 	// Backfill rows that existed before the index was created.
-	backfillSQL := fmt.Sprintf(`INSERT INTO "%s"(rowid, %s) SELECT _spine_id, %s FROM "%s"`,
+	backfillSQL := fmt.Sprintf(`INSERT OR IGNORE INTO "%s"(rowid, %s) SELECT _spine_id, %s FROM "%s"`,
 		ftsTable, colList, colList, table)
 	if _, err := b.db.Exec(backfillSQL); err != nil {
 		return fmt.Errorf("fts.search: backfilling index for %q failed: %w", table, err)

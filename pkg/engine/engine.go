@@ -245,6 +245,9 @@ func NewFromFile(spineFile, dbPath string) (*Engine, error) {
 				schema.Routes = append(schema.Routes, overlaySchema.Routes...)
 				schema.Nodes = append(schema.Nodes, overlaySchema.Nodes...)
 				log.Printf("[overlay] Applied environment overlay '%s'", overlayFile)
+				if valErr := manifest.ValidateSchema(spineFile, schema); valErr != nil {
+					return nil, fmt.Errorf("overlay schema validation failed: %w", valErr)
+				}
 			}
 		}
 	}

@@ -1336,6 +1336,9 @@ func TestEcommerceEmailMarketing(t *testing.T) {
 		t.Fatalf("place order failed: %v %v", err, res)
 	}
 	msgs = server.waitCount(t, 2)
+	if len(msgs) < 2 {
+		t.Fatalf("expected at least 2 emails, got %d", len(msgs))
+	}
 	confirmation := msgs[1].data
 	if !strings.Contains(confirmation, "To: shopper@example.com") ||
 		!strings.Contains(confirmation, "Subject: Order "+orderID+" confirmed") {
@@ -1348,6 +1351,9 @@ func TestEcommerceEmailMarketing(t *testing.T) {
 		t.Fatalf("ship order failed: %v %v", err, res)
 	}
 	msgs = server.waitCount(t, 3)
+	if len(msgs) < 3 {
+		t.Fatalf("expected at least 3 emails, got %d", len(msgs))
+	}
 	shipped := msgs[2].data
 	if !strings.Contains(shipped, "To: shopper@example.com") ||
 		!strings.Contains(shipped, "Subject: Order "+orderID+" has shipped") {

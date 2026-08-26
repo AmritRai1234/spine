@@ -117,3 +117,69 @@ routes:
 		t.Error("expected ftsSearch on a missing table to return an error, got nil")
 	}
 }
+
+func TestFTSProvisionAndSearch_ServerRestart(t *testing.T) {
+	dir := t.TempDir()
+	spineFile := filepath.Join(dir, "app.spine")
+	dbPath := filepath.Join(dir, "app.db")
+
+	manifestContent := `spine_version: 1
+database:
+  tables:
+    - articles
+nodes:
+  - name: A
+    emits:
+      - event: SEED
+        payload:
+          title: string
+          body: string
+routes:
+  - on: SEED
+    steps:
+      - action: db.insert
+        table: articles
+        sync: "true"
+`
+	if err := os.WriteFile(spineFile, []byte(manifestContent), 0644); err != nil {
+		t.Fatalf("Failed to write manifest: %v", err)
+	}
+
+	eng1, err := NewFromFile(spineFile, dbPath)
+	if err != nil {
+		t.Fatalf("Failed to init engine 1: %v", err)
+	}
+
+	if _, err := eng1.Bus.Emit("SEED", map[string]interface{}{"title": "Restart Test", "body": "persisted search query"}); err != nil {
+		t.Fatalf("seed emit failed: %v", err)
+	}
+
+	step := &manifest.RouteStep{
+		Action: "fts.search",
+		Table:  "articles",
+		Config: map[string]string{"query": "$event.payload.q"},
+	}
+
+	p1 := map[string]interface{}{"q": "persisted"}
+	if err := eng1.Bus.ftsSearch(step, "SEARCH", p1); err != nil {
+		t.Fatalf("ftsSearch on eng1 failed: %v", err)
+	}
+	eng1.Close()
+
+	// Re-open engine with existing database (simulates server restart)
+	eng2, err := NewFromFile(spineFile, dbPath)
+	if err != nil {
+		t.Fatalf("Failed to re-init engine on restart: %v", err)
+	}
+	defer eng2.Close()
+
+	p2 := map[string]interface{}{"q": "persisted"}
+	if err := eng2.Bus.ftsSearch(step, "SEARCH", p2); err != nil {
+		t.Fatalf("ftsSearch on eng2 after restart failed: %v", err)
+	}
+	res, ok := p2["fts_results"].([]map[string]interface{})
+	if !ok || len(res) != 1 {
+		t.Fatalf("expected 1 result after restart, got %d", len(res))
+	}
+}
+

@@ -143,7 +143,7 @@ func ParseManifest(manifestPath string) (*SpineSchema, error) {
 	}
 	// Post-merge validation: run against the merged schema so cross-file
 	// references (root route → event declared in an included file) validate.
-	if err := validateSchema(absPath, schema); err != nil {
+	if err := ValidateSchema(absPath, schema); err != nil {
 		return nil, err
 	}
 	return schema, nil
@@ -735,8 +735,8 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 	return schema, nil
 }
 
-// validateSchema performs post-parse semantic validation on the parsed schema.
-func validateSchema(file string, schema *SpineSchema) error {
+// ValidateSchema performs post-parse semantic validation on the parsed schema.
+func ValidateSchema(file string, schema *SpineSchema) error {
 	// Missing spine_version
 	if schema.SpineVersion == 0 {
 		return parseError(file, 0, "missing required 'spine_version' declaration")
