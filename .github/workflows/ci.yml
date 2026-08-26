@@ -64,7 +64,7 @@ jobs:
       - name: Postgres integration tests
         env:
           SPINE_TEST_PG_DSN: postgres://spine:spine@localhost:5432/spine?sslmode=disable
-        run: go test -tags "sqlite_fts5 integration" ./tests/ -run 'TestPG_' -v -count=1
+        run: go test -tags "sqlite_fts5 integration" ./tests/features/ -run 'TestPG_' -v -count=1
 
   build:
     name: Build
