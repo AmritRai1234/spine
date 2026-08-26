@@ -31,10 +31,10 @@ jobs:
         run: go test -tags sqlite_fts5 ./... -v -count=1
 
       - name: Race tests
-        run: go test -tags sqlite_fts5 -race ./pkg/... ./tests/ -count=1
+        run: go test -tags sqlite_fts5 -race ./pkg/... ./tests/... -count=1
 
       - name: Benchmark
-        run: go test -tags sqlite_fts5 ./tests/ -bench=. -benchmem -count=1 -run='^$'
+        run: go test -tags sqlite_fts5 ./tests/... -bench=. -benchmem -count=1 -run='^$'
 
   pg-integration:
     name: Postgres integration
