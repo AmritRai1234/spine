@@ -139,6 +139,47 @@ func ResolveVariables(input string, eventName string, payload map[string]interfa
 	return res.String()
 }
 
+// ResolveVariablesStrict is like ResolveVariables but returns an error when a
+// $event.payload.PATH token cannot be resolved (missing payload field). Where
+// clauses use it: an unresolvable value previously became '' silently, making
+// "WHERE col = ''" match (or not match) rows with no indication of the bug.
+func ResolveVariablesStrict(input string, eventName string, payload map[string]interface{}) (string, error) {
+	if input == "" || strings.IndexByte(input, '$') == -1 {
+		return input, nil
+	}
+	var res strings.Builder
+	idx := 0
+	for idx < len(input) {
+		if input[idx] != '$' {
+			res.WriteByte(input[idx])
+			idx++
+			continue
+		}
+		end := idx + 1
+		for end < len(input) && (input[end] == '_' || input[end] == '.' || (input[end] >= 'a' && input[end] <= 'z') || (input[end] >= 'A' && input[end] <= 'Z') || (input[end] >= '0' && input[end] <= '9')) {
+			end++
+		}
+		token := input[idx:end]
+		switch {
+		case token == "$now", token == "$uuid", token == "$event.name":
+			res.WriteString(ResolveVariables(token, eventName, payload))
+		case strings.HasPrefix(token, "$env."):
+			res.WriteString(os.Getenv(token[5:]))
+		case strings.HasPrefix(token, "$event.payload."):
+			path := token[len("$event.payload."):]
+			if val, ok := resolvePath(payload, path); ok {
+				res.WriteString(fmt.Sprintf("%v", val))
+			} else {
+				return "", fmt.Errorf("unresolvable variable %q (missing payload field)", token)
+			}
+		default:
+			res.WriteString(token)
+		}
+		idx = end
+	}
+	return res.String(), nil
+}
+
 // ResolveValue resolves a value from payload or variable expression for SQL insertion/execution.
 func ResolveValue(expr string, eventName string, payload map[string]interface{}) interface{} {
 	if expr == "$now" {

@@ -38,7 +38,17 @@ type RateLimitManager struct {
 
 // NewRateLimitManager creates a rate limit manager allowing `rps` requests/sec with `burst` capacity.
 // Starts a background eviction goroutine that removes stale IP entries every 60 seconds.
+//
+// Fail-closed tuning: burst is clamped to >= 1 (a burst < 1 previously made
+// every request after the first permanently rejected — tokens could never
+// reach 1), and rps <= 0 degrades to 1 req/sec rather than a hard block.
 func NewRateLimitManager(rps float64, burst float64) *RateLimitManager {
+	if rps <= 0 {
+		rps = 1
+	}
+	if burst < 1 {
+		burst = 1
+	}
 	m := &RateLimitManager{
 		limit:          rps,
 		burst:          burst,
@@ -121,6 +131,10 @@ func (m *RateLimitManager) Allow(ip string) bool {
 	now := time.Now()
 
 	if !exists {
+		// The first request is allowed by the unconditional return below and
+		// consumes the first token: start at burst-1 so the bucket holds
+		// exactly `burst` immediate requests total. burst is clamped >= 1 in
+		// the constructor, so this is never negative.
 		shard.limiters[ip] = &rateLimiter{
 			tokens:     m.burst - 1,
 			maxTokens:  m.burst,

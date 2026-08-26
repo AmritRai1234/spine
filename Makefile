@@ -1,10 +1,11 @@
 # Spine Makefile — Build, Test & Install Automation
 
-VERSION := 3.0.0
+# Single source of truth: spine.go (const Version). Never hardcode a version here.
+VERSION := $(shell sed -n 's/^const Version = "\(.*\)"/\1/p' spine.go)
 BINARY_NAME := spine
 INSTALL_PATH := /usr/local/bin
 
-.PHONY: all build install test doc-lint clean help
+.PHONY: all build install test test-race doc-lint clean help
 
 all: build
 
@@ -12,7 +13,7 @@ all: build
 build:
 	@echo "==> Building $(BINARY_NAME) v$(VERSION)..."
 	@mkdir -p bin
-	@go build -ldflags="-s -w" -o bin/$(BINARY_NAME) ./cmd/spine/
+	@go build -tags sqlite_fts5 -ldflags="-s -w" -o bin/$(BINARY_NAME) ./cmd/spine/
 	@echo "==> Binary built at ./bin/$(BINARY_NAME)"
 
 ## install: Compiles and installs the spine CLI binary to /usr/local/bin
@@ -24,7 +25,12 @@ install: build
 ## test: Runs doc-lint plus all unit & integration test suites
 test: doc-lint
 	@echo "==> Running test suite..."
-	@go test -v ./...
+	@go test -tags sqlite_fts5 -v ./...
+
+## test-race: Runs doc-lint plus all tests under the race detector
+test-race: doc-lint
+	@echo "==> Running test suite with race detector..."
+	@go test -tags sqlite_fts5 -race ./...
 
 ## doc-lint: Verifies documented .spine manifest keys match the parser whitelist
 doc-lint:

@@ -52,6 +52,12 @@ func (b *Bus) CommitFailures() uint64 {
 	return atomic.LoadUint64(&b.commitFailures)
 }
 
+// StmtFailures returns the number of writes dropped by the batch writer
+// because they failed permanently (constraint violations, type mismatches,
+// missing columns). Each drop is also logged; nothing is ever silently lost.
+func (b *Bus) StmtFailures() uint64 {
+	return atomic.LoadUint64(&stmtFailures)
+}
 // SpillWrites returns the number of writes durably retained in
 // _spine_write_spill after flush failures.
 func (b *Bus) SpillWrites() uint64 {
@@ -70,9 +76,15 @@ func (b *Bus) DroppedAudit() uint64 {
 	return atomic.LoadUint64(&b.droppedAudit)
 }
 
-// drainSpill submits up to 100 pending spill rows back to the writer.
+// drainSpill submits up to 500 pending spill rows back to the writer and waits
+// for a flush fence before deleting them. Rows are deleted ONLY after their
+// writes have actually committed: the old code deleted the durable row as
+// soon as the writer accepted the task, so a crash between accept and commit
+// permanently lost the write (contradicting the at-least-once contract). If
+// the fence times out, the rows stay and the next tick re-submits them —
+// duplicates are possible, loss is not.
 func (b *Bus) drainSpill() {
-	rows, err := b.db.Query(`SELECT id, query, params_json FROM "_spine_write_spill" WHERE status = 'pending' ORDER BY id ASC LIMIT 100`)
+	rows, err := b.db.Query(`SELECT id, query, params_json FROM "_spine_write_spill" WHERE status = 'pending' ORDER BY id ASC LIMIT 500`)
 	if err != nil {
 		return
 	}
@@ -91,6 +103,7 @@ func (b *Bus) drainSpill() {
 	}
 	rows.Close()
 
+	var submitted []int64
 	for _, t := range tasks {
 		var params []interface{}
 		if err := json.Unmarshal([]byte(t.paramsJSON), &params); err != nil {
@@ -99,9 +112,22 @@ func (b *Bus) drainSpill() {
 			continue
 		}
 		if b.writer.submitAny(dbTask{query: t.query, params: params}) {
-			// Intent is back in the writer pipeline; drop the durable copy.
-			// A later flush failure re-spills it as a fresh row (at-least-once).
-			_, _ = b.db.Exec(`DELETE FROM "_spine_write_spill" WHERE id = `+b.ph(1), t.id)
+			submitted = append(submitted, t.id)
+		}
+	}
+	if len(submitted) == 0 {
+		return
+	}
+
+	// Fence: wait until the submitted writes are committed before dropping
+	// the durable copies.
+	if !b.writer.flushAndWait(writerFlushTimeout) {
+		log.Printf("[spill] drain flush fence timed out — %d rows stay durable and will be re-submitted next tick", len(submitted))
+		return
+	}
+	for _, id := range submitted {
+		if _, err := b.db.Exec(`DELETE FROM "_spine_write_spill" WHERE id = `+b.ph(1), id); err != nil {
+			log.Printf("[spill] delete row %d failed: %v", id, err)
 		}
 	}
 }

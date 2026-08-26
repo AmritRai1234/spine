@@ -84,6 +84,31 @@ func unquote(s string) string {
 	return s
 }
 
+// parseBoolFlag parses a manifest boolean value fail-closed: strconv.ParseBool
+// accepts true/false and their case variants (True, TRUE, 1, t, ...), and
+// anything else is a hard parse error. The previous exact-match `v == "true"`
+// silently treated `True`, `TRUE`, `yes`, or `1` as FALSE — e.g. a
+// `read_only: True` role became writable with no warning.
+func parseBoolFlag(file string, lineno int, key, v string) (bool, error) {
+	b, err := strconv.ParseBool(strings.TrimSpace(v))
+	if err != nil {
+		return false, parseError(file, lineno, "invalid boolean value '%s' for '%s' (expected true or false)", v, key)
+	}
+	return b, nil
+}
+
+// fieldTypeValue normalizes a payload field type declaration: strips an
+// inline ` # comment` and unquotes. Previously `email: string # primary`
+// stored "string # primary" as the type, which mapped to `any` in codegen
+// and was silently NEVER type-checked at runtime — a comment disabled the
+// contract end-to-end.
+func fieldTypeValue(v string) string {
+	if c := strings.Index(v, " #"); c >= 0 {
+		v = v[:c]
+	}
+	return unquote(strings.TrimSpace(v))
+}
+
 func kvValue(trimmed, key string) (string, bool) {
 	if strings.HasPrefix(trimmed, key) && len(trimmed) > len(key) && trimmed[len(key)] == ':' {
 		return strings.TrimSpace(trimmed[len(key)+1:]), true
@@ -104,13 +129,24 @@ func listKvValue(trimmed, key string) (string, bool) {
 
 // ParseManifest reads a .spine manifest file and returns the parsed schema.
 // This is the public API entry point — it delegates to the internal parser
-// with an empty include stack for circular include detection.
+// with an empty include stack for circular include detection, then runs
+// semantic validation ONCE on the fully merged schema (root + all includes),
+// so routes may reference events declared in included files.
 func ParseManifest(manifestPath string) (*SpineSchema, error) {
 	absPath, err := filepath.Abs(manifestPath)
 	if err != nil {
 		return nil, fmt.Errorf("cannot resolve path '%s': %w", manifestPath, err)
 	}
-	return parseManifestWithStack(absPath, nil)
+	schema, err := parseManifestWithStack(absPath, nil)
+	if err != nil {
+		return nil, err
+	}
+	// Post-merge validation: run against the merged schema so cross-file
+	// references (root route → event declared in an included file) validate.
+	if err := validateSchema(absPath, schema); err != nil {
+		return nil, err
+	}
+	return schema, nil
 }
 
 // parseManifestWithStack is the internal parser that carries the include chain
@@ -332,7 +368,11 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 						continue
 					}
 					if v, ok := kvValue(trimmed, "read_only"); ok {
-						curAccess.ReadOnly = (v == "true")
+						readOnly, berr := parseBoolFlag(manifestPath, lineno, "read_only", v)
+						if berr != nil {
+							return nil, berr
+						}
+						curAccess.ReadOnly = readOnly
 						state = sAccessEntry
 						continue
 					}
@@ -425,7 +465,7 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				if idx := strings.Index(trimmed, ":"); idx > 0 {
 					curEmit.Fields = append(curEmit.Fields, PayloadField{
 						Name:      strings.TrimSpace(trimmed[:idx]),
-						FieldType: unquote(trimmed[idx+1:]),
+						FieldType: fieldTypeValue(trimmed[idx+1:]),
 					})
 					continue
 				}
@@ -451,7 +491,7 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				if idx := strings.Index(trimmed, ":"); idx > 0 {
 					curListen.Fields = append(curListen.Fields, PayloadField{
 						Name:      strings.TrimSpace(trimmed[:idx]),
-						FieldType: unquote(trimmed[idx+1:]),
+						FieldType: fieldTypeValue(trimmed[idx+1:]),
 					})
 					continue
 				}
@@ -539,7 +579,11 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 					continue
 				}
 				if v, ok := kvValue(trimmed, "parallel"); ok {
-					curRoute.Parallel = unquote(v) == "true"
+					parallel, perr := parseBoolFlag(manifestPath, lineno, "parallel", v)
+					if perr != nil {
+						return nil, perr
+					}
+					curRoute.Parallel = parallel
 					state = sRouteBody
 					continue
 				}
@@ -638,10 +682,10 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 		return nil, fmt.Errorf("error reading manifest: %w", err)
 	}
 
-	// Post-parse semantic validation
-	if err := validateSchema(manifestPath, schema); err != nil {
-		return nil, err
-	}
+	// NOTE: semantic validation (validateSchema) intentionally runs in
+	// ParseManifest AFTER includes are merged, so routes can reference events
+	// declared in included files. A per-frame validation here would reject
+	// that natural include pattern with a misleading "possible typo?" error.
 
 	// Process includes with circular detection
 	newStack := append(includeStack, manifestPath)
@@ -658,6 +702,12 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 			return nil, fmt.Errorf("failed to process included manifest '%s': %w", incRel, err)
 		}
 
+		// An included file's own spine_version is dropped by the merge, so
+		// range-check it here (the top-level version is validated post-merge).
+		if subSchema.SpineVersion < 1 || subSchema.SpineVersion > MaxSupportedSpineVersion {
+			return nil, fmt.Errorf("included manifest '%s' declares unsupported 'spine_version: %d' — this engine supports manifest schema versions 1 to %d", incRel, subSchema.SpineVersion, MaxSupportedSpineVersion)
+		}
+
 		// Deduplicate tables from includes
 		for _, t := range subSchema.DbTables {
 			if !seenTables[t] {
@@ -665,6 +715,16 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				seenTables[t] = true
 			}
 		}
+
+		// Node names must be unique across the whole manifest graph: a
+		// duplicate silently last-wins in the registry today.
+		for _, n := range subSchema.Nodes {
+			if _, dup := seenNodes[n.Name]; dup {
+				return nil, fmt.Errorf("included manifest '%s' declares node '%s' which is already defined in this manifest graph — node names must be unique", incRel, n.Name)
+			}
+			seenNodes[n.Name] = 0
+		}
+
 		schema.Nodes = append(schema.Nodes, subSchema.Nodes...)
 		schema.Routes = append(schema.Routes, subSchema.Routes...)
 	}
@@ -703,6 +763,33 @@ func validateSchema(file string, schema *SpineSchema) error {
 	for _, node := range schema.Nodes {
 		for _, e := range node.Emits {
 			knownEvents[e.Event] = true
+		}
+	}
+
+	// Duplicate event declarations must agree on their payload shape. The
+	// registry (last declaration wins) and the TS codegen (most fields win)
+	// would otherwise diverge: generated types could require fields the
+	// runtime never validates, or vice versa. Identical re-declarations
+	// (same fields, same types — e.g. two nodes emitting the same event) are
+	// fine; conflicting shapes are a manifest bug and fail loudly.
+	type eventShape map[string]string // field -> type
+	seenShapes := make(map[string]eventShape)
+	for _, node := range schema.Nodes {
+		for _, e := range node.Emits {
+			shape := make(eventShape, len(e.Fields))
+			for _, f := range e.Fields {
+				shape[f.Name] = strings.ToLower(f.FieldType)
+			}
+			if prev, ok := seenShapes[e.Event]; ok {
+				// An empty declaration (no fields) is a no-op, not a conflict.
+				if len(prev) > 0 && len(shape) > 0 && !equalEventShape(prev, shape) {
+					return parseError(file, 0,
+						"event '%s' is declared with conflicting payload shapes by multiple nodes (%v vs %v) — duplicate event declarations must match",
+						e.Event, prev, shape)
+				}
+			} else {
+				seenShapes[e.Event] = shape
+			}
 		}
 	}
 
@@ -755,8 +842,21 @@ func validateSchema(file string, schema *SpineSchema) error {
 	return nil
 }
 
-func suggestSimilarKey(input string, validKeys []string) string {
-	bestMatch := ""
+// equalEventShape reports whether two event payload shapes (field → type)
+// describe the same contract.
+func equalEventShape(a, b map[string]string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if bv, ok := b[k]; !ok || bv != v {
+			return false
+		}
+	}
+	return true
+}
+
+func suggestSimilarKey(input string, validKeys []string) string {	bestMatch := ""
 	minDist := 3
 
 	for _, k := range validKeys {

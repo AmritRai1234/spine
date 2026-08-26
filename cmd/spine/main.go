@@ -2,10 +2,12 @@ package main
 
 import (
 	"bufio"
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,6 +21,21 @@ import (
 )
 
 var version = spine.Version
+
+// redactDSN strips credentials from a database DSN before it is printed or
+// logged: turso/libsql URLs embed auth tokens in the query string, and
+// postgres URLs can carry userinfo passwords — a boot log line would
+// otherwise leak them to stdout/journald. Plain file paths pass through.
+func redactDSN(dsn string) string {
+	if strings.Contains(dsn, "://") {
+		if u, err := url.Parse(dsn); err == nil {
+			u.User = nil
+			u.RawQuery = ""
+			return u.String()
+		}
+	}
+	return dsn
+}
 
 func usage() {
 	fmt.Fprintf(os.Stderr, `Spine — Declarative Event-Driven Backend Engine (v%s)
@@ -96,6 +113,7 @@ func cmdServe(args []string) {
 		port         string
 		apiKey       string
 		rateLimit    float64
+		allowNoAuth  bool
 		tlsDomains   []string
 		acmeEmail    string
 		certCache    string
@@ -121,6 +139,9 @@ Options:
   --db <path>         Database path (default: spine.db)
   --api-key <key>     Require API key for protected endpoints
   --rate-limit <rps>  Enable rate limiting at N requests/sec
+  --allow-no-auth     Start WITHOUT authentication (local development only).
+                      Refused by default: Spine serves raw table data and the
+                      full event log, so unauthenticated startup is dangerous.
   --domain <name>     Enable free auto-HTTPS (Let's Encrypt); repeatable.
                       Binds :443 (or --tls-port) for TLS and :80 for ACME
                       challenges with HTTP→HTTPS redirect.
@@ -140,7 +161,7 @@ Environment:
   SPINE_CERT_CACHE    Cert cache dir (overrides --cert-cache)
 
 Examples:
-  spine serve app.spine
+  spine serve app.spine --api-key <generated-key>
   spine serve app.spine --port 3000 --api-key secret123
   spine serve app.spine --db turso://mydb.turso.io --rate-limit 1000
 
@@ -148,6 +169,8 @@ Examples:
   spine serve app.spine --domain shop.example.com --acme-email you@example.com
 `)
 			return
+		case "--allow-no-auth":
+			allowNoAuth = true
 		case "--port":
 			i++
 			if i < len(args) {
@@ -244,7 +267,7 @@ Examples:
 	// Parse manifest
 	fmt.Printf("⚡ Spine v%s\n", version)
 	fmt.Printf("   manifest: %s\n", manifestPath)
-	fmt.Printf("   database: %s\n", dbPath)
+	fmt.Printf("   database: %s\n", redactDSN(dbPath))
 	fmt.Printf("   port:     %s\n", port)
 
 	eng, err := spine.NewFromFile(manifestPath, dbPath)
@@ -258,6 +281,23 @@ Examples:
 	fmt.Printf("   nodes:    %d\n", len(schema.Nodes))
 	fmt.Printf("   routes:   %d\n", len(schema.Routes))
 	fmt.Printf("   tables:   %d\n", len(schema.DbTables))
+
+	// Fail-closed authentication: Spine serves raw table data and the full
+	// event log. Refuse to start with no API key and no manifest access rules
+	// unless the operator explicitly opts out with --allow-no-auth.
+	hasAuth := apiKey != "" || len(schema.Access) > 0
+	if !hasAuth {
+		if !allowNoAuth {
+			fmt.Fprintln(os.Stderr, "✗ Refusing to start: no authentication configured.")
+			fmt.Fprintln(os.Stderr, "  Spine exposes raw table data and the full event log; starting unauthenticated")
+			fmt.Fprintln(os.Stderr, "  would serve them to anyone who can reach this port.")
+			fmt.Fprintln(os.Stderr, "  Configure auth:  spine serve app.spine --api-key <key>   (or set SPINE_API_KEY)")
+			fmt.Fprintln(os.Stderr, "                  or add 'access:' rules to the manifest.")
+			fmt.Fprintln(os.Stderr, "  Local dev only:  spine serve app.spine --allow-no-auth")
+			os.Exit(1)
+		}
+		fmt.Println("   auth:     ⚠ DISABLED (--allow-no-auth) — the server is OPEN to unauthenticated access")
+	}
 
 	if apiKey != "" {
 		eng.SetAPIKey(apiKey)
@@ -891,7 +931,7 @@ access:
     key: "$ADMIN_SECRET"
 
   - role: public
-    key: "sk_public_key"
+    key: "$PUBLIC_SECRET"
     events:
       - USER_SIGNUP
 
@@ -922,17 +962,40 @@ routes:
 		os.Exit(1)
 	}
 
-	envContent := `ADMIN_SECRET=sk_admin_secret_12345
-SPINE_PORT=8080
-SPINE_DB=spine.db
-`
+	// Never ship a known default secret: generate fresh keys at scaffold time
+	// so a deployed init project is not trivially impersonable.
+	adminSecret := randomKey("sk_admin_", 24)
+	publicSecret := randomKey("sk_public_", 24)
+	envContent := "ADMIN_SECRET=" + adminSecret + "\n" +
+		"PUBLIC_SECRET=" + publicSecret + "\n" +
+		"SPINE_PORT=8080\n" +
+		"SPINE_DB=spine.db\n"
 	envPath := filepath.Join(targetDir, ".env.example")
-	_ = os.WriteFile(envPath, []byte(envContent), 0644)
+	_ = os.WriteFile(envPath, []byte(envContent), 0600)
 
 	fmt.Printf("✓ Initialized Spine project in '%s'\n", targetDir)
 	fmt.Printf("  ├── app.spine\n")
 	fmt.Printf("  └── .env.example\n\n")
 	fmt.Printf("Run 'spine dev app.spine' to start your local dev server.\n")
+}
+
+// randomKey returns a cryptographically random key with a readable prefix,
+// e.g. "sk_admin_a1b2c3...". Used by `spine init` so scaffolds never ship a
+// known default secret.
+func randomKey(prefix string, nBytes int) string {
+	buf := make([]byte, nBytes)
+	if _, err := rand.Read(buf); err != nil {
+		// crypto/rand failing is fatal for key generation — fail loudly.
+		fmt.Fprintf(os.Stderr, "✗ cannot generate random secret: %v\n", err)
+		os.Exit(1)
+	}
+	const hexChars = "0123456789abcdef"
+	out := make([]byte, 0, len(prefix)+nBytes*2)
+	out = append(out, prefix...)
+	for _, b := range buf {
+		out = append(out, hexChars[b>>4], hexChars[b&0x0f])
+	}
+	return string(out)
 }
 
 // loadDotEnv reads KEY=VALUE pairs from a .env file into the process
@@ -1015,7 +1078,7 @@ Starts a hot-reloading development server (manifest + includes are watched).
 	loadDotEnv(filepath.Join(filepath.Dir(manifestPath), ".env"))
 
 	fmt.Printf("\033[36m[SPINE DEV]\033[0m Starting Spine Dev Server on http://localhost:%s (hot-reload enabled)\n", port)
-	fmt.Printf("\033[36m[SPINE DEV]\033[0m Database: %s | Manifest: %s\n", dbPath, manifestPath)
+	fmt.Printf("\033[36m[SPINE DEV]\033[0m Database: %s | Manifest: %s\n", redactDSN(dbPath), manifestPath)
 
 	eng, err := spine.NewFromFile(manifestPath, dbPath)
 	if err != nil {
@@ -1103,6 +1166,9 @@ primary_region = "iad"
 [env]
   SPINE_ENV = "prod"
   PORT = "8080"
+  # Required — Spine refuses to start without authentication. Set this to a
+  # long random value (e.g. openssl rand -hex 32).
+  # SPINE_API_KEY = ""
 
 [[services]]
   internal_port = 8080
@@ -1123,7 +1189,7 @@ primary_region = "iad"
 		fmt.Printf("✓ Generated fly.toml for Fly.io deployment\n")
 		fmt.Printf("Run 'fly deploy' to launch your Spine application on Fly.io.\n")
 
-	case "railway":
+	case "railway", "render": // render generates the same universal Dockerfile
 		dockerfile := `FROM golang:1.24-alpine AS builder
 WORKDIR /app
 COPY . .
@@ -1134,11 +1200,15 @@ WORKDIR /app
 COPY --from=builder /app/spine /usr/local/bin/spine
 COPY app.spine .
 EXPOSE 8080
+# Required — Spine refuses to start without authentication. Set this in your
+# platform's environment (Railway/Render dashboard or config).
+# ENV SPINE_API_KEY=change-me
 CMD ["spine", "serve", "app.spine", "--port", "8080"]
 `
 		_ = os.WriteFile("Dockerfile", []byte(dockerfile), 0644)
 		fmt.Printf("✓ Generated Dockerfile for Railway / Render deployment\n")
 		fmt.Printf("Run 'railway up' or push to GitHub for automatic deployment.\n")
+		fmt.Printf("⚠ Set SPINE_API_KEY in the platform environment — 'spine serve' refuses to start without authentication.\n")
 
 	default:
 		fmt.Fprintf(os.Stderr, "Unknown deployment target: %s (expected: fly, railway, render)\n", target)

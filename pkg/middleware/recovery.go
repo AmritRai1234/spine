@@ -2,14 +2,16 @@ package middleware
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"net/http"
 	"runtime/debug"
 )
 
 // RecoveryMiddleware wraps an HTTP handler to recover from panics, log the stack trace,
-// and return a JSON 500 Internal Server Error without crashing the server.
+// and return a generic JSON 500 Internal Server Error without crashing the server.
+// The panic value is logged server-side ONLY — echoing it to the client would
+// disclose internal paths, SQL fragments, or other internals to (potentially
+// unauthenticated) callers.
 func RecoveryMiddleware(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		defer func() {
@@ -22,7 +24,6 @@ func RecoveryMiddleware(next http.HandlerFunc) http.HandlerFunc {
 				json.NewEncoder(w).Encode(map[string]interface{}{
 					"status": "error",
 					"error":  "internal_server_error",
-					"detail": fmt.Sprintf("%v", err),
 				})
 			}
 		}()

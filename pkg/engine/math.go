@@ -1,8 +1,11 @@
 package engine
 
 import (
+	"encoding/json"
 	"fmt"
+	"os"
 	"strconv"
+	"strings"
 
 	"github.com/AmritRai1234/spine/pkg/manifest"
 )
@@ -23,13 +26,109 @@ func (b *Bus) mathCalc(step *manifest.RouteStep, eventName string, payload map[s
 	if setKey == "" || expr == "" {
 		return fmt.Errorf("math.calc requires 'set' and 'expr' config")
 	}
-	resolved := ResolveVariables(expr, eventName, payload)
+	resolved, err := mathResolveTokens(expr, eventName, payload)
+	if err != nil {
+		return fmt.Errorf("math.calc '%s': %w", setKey, err)
+	}
 	val, err := evalArithmetic(resolved)
 	if err != nil {
 		return fmt.Errorf("math.calc '%s': %w", setKey, err)
 	}
 	payload[setKey] = val
 	return nil
+}
+
+// mathResolveTokens substitutes $event.payload.PATH and $env.KEY tokens in a
+// math expression with PLAIN-NUMBER literals only. A resolved payload value is
+// an OPERAND, never expression text: a payload of "0 + 9999" must fail the
+// step, not rewrite the expression (otherwise a client could forge computed
+// totals — exactly what server-side math.calc is meant to prevent). $now,
+// $uuid and $event.name are not numbers and are left for the parser to reject
+// loudly.
+func mathResolveTokens(expr string, eventName string, payload map[string]interface{}) (string, error) {
+	if strings.IndexByte(expr, '$') == -1 {
+		return expr, nil
+	}
+	var res strings.Builder
+	idx := 0
+	for idx < len(expr) {
+		if expr[idx] != '$' {
+			res.WriteByte(expr[idx])
+			idx++
+			continue
+		}
+		// Token boundary: identifier chars (mirrors ResolveVariables).
+		end := idx + 1
+		for end < len(expr) {
+			c := expr[end]
+			if c == '_' || c == '.' || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') {
+				end++
+				continue
+			}
+			break
+		}
+		token := expr[idx:end]
+
+		var raw interface{}
+		switch {
+		case strings.HasPrefix(token, "$event.payload."):
+			var ok bool
+			raw, ok = resolvePath(payload, token[len("$event.payload."):])
+			if !ok {
+				return "", fmt.Errorf("unresolvable operand %q", token)
+			}
+		case strings.HasPrefix(token, "$env."):
+			raw = os.Getenv(token[len("$env."):])
+		default:
+			// $now/$uuid/$event.name and anything else: not numeric operands.
+			res.WriteString(token)
+			idx = end
+			continue
+		}
+
+		numStr, err := mathOperandString(raw)
+		if err != nil {
+			return "", fmt.Errorf("operand %q must be a plain number, got %v", token, raw)
+		}
+		res.WriteString(numStr)
+		idx = end
+	}
+	return res.String(), nil
+}
+
+// mathOperandString converts a resolved payload/env value into a plain-number
+// literal, rejecting anything that is not a decimal number. Strings may carry
+// one optional leading '-' (a negative operand is safe: the parser treats it
+// as unary minus); everything else — "0 + 9999", "1; DROP TABLE", booleans,
+// maps — is rejected.
+func mathOperandString(v interface{}) (string, error) {
+	switch val := v.(type) {
+	case float64:
+		return strconv.FormatFloat(val, 'f', -1, 64), nil
+	case float32:
+		return strconv.FormatFloat(float64(val), 'f', -1, 64), nil
+	case int:
+		return strconv.Itoa(val), nil
+	case int64:
+		return strconv.FormatInt(val, 10), nil
+	case json.Number:
+		return string(val), nil
+	case string:
+		s := strings.TrimSpace(val)
+		if s == "" {
+			return "", fmt.Errorf("empty operand")
+		}
+		body := s
+		if body[0] == '-' {
+			body = body[1:]
+		}
+		if !isPlainNumber(body) {
+			return "", fmt.Errorf("not a plain number")
+		}
+		return s, nil
+	default:
+		return "", fmt.Errorf("unsupported operand type %T", v)
+	}
 }
 
 // evalArithmetic parses and evaluates expr with + - * / and parentheses.

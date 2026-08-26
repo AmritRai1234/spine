@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"encoding/base64"
 	"fmt"
 	"log"
@@ -50,12 +51,13 @@ func buildEmailMessage(from, to, subject, body string, html bool, unsubURL strin
 	if html {
 		contentType = "text/html"
 	}
-	b.WriteString("From: " + from + "\r\n")
-	b.WriteString("To: " + to + "\r\n")
+	// CR/LF in any header value would smuggle extra headers into the message.
+	b.WriteString("From: " + stripCRLF(from) + "\r\n")
+	b.WriteString("To: " + stripCRLF(to) + "\r\n")
 	b.WriteString("Subject: " + mimeEncodeHeader(subject) + "\r\n")
 	if unsubURL != "" {
 		oneClick := strings.ReplaceAll(unsubURL, "{{email}}", url.QueryEscape(to))
-		b.WriteString("List-Unsubscribe: <" + oneClick + ">\r\n")
+		b.WriteString("List-Unsubscribe: <" + stripCRLF(oneClick) + ">\r\n")
 	}
 	b.WriteString("MIME-Version: 1.0\r\n")
 	b.WriteString("Content-Type: " + contentType + "; charset=\"utf-8\"\r\n")
@@ -65,6 +67,12 @@ func buildEmailMessage(from, to, subject, body string, html bool, unsubURL strin
 	body = strings.ReplaceAll(body, "\\n", "\n")
 	b.WriteString(strings.ReplaceAll(body, "\n", "\r\n"))
 	return []byte(b.String())
+}
+
+// stripCRLF removes carriage returns and newlines from a header value so a
+// payload-derived address/URL can never inject additional SMTP headers.
+func stripCRLF(s string) string {
+	return strings.ReplaceAll(strings.ReplaceAll(s, "\r", ""), "\n", "")
 }
 
 // mimeEncodeHeader guards against header injection: newlines would smuggle
@@ -126,13 +134,13 @@ func (b *Bus) emailSend(step *manifest.RouteStep, eventName string, payload map[
 		}
 		return nil
 	}
-	to := ResolveVariables(step.Config["to"], eventName, payload)
+	to := stripCRLF(ResolveVariables(step.Config["to"], eventName, payload))
 	if to == "" {
 		return fmt.Errorf("email.send requires 'to' config")
 	}
 	subject := ResolveVariables(step.Config["subject"], eventName, payload)
 	body := ResolveVariables(step.Config["body"], eventName, payload)
-	from := resolveEmailFrom(step, eventName, payload)
+	from := stripCRLF(resolveEmailFrom(step, eventName, payload))
 	if from == "" {
 		return fmt.Errorf("email.send requires 'from' config or SMTP_FROM env")
 	}
@@ -177,11 +185,31 @@ func (b *Bus) emailBroadcast(step *manifest.RouteStep, eventName string, payload
 	}
 
 	query := fmt.Sprintf(`SELECT "%s" FROM "%s"`, col, tableName)
+	var params []interface{}
 	if w := strings.TrimSpace(step.Where); w != "" {
-		query += " WHERE " + w
+		// Parameterize through parseWhereCondition like every other db op —
+		// never interpolate the where expression raw into the SQL string
+		// (it would bypass template resolution and parameterization, and
+		// "email = '$event.payload.x'" would silently match nothing).
+		whereCol, whereOp, whereVal, err := parseWhereCondition(w, eventName, payload)
+		if err != nil {
+			var unresolvable *errWhereUnresolvable
+			if errors.As(err, &unresolvable) {
+				// Optional where-field absent → no recipients → nothing sent.
+				return nil
+			}
+			return fmt.Errorf("email.broadcast: %w", err)
+		}
+		// Bind the value as-is (string): SQLite's type-affinity rules make a
+		// text operand compare numerically against INTEGER columns and as
+		// text against TEXT columns, so "unsubscribed = 0" matches both
+		// storage forms. (Binding float64 would text-convert to "0.0" and
+		// silently miss rows stored as "0".)
+		query += fmt.Sprintf(` WHERE "%s" %s `+b.ph(1), b.sanitizeIdentCached(whereCol), whereOp)
+		params = append(params, whereVal)
 	}
 
-	rows, err := b.db.Query(query)
+	rows, err := b.db.Query(query, params...)
 	if err != nil {
 		return fmt.Errorf("email.broadcast query failed: %w", err)
 	}

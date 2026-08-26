@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -133,14 +134,32 @@ type Engine struct {
 	reloadInterval time.Duration // manifest poll interval for hot-reload
 
 	// WebSocket hardening knobs
-	wsMaxConns    int           // connection cap (refuse upgrades with 503 above this)
-	wsAuthTimeout time.Duration // first-message auth deadline (close 4001)
-	wsConnCount   atomic.Int64  // live WebSocket connections
+	wsMaxConns      int           // connection cap (refuse upgrades with 503 above this)
+	wsMaxConnsPerIP int           // per-IP connection cap (refuse upgrades with 429 above this)
+	wsAuthTimeout   time.Duration // first-message auth deadline (close 4001)
+	wsConnCount     atomic.Int64  // live WebSocket connections
+
+	// authFailClosed makes every endpoint require authentication even when
+	// neither an API key nor access rules are configured (defense in depth
+	// for embedders; the CLI enforces this by refusing to start unauthenticated).
+	authFailClosed atomic.Bool
+
+	// wsIPCounts tracks live WebSocket connections per client IP for the
+	// per-IP connection cap on the /ws upgrade path.
+	wsIPCounts sync.Map // ip -> *atomic.Int64
 }
 
 // SetRateLimit enables IP-based token bucket rate limiting on public endpoints.
 func (e *Engine) SetRateLimit(rps, burst float64) {
 	e.rateLimiter = middleware.NewRateLimitManager(rps, burst)
+}
+
+// SetAuthFailClosed controls whether requests are rejected when no auth
+// configuration exists at all (no API key, no access rules). Default false
+// (legacy permissive mode); set true when the deployment must never serve
+// unauthenticated. The CLI sets this implicitly by refusing to start.
+func (e *Engine) SetAuthFailClosed(v bool) {
+	e.authFailClosed.Store(v)
 }
 
 // RegisterCustomExtractor registers a function to dynamically extract custom attributes (e.g. location, temperature, device info) from HTTP requests.
@@ -163,14 +182,15 @@ func New(schema *manifest.SpineSchema, dbPath string) (*Engine, error) {
 		return nil, err
 	}
 	eng := &Engine{
-		Bus:            bus,
-		Hub:            hub,
-		Schema:         schema,
-		customContext:  middleware.NewCustomContextManager(),
-		reloadInterval: time.Second,
-		webhookSecrets: make(map[string]string),
-		wsMaxConns:     10000,
-		wsAuthTimeout:  5 * time.Second,
+		Bus:             bus,
+		Hub:             hub,
+		Schema:          schema,
+		customContext:   middleware.NewCustomContextManager(),
+		reloadInterval:  time.Second,
+		webhookSecrets:  make(map[string]string),
+		wsMaxConns:      10000,
+		wsMaxConnsPerIP: 100,
+		wsAuthTimeout:   5 * time.Second,
 	}
 
 	// WebSocket connection cap from env (invalid/negative values fall back to
@@ -188,6 +208,17 @@ func New(schema *manifest.SpineSchema, dbPath string) (*Engine, error) {
 
 	// Auto-populate webhook secrets from environment
 	eng.loadWebhookSecretsFromEnv()
+
+	// Prominent startup warning when unsigned webhooks are permitted: with
+	// SPINE_ALLOW_UNSIGNED_WEBHOOKS=1, any provider without a configured
+	// secret accepts unsigned POSTs that inject WEBHOOK_* events.
+	if os.Getenv("SPINE_ALLOW_UNSIGNED_WEBHOOKS") == "1" {
+		secrets := make([]string, 0, len(eng.webhookSecrets))
+		for p := range eng.webhookSecrets {
+			secrets = append(secrets, p)
+		}
+		log.Printf("[webhook] ⚠ SPINE_ALLOW_UNSIGNED_WEBHOOKS=1 — webhook providers WITHOUT a configured secret (SPINE_WEBHOOK_SECRET_<PROVIDER>/<PROVIDER>_WEBHOOK_SECRET) will accept UNSIGNED requests that inject events. Configured: %v", secrets)
+	}
 
 	return eng, nil
 }
@@ -232,6 +263,13 @@ func (e *Engine) Access() *AccessResolver {
 }
 
 // SetAPIKey configures the API key requirement for protected HTTP endpoints.
+//
+// MUST be called before serving (before HTTPHandler()/ListenAndServe/
+// ListenAndServeTLS): the legacy auth handler is captured once when the mux
+// is built, and the WebSocket auth check reads e.APIKey at request time, so
+// calling this while the server is running is both racy and ineffective on
+// HTTP paths. For hot-swappable multi-key auth use manifest `access:` rules
+// (the resolver is reloaded atomically).
 func (e *Engine) SetAPIKey(key string) {
 	e.APIKey = key
 }
@@ -294,6 +332,9 @@ func (e *Engine) Close() error {
 	if e.rateLimiter != nil {
 		e.rateLimiter.Close()
 	}
+	// Stop the hub (Run + broadcast loops) so Engine.New/Close cycles don't
+	// leak goroutines.
+	e.Hub.Close()
 	return e.Bus.Close()
 }
 
@@ -344,6 +385,18 @@ func (e *Engine) wrapMiddleware(handler http.HandlerFunc) http.HandlerFunc {
 			}
 			ctx := context.WithValue(r.Context(), accessContextKey, ac)
 			handler(w, r.WithContext(ctx))
+			return
+		}
+		// Fail-closed: no API key AND no access rules AND fail-closed mode —
+		// refuse rather than serve raw table data and the full event log to
+		// unauthenticated callers.
+		if e.authFailClosed.Load() && e.APIKey == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": "error",
+				"error":  "unauthorized: no authentication configured and fail-closed mode is enabled",
+			})
 			return
 		}
 		legacyAuth(w, r)
@@ -413,6 +466,20 @@ func (e *Engine) wrapWebhookMiddleware(handler http.HandlerFunc) http.HandlerFun
 	return h
 }
 
+// wsClientIP returns the client IP for the /ws per-IP cap, honoring trusted
+// proxy headers when the rate limiter is configured (which validates them),
+// and falling back to the raw remote address otherwise.
+func wsClientIP(e *Engine, r *http.Request) string {
+	if e.rateLimiter != nil {
+		return e.rateLimiter.ExtractIP(r)
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		return r.RemoteAddr
+	}
+	return host
+}
+
 // getAccessContext extracts the resolved AccessContext from the request context.
 // Returns nil if no access rules are configured (legacy mode).
 func getAccessContext(r *http.Request) *AccessContext {
@@ -438,7 +505,9 @@ func (e *Engine) wsAuthCheck(r *http.Request) (bool, *AccessContext) {
 
 	// Legacy single-key mode
 	if e.APIKey == "" {
-		return true, nil
+		// Fail-closed: without any key configured, connections are only
+		// accepted when fail-closed mode is off.
+		return !e.authFailClosed.Load(), nil
 	}
 
 	var clientKey string
@@ -570,8 +639,16 @@ spine_lost_writes %d
 # HELP spine_dropped_audit Audit rows dropped due to shard saturation
 # TYPE spine_dropped_audit counter
 spine_dropped_audit %d
+
+# HELP spine_stmt_failures Writes dropped because they failed permanently (constraint violations, type mismatches, missing columns)
+# TYPE spine_stmt_failures counter
+spine_stmt_failures %d
+
+# HELP spine_dropped_broadcasts State broadcasts dropped because the broadcast channel was saturated
+# TYPE spine_dropped_broadcasts counter
+spine_dropped_broadcasts %d
 `, rps, batchSize, mode,
-			e.Bus.CommitFailures(), e.Bus.SpillWrites(), e.Bus.LostWrites(), e.Bus.DroppedAudit())
+			e.Bus.CommitFailures(), e.Bus.SpillWrites(), e.Bus.LostWrites(), e.Bus.DroppedAudit(), e.Bus.StmtFailures(), e.Hub.DroppedBroadcasts())
 
 		w.Write([]byte(metrics))
 	})
@@ -798,6 +875,17 @@ spine_dropped_audit %d
 			json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": err.Error()})
 			return
 		}
+		// RLAC: a role with an Events whitelist must not read audit entries
+		// for events outside its whitelist.
+		if ac := getAccessContext(r); ac != nil && ac.Events != nil {
+			filtered := logs[:0]
+			for _, l := range logs {
+				if ev, ok := l["event"].(string); ok && ac.CanReceive(ev) {
+					filtered = append(filtered, l)
+				}
+			}
+			logs = filtered
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status": "ok",
 			"count":  len(logs),
@@ -806,9 +894,32 @@ spine_dropped_audit %d
 	}))
 
 	mux.HandleFunc("/ws", wrapWSHandler(func(w http.ResponseWriter, r *http.Request) {
+		// /ws bypasses the HTTP middleware chain (it is registered directly
+		// on the mux), so apply rate limiting and the per-IP connection cap
+		// here explicitly.
+		if e.rateLimiter != nil {
+			if !e.rateLimiter.Allow(e.rateLimiter.ExtractIP(r)) {
+				http.Error(w, "too many requests", http.StatusTooManyRequests)
+				return
+			}
+		}
+		ip := wsClientIP(e, r)
+		if ip != "" {
+			if v, _ := e.wsIPCounts.LoadOrStore(ip, new(atomic.Int64)); v.(*atomic.Int64).Add(1) > int64(e.wsMaxConnsPerIP) {
+				v.(*atomic.Int64).Add(-1)
+				http.Error(w, "too many websocket connections from this IP", http.StatusTooManyRequests)
+				return
+			}
+		}
+
 		// Connection cap: refuse upgrades above the limit BEFORE any upgrade
 		// work (cheap atomic read).
 		if e.wsConnCount.Load() >= int64(e.wsMaxConns) {
+			if ip != "" {
+				if v, _ := e.wsIPCounts.Load(ip); v != nil {
+					v.(*atomic.Int64).Add(-1)
+				}
+			}
 			http.Error(w, "too many websocket connections", http.StatusServiceUnavailable)
 			return
 		}
@@ -819,6 +930,11 @@ spine_dropped_audit %d
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
 			log.Printf("[ws] upgrade error: %v", err)
+			if ip != "" {
+				if v, _ := e.wsIPCounts.Load(ip); v != nil {
+					v.(*atomic.Int64).Add(-1)
+				}
+			}
 			return
 		}
 		// Decrement happens in the read-loop cleanup (below), NOT here — this
@@ -835,7 +951,7 @@ spine_dropped_audit %d
 			return conn.SetReadDeadline(time.Now().Add(wsPongWait))
 		})
 
-		client := &WsClient{Conn: conn, Send: make(chan []byte, 256)}
+		client := &WsClient{Conn: conn, Send: make(chan []byte, 256), Access: wsAccess}
 
 		if authenticated {
 			e.Hub.Register <- client
@@ -885,8 +1001,19 @@ spine_dropped_audit %d
 				}
 				if authenticated {
 					e.Hub.Unregister <- client
+				} else {
+					// Never registered (auth never succeeded): nothing will
+					// close client.Send via Unregister or slow-client reaping,
+					// so the writer goroutine would block on it until a ping
+					// write fails ~25s later. Close it here.
+					client.closeOnce.Do(func() { close(client.Send) })
 				}
 				e.wsConnCount.Add(-1) // connection fully closed
+				if ip != "" {
+					if v, _ := e.wsIPCounts.Load(ip); v != nil {
+						v.(*atomic.Int64).Add(-1)
+					}
+				}
 				conn.Close()
 			}()
 			for {
@@ -911,10 +1038,17 @@ spine_dropped_audit %d
 						authOk = ac != nil
 						if authOk {
 							wsAccess = ac
+							client.Access = ac // RLAC fan-out filtering
 						}
 					} else {
 						// Legacy single-key mode
-						authOk = e.APIKey == "" || subtle.ConstantTimeCompare([]byte(token), []byte(e.APIKey)) == 1
+						if e.APIKey != "" {
+							authOk = subtle.ConstantTimeCompare([]byte(token), []byte(e.APIKey)) == 1
+						} else {
+							// No key configured: only acceptable when
+							// fail-closed mode is off.
+							authOk = !e.authFailClosed.Load()
+						}
 					}
 
 					if authOk {
@@ -968,6 +1102,21 @@ spine_dropped_audit %d
 					// it is fully caught up.
 					const replayBatchMax = 500
 					missedEvents, hasMore, replayErr := e.Bus.GetEventsSince(lastSeenID, replayBatchMax)
+
+					// RLAC: a whitelisted role must not receive replay
+					// payloads for events outside its whitelist. (hasMore is
+					// computed pre-filter, so a whitelisted client paging
+					// through a large backlog may see extra empty pages —
+					// acceptable; correctness of the whitelist is not.)
+					if wsAccess != nil && wsAccess.Events != nil {
+						filtered := missedEvents[:0]
+						for _, ev := range missedEvents {
+							if name, ok := ev["event"].(string); ok && wsAccess.CanReceive(name) {
+								filtered = append(filtered, ev)
+							}
+						}
+						missedEvents = filtered
+					}
 
 					ack := map[string]interface{}{
 						"type":          "reconnect_ack",

@@ -61,7 +61,19 @@ func (b *Bus) stripeCheckout(step *manifest.RouteStep, eventName string, payload
 	if amountDollars <= 0 || math.IsNaN(amountDollars) || math.IsInf(amountDollars, 0) {
 		return fmt.Errorf("stripe.checkout 'amount' must be positive, got %v", amountDollars)
 	}
-	cents := int64(math.Round(amountDollars * 100))
+	// Exact integer dollars → exact cents (no float rounding). Fractional
+	// amounts still go through float conversion — Stripe's unit is cents and
+	// a rounding error on a float dollar amount is at most a cent.
+	var cents int64
+	rawAmount := strings.TrimSpace(step.Config["amount"])
+	if isPlainNumber(rawAmount) && !strings.Contains(rawAmount, ".") {
+		if dollarsInt, perr := strconv.ParseInt(rawAmount, 10, 64); perr == nil {
+			cents = dollarsInt * 100
+		}
+	}
+	if cents == 0 {
+		cents = int64(math.Round(amountDollars * 100))
+	}
 
 	successURL := ResolveVariables(step.Config["success_url"], eventName, payload)
 	cancelURL := ResolveVariables(step.Config["cancel_url"], eventName, payload)
@@ -69,6 +81,16 @@ func (b *Bus) stripeCheckout(step *manifest.RouteStep, eventName string, payload
 		if !strings.HasPrefix(u, "https://") && !strings.HasPrefix(u, "http://") {
 			// Common cause: $env.STORE_PUBLIC_URL unset → relative path.
 			return fmt.Errorf("stripe.checkout '%s' must be an absolute http(s) URL (got %q) — is its environment variable set?", name, u)
+		}
+		// Open-redirect guard: post-payment redirect targets must not be
+		// client-controlled. Payload-derived URLs are only accepted when the
+		// resolved host is in STRIPE_ALLOWED_REDIRECT_HOSTS (comma-separated).
+		cfgName := map[string]string{"success_url": "success_url", "cancel_url": "cancel_url"}[name]
+		if strings.Contains(step.Config[cfgName], "$event.payload") {
+			parsed, perr := url.Parse(u)
+			if perr != nil || !redirectHostAllowed(parsed.Hostname()) {
+				return fmt.Errorf("stripe.checkout '%s' is derived from the client payload — refusing to redirect there (open-redirect risk); configure it in the manifest or allowlist the host via STRIPE_ALLOWED_REDIRECT_HOSTS", name)
+			}
 		}
 	}
 
@@ -106,6 +128,20 @@ func (b *Bus) stripeCheckout(step *manifest.RouteStep, eventName string, payload
 	return nil
 }
 
+// redirectHostAllowed reports whether host is in the STRIPE_ALLOWED_REDIRECT_HOSTS
+// allowlist (comma-separated, hostnames only). An unset allowlist allows nothing.
+func redirectHostAllowed(host string) bool {
+	if host == "" {
+		return false
+	}
+	for _, h := range strings.Split(os.Getenv("STRIPE_ALLOWED_REDIRECT_HOSTS"), ",") {
+		if strings.EqualFold(strings.TrimSpace(h), host) {
+			return true
+		}
+	}
+	return false
+}
+
 // stripeCreateSession posts the form-encoded Sessions request and extracts
 // id + url from the response.
 func stripeCreateSession(secret string, form url.Values) (sessionID, checkoutURL string, err error) {
@@ -120,6 +156,10 @@ func stripeCreateSession(secret string, form url.Values) (sessionID, checkoutURL
 	}
 	req.Header.Set("Authorization", "Bearer "+secret)
 	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	// Idempotency: keyed by client_reference_id (order_id) so execStep
+	// retries or client re-emits for the same order never create duplicate
+	// Checkout Sessions.
+	req.Header.Set("Idempotency-Key", "spine-order-"+form.Get("client_reference_id"))
 
 	resp, err := sharedHTTPClient.Do(req)
 	if err != nil {

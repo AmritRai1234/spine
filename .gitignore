@@ -13,6 +13,14 @@ node_modules/
 *.turso-shm
 Untitled design.png
 
+# Python
+__pycache__/
+*.egg-info/
+*.pyc
+
+# Expo / mobile
+.expo/
+
 # OS
 .DS_Store
 Thumbs.db
@@ -26,3 +34,4 @@ Thumbs.db
 bin/
 web/dist/
 tests.test
+.gocache/

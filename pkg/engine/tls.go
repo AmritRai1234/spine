@@ -63,7 +63,12 @@ func newACMEManager(cfg *TLSConfig) (*autocert.Manager, error) {
 
 	allowed := make(map[string]bool, len(cfg.Domains))
 	for _, d := range cfg.Domains {
-		d = strings.ToLower(strings.TrimSpace(strings.TrimPrefix(d, "*.")))
+		d = strings.ToLower(strings.TrimSpace(d))
+		if strings.HasPrefix(d, "*.") {
+			// autocert.HostWhitelist does exact matching only — a wildcard
+			// entry would silently fail for every subdomain. Refuse loudly.
+			return nil, fmt.Errorf("wildcard ACME domain '%s' is not supported (autocert HostWhitelist matches exact hostnames only); list each subdomain explicitly", d)
+		}
 		if d == "" {
 			return nil, fmt.Errorf("empty domain in TLS config")
 		}
@@ -151,6 +156,7 @@ func (e *Engine) ListenAndServeTLS(addr string, cfg *TLSConfig) error {
 		srv.TLSConfig = &tls.Config{
 			GetCertificate: m.GetCertificate,
 			MinVersion:     tls.VersionTLS12,
+			NextProtos:     []string{"h2", "http/1.1"},
 		}
 		challenge := httpChallengeServer(m)
 		servers = append(servers, srv, challenge)
@@ -160,6 +166,12 @@ func (e *Engine) ListenAndServeTLS(addr string, cfg *TLSConfig) error {
 		)
 		log.Printf("[spine] ACME enabled for %v (cert cache: %s)", cfg.Domains, orDefault(cfg.CacheDir, DefaultCertCacheDir))
 	case cfg.CertFile != "" && cfg.KeyFile != "":
+		// State the TLS floor explicitly instead of relying on the Go
+		// server default: TLS 1.2 minimum, HTTP/2 negotiated.
+		srv.TLSConfig = &tls.Config{
+			MinVersion: tls.VersionTLS12,
+			NextProtos: []string{"h2", "http/1.1"},
+		}
 		servers = append(servers, srv)
 		starts = append(starts, func() error { return srv.ListenAndServeTLS(cfg.CertFile, cfg.KeyFile) })
 	default:

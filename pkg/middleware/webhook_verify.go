@@ -13,6 +13,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 )
 
@@ -23,6 +24,14 @@ import (
 func allowUnsignedWebhooks() bool {
 	return os.Getenv("SPINE_ALLOW_UNSIGNED_WEBHOOKS") == "1"
 }
+
+// minWebhookSecretLen is the minimum HMAC secret length before the middleware
+// warns about a weak webhook secret (verification still runs).
+const minWebhookSecretLen = 16
+
+// shortSecretWarned tracks providers already warned about short secrets so the
+// warning fires once per provider, not once per request.
+var shortSecretWarned sync.Map
 
 // SecretFunc is a function that returns the webhook secret for a provider.
 type SecretFunc func(provider string) string
@@ -61,6 +70,15 @@ func WebhookVerifyMiddleware(getSecret SecretFunc, next http.HandlerFunc) http.H
 				"error":  "webhook_provider_not_configured",
 			})
 			return
+		}
+
+		// HMAC secrets shorter than 16 bytes are trivially brute-forceable;
+		// warn once per provider (verification still runs — the warning makes
+		// the misconfiguration visible without breaking existing setups).
+		if len(secret) < minWebhookSecretLen {
+			if _, warned := shortSecretWarned.LoadOrStore(provider, struct{}{}); !warned {
+				log.Printf("[webhook] ⚠ provider '%s' has a webhook secret shorter than %d bytes — use a secret of at least %d random bytes", provider, minWebhookSecretLen, minWebhookSecretLen)
+			}
 		}
 
 		// Read the raw body

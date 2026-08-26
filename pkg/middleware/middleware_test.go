@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 )
 
 func TestCORSMiddleware(t *testing.T) {
@@ -116,7 +117,7 @@ func TestRateLimitXFFNotTrustedByDefault(t *testing.T) {
 
 func TestRecoveryMiddleware(t *testing.T) {
 	panicHandler := func(w http.ResponseWriter, r *http.Request) {
-		panic("simulated engine unexpected failure")
+		panic("simulated engine unexpected failure with /etc/passwd content")
 	}
 
 	handler := RecoveryMiddleware(panicHandler)
@@ -130,6 +131,31 @@ func TestRecoveryMiddleware(t *testing.T) {
 	}
 	if !bytes.Contains(rec.Body.Bytes(), []byte("internal_server_error")) {
 		t.Errorf("Expected response body to contain internal_server_error, got %s", rec.Body.String())
+	}
+	// The panic value must stay server-side — echoing it would disclose
+	// internals (paths, SQL fragments) to unauthenticated callers.
+	if bytes.Contains(rec.Body.Bytes(), []byte("/etc/passwd")) ||
+		bytes.Contains(rec.Body.Bytes(), []byte("simulated engine")) {
+		t.Errorf("panic detail leaked to the client: %s", rec.Body.String())
+	}
+}
+
+// TestRateLimitSubOneRPS: a limit below 1 req/sec must degrade to "1 request
+// per N seconds", not permanently block after the first request (the old
+// burst<1 math could never refill a token).
+func TestRateLimitSubOneRPS(t *testing.T) {
+	m := NewRateLimitManager(0.5, 0.5) // 1 request per 2 seconds
+	defer m.Close()
+
+	if !m.Allow("10.0.0.1") {
+		t.Fatal("first request must be allowed")
+	}
+	if m.Allow("10.0.0.1") {
+		t.Fatal("second immediate request must be blocked (bucket empty)")
+	}
+	time.Sleep(2100 * time.Millisecond)
+	if !m.Allow("10.0.0.1") {
+		t.Fatal("after the refill window a request must be allowed again")
 	}
 }
 

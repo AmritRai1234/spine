@@ -41,6 +41,10 @@ type Bus struct {
 	upsertSQLCache sync.Map // "table|conflictKey|col1,col2" → *sqlTemplate
 	uniqueIdx      sync.Map // "table|conflictCol" → ensured unique index marker
 
+	// tableEnsureMu single-flights the DDL section of ensureTable per table
+	// fingerprint (contended only on first-insert cache misses).
+	tableEnsureMu sync.Mutex
+
 	// Dialect-specific SQL fragments (placeholder style, auto-PK, table list)
 	dialect  *dialect
 	auditSQL string
@@ -391,6 +395,31 @@ func (b *Bus) startBatchWriter() {
 
 		batch := make([]dbTask, 0, 1000)
 
+		// releaseFences holds flush fences (flushAndWait) drained from the
+		// channels. They are NEVER executed as SQL — they are released only
+		// after the next flush, so "all writes submitted before the fence are
+		// committed" holds even when a fence is drained indirectly (e.g. by
+		// drainAllShards reading shard[0]).
+		var releaseFences []chan struct{}
+		releaseFencesAfterFlush := func() {
+			if len(releaseFences) > 0 {
+				for _, f := range releaseFences {
+					close(f)
+				}
+				releaseFences = releaseFences[:0]
+			}
+		}
+
+		// takeTask routes a drained task: write tasks join the batch, flush
+		// fences are recorded for release after the next flush.
+		takeTask := func(t dbTask) {
+			if t.barrier != nil {
+				releaseFences = append(releaseFences, t.barrier)
+				return
+			}
+			batch = append(batch, t)
+		}
+
 		flush := func() {
 			if len(batch) == 0 {
 				return
@@ -413,7 +442,7 @@ func (b *Bus) startBatchWriter() {
 						if !ok {
 							break
 						}
-						batch = append(batch, t)
+						takeTask(t)
 						continue
 					default:
 					}
@@ -425,43 +454,71 @@ func (b *Bus) startBatchWriter() {
 			}
 		}
 
+		// drainAllShardsFull does a non-blocking FULL drain of every shard
+		// (not capped by targetSize) — used by flush fences and shutdown.
+		drainAllShardsFull := func() {
+			for i := range b.writer.shards {
+				for {
+					select {
+					case t, ok := <-b.writer.shards[i]:
+						if !ok {
+							break
+						}
+						takeTask(t)
+						continue
+					default:
+					}
+					break
+				}
+			}
+		}
+
 		// Block on shard[0] to avoid busy-wait, then drain all shards
 		for {
 			select {
 			case <-b.stopCh:
 				// Drain all shards before exit
-				for i := range b.writer.shards {
-					for {
-						select {
-						case t, ok := <-b.writer.shards[i]:
-							if !ok {
-								break
-							}
-							batch = append(batch, t)
-							continue
-						default:
-						}
-						break
-					}
-				}
+				drainAllShardsFull()
 				flush()
+				releaseFencesAfterFlush()
 				return
 			case task, ok := <-b.writer.shards[0]:
 				if !ok {
 					// Channel closed — drain remaining shards and exit
 					for i := 1; i < numWriteShards; i++ {
 						for t := range b.writer.shards[i] {
-							batch = append(batch, t)
+							takeTask(t)
 						}
 					}
 					flush()
+					releaseFencesAfterFlush()
 					return
 				}
-				batch = append(batch, task)
+				if task.barrier != nil {
+					// Flush fence (flushAndWait): drain EVERYTHING queued
+					// before the fence — not just up to the target batch
+					// size — commit, then release the waiter (via
+					// releaseFencesAfterFlush). Guarantees every task
+					// submitted before the fence is durable when it closes.
+					takeTask(task)
+					drainAllShardsFull()
+					flush()
+					releaseFencesAfterFlush()
+					continue
+				}
+				takeTask(task)
 				targetBatchSize := b.optimizer.GetBatchSize()
 				// Accumulate from all shards before flushing
 				drainAllShards(targetBatchSize)
-				flush()
+				// Real adaptive batching: flush only when the batch reached
+				// the optimizer's target size (or the ticker fires). The old
+				// unconditional flush-per-receive committed every event in
+				// its own 1-2 item transaction, making the optimizer's batch
+				// size tuning aspirational.
+				if len(batch) >= targetBatchSize {
+					flush()
+					releaseFencesAfterFlush()
+				}
 
 				// Dynamically adjust ticker when optimizer changes mode
 				newInterval := b.optimizer.GetFlushInterval()
@@ -473,6 +530,7 @@ func (b *Bus) startBatchWriter() {
 				// Periodic flush — drain all shards
 				drainAllShards(b.optimizer.GetBatchSize())
 				flush()
+				releaseFencesAfterFlush()
 			}
 		}
 	}()
@@ -480,6 +538,15 @@ func (b *Bus) startBatchWriter() {
 
 // Close shuts down batch writer and the database connection.
 func (b *Bus) Close() error {
+	// Close the writer FIRST: the closed flag makes every subsequent submit
+	// return false (callers fall back to synchronous writes), and the writer
+	// loop sees the closed channels and drains everything still queued before
+	// exiting. This removes the old shutdown race where a task submitted
+	// between the loop's final drain and closeAll landed in a channel that
+	// was then closed unread — with the caller having already been told the
+	// write succeeded.
+	b.writer.closeAll()
+
 	select {
 	case <-b.stopCh:
 	default:
@@ -489,7 +556,6 @@ func (b *Bus) Close() error {
 	if b.optimizer != nil {
 		b.optimizer.Close()
 	}
-	b.writer.closeAll()
 	b.wg.Wait()
 	return b.db.Close()
 }
@@ -644,6 +710,14 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 		statesPool.Put(statesPtr)
 	}()
 
+	// Deferred state broadcasts for depth-0 emits: enqueued AFTER the audit
+	// insert so they can carry the audit id (the WS reconnect replay cursor).
+	// NOTE: chained-route broadcasts (depth > 0) are enqueued during the loop,
+	// so a chained state may reach clients before its parent state — the
+	// cursor protocol only requires the id to reference a committed audit
+	// row, which holds.
+	var pendingBroadcasts []stateBroadcast
+
 	for _, route := range routes {
 		if route.IfCondition != "" && !EvaluateCondition(route.IfCondition, event, payload) {
 			continue
@@ -735,7 +809,11 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 
 		if route.EmitState != "" {
 			b.SetState(route.EmitState, payload)
-			b.hub.BroadcastState(route.EmitState, event, payload)
+			if depth == 0 {
+				pendingBroadcasts = append(pendingBroadcasts, stateBroadcast{state: route.EmitState, payload: payload})
+			} else {
+				b.hub.BroadcastState(route.EmitState, event, payload)
+			}
 			emittedStates = append(emittedStates, route.EmitState)
 
 			// Event Chaining: trigger routes matching the emitted state
@@ -752,7 +830,10 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 	}
 
 	if depth == 0 {
-		b.logEventAudit(event, payload, emittedStates)
+		auditID := b.logEventAudit(event, payload, emittedStates)
+		for _, pb := range pendingBroadcasts {
+			b.hub.BroadcastStateID(pb.state, event, pb.payload, auditID)
+		}
 	}
 
 	// Copy emittedStates before returning (original goes back to pool)
@@ -768,6 +849,14 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 
 	if idempotencyKey != "" {
 		if claimedKey != "" {
+			// Durability fence: the idempotency row must not claim 'completed'
+			// until every write this emit queued is actually committed.
+			// Otherwise a crash right after would make every retry with the
+			// same key replay a cached 'ok' for an event whose effects were
+			// lost (idempotency false positive).
+			if !b.writer.flushAndWait(writerFlushTimeout) {
+				log.Printf("[idempotency] flush fence for key %s timed out — marking completed without durability guarantee", idempotencyKey)
+			}
 			resultJSON, err := json.Marshal(res)
 			if err != nil {
 				// res contains only strings/ints/slices, so this should never
@@ -852,7 +941,28 @@ func (b *Bus) handleRouteFailure(onFailureState string, event string, currentPay
 	}, stepErr
 }
 
+// stateBroadcast is a deferred depth-0 state broadcast awaiting the audit id.
+type stateBroadcast struct {
+	state   string
+	payload map[string]interface{}
+}
+
+// execStep executes a route step with retries, enqueueing failed
+// http.post/notify.webhook actions into the durable outbox for retry.
 func (b *Bus) execStep(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
+	return b.execStepInternal(step, eventName, payload, false)
+}
+
+// execStepNoEnqueue executes a step exactly like execStep but NEVER re-enqueues
+// a failed http.post/notify.webhook into the outbox. It is used by the outbox
+// worker: without this, every outbox retry of a failing webhook would insert a
+// brand-new outbox row (attempts=1), bypassing maxRetries and growing the
+// table forever (self-perpetuating retry loop).
+func (b *Bus) execStepNoEnqueue(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
+	return b.execStepInternal(step, eventName, payload, true)
+}
+
+func (b *Bus) execStepInternal(step *manifest.RouteStep, eventName string, payload map[string]interface{}, fromOutbox bool) error {
 	if step.IfCondition != "" && !EvaluateCondition(step.IfCondition, eventName, payload) {
 		return nil
 	}
@@ -873,13 +983,24 @@ func (b *Bus) execStep(step *manifest.RouteStep, eventName string, payload map[s
 		}
 	}
 	if step.Action == "http.post" || step.Action == "notify.webhook" {
-		b.enqueueOutboxStep(step, step.Action, payload, step.BackoffMs)
+		if !fromOutbox {
+			b.enqueueOutboxStep(step, step.Action, payload, step.BackoffMs)
+		}
 	}
 	return fmt.Errorf("action %s failed after %d attempts: %w", step.Action, attempts, lastErr)
 }
 
 // rollbackCompensation executes compensation actions for previously succeeded steps in reverse order (Saga pattern).
 func (b *Bus) rollbackCompensation(succeededSteps []manifest.RouteStep, eventName string, payload map[string]interface{}) {
+	// Durability fence: compensation actions must run AFTER the writes they
+	// undo have committed. Flush everything queued so far (including the
+	// failed step's own writes) before compensating; without this, a
+	// compensating db.delete could commit BEFORE the db.insert it undoes
+	// (both are async through the sharded writer), leaving the "rolled back"
+	// effect in the final state.
+	if !b.writer.flushAndWait(writerFlushTimeout) {
+		log.Printf("[compensation] flush fence timed out — compensation may race the writes it undoes")
+	}
 	for i := len(succeededSteps) - 1; i >= 0; i-- {
 		step := succeededSteps[i]
 		if step.Compensate == "" {
@@ -895,6 +1016,20 @@ func (b *Bus) rollbackCompensation(succeededSteps []manifest.RouteStep, eventNam
 		// If config contains compensate_where, substitute for Where
 		if compWhere, ok := step.Config["compensate_where"]; ok {
 			compStep.Where = compWhere
+		}
+
+		// Compensating db.inserts run synchronously so they cannot be
+		// reordered behind later compensation writes (best-effort; only
+		// db.insert honors the sync flag).
+		if compStep.Config != nil {
+			cfg := make(map[string]string, len(compStep.Config)+1)
+			for k, v := range compStep.Config {
+				cfg[k] = v
+			}
+			cfg["sync"] = "true"
+			compStep.Config = cfg
+		} else {
+			compStep.Config = map[string]string{"sync": "true"}
 		}
 
 		if err := b.dispatchAction(&compStep, eventName, payload); err != nil {

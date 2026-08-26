@@ -103,11 +103,22 @@ func (b *Bus) enqueueOutboxStep(step *manifest.RouteStep, action string, payload
 	}
 }
 
+// outboxRetention is how long terminal (failed/completed) outbox rows are kept
+// before the periodic sweep deletes them, bounding table growth over time.
+const outboxRetention = 7 * 24 * time.Hour
+
 // processOutboxQueue processes pending outbox retry tasks surviving server restarts.
 // Uses a bounded worker pool configured via database.outbox.max_workers in the manifest.
 func (b *Bus) processOutboxQueue() {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
+
+	// Crash recovery: a previous process may have died mid-execution, leaving
+	// rows stuck in 'processing'. No worker is running yet, so every such row
+	// can safely return to 'pending' and be retried.
+	if _, err := b.db.Exec(`UPDATE "_spine_outbox" SET status = 'pending' WHERE status = 'processing'`); err != nil {
+		log.Printf("[outbox] reset stale 'processing' rows failed: %v", err)
+	}
 
 	getOutboxConfig := func() (int, int, int) {
 		maxWorkers := 10
@@ -135,6 +146,7 @@ func (b *Bus) processOutboxQueue() {
 
 		rows, err := b.db.Query(`SELECT id, action, payload, COALESCE(step_data, ''), attempts FROM "_spine_outbox" WHERE status = 'pending' AND next_retry_at <= `+b.ph(1)+` ORDER BY id ASC LIMIT 50`, nowStr)
 		if err != nil {
+			log.Printf("[outbox] select pending failed: %v", err)
 			return
 		}
 
@@ -171,6 +183,18 @@ func (b *Bus) processOutboxQueue() {
 					wg.Done()
 				}()
 
+				// Claim the row before executing so concurrent ticks (or
+				// multiple bus instances on the same DB) cannot double-deliver.
+				// Only 'pending' rows can be claimed.
+				res, err := b.db.Exec(`UPDATE "_spine_outbox" SET status = 'processing' WHERE id = `+b.ph(1)+` AND status = 'pending'`, t.id)
+				if err != nil {
+					log.Printf("[outbox] claim row %d failed: %v", t.id, err)
+					return
+				}
+				if n, _ := res.RowsAffected(); n == 0 {
+					return // already claimed by another worker
+				}
+
 				var payload map[string]interface{}
 				_ = json.Unmarshal([]byte(t.payload), &payload)
 
@@ -181,27 +205,38 @@ func (b *Bus) processOutboxQueue() {
 					_ = json.Unmarshal([]byte(t.stepData), step)
 				}
 
-				err := b.execStep(step, "_spine_outbox_retry", payload)
+				// execStepNoEnqueue: a failed retry must NEVER enqueue a fresh
+				// outbox row (that would bypass maxRetries and grow the table
+				// forever). Retries update attempts on THIS row only.
+				err = b.execStepNoEnqueue(step, "_spine_outbox_retry", payload)
 				if err == nil {
-					b.db.Exec(`UPDATE "_spine_outbox" SET status = 'completed' WHERE id = `+b.ph(1), t.id)
-				} else {
-					nextAttempts := t.attempts + 1
-					if nextAttempts > maxRetries {
-						b.db.Exec(`UPDATE "_spine_outbox" SET status = 'failed', attempts = `+b.ph(1)+` WHERE id = `+b.ph(2), nextAttempts, t.id)
-					} else {
-						multiplier := 1 << (nextAttempts - 1)
-						if multiplier > 32 {
-							multiplier = 32
-						}
-						nextRetry := time.Now().UTC().Add(time.Duration(backoffMs*multiplier) * time.Millisecond).Format(time.RFC3339)
-						b.db.Exec(`UPDATE "_spine_outbox" SET attempts = `+b.ph(1)+`, next_retry_at = `+b.ph(2)+` WHERE id = `+b.ph(3), nextAttempts, nextRetry, t.id)
+					if uerr := execWithRetry(b.db, `UPDATE "_spine_outbox" SET status = 'completed' WHERE id = `+b.ph(1), t.id); uerr != nil {
+						log.Printf("[outbox] mark row %d completed failed: %v", t.id, uerr)
 					}
+					return
+				}
+
+				nextAttempts := t.attempts + 1
+				if nextAttempts > maxRetries {
+					if uerr := execWithRetry(b.db, `UPDATE "_spine_outbox" SET status = 'failed', attempts = `+b.ph(1)+` WHERE id = `+b.ph(2), nextAttempts, t.id); uerr != nil {
+						log.Printf("[outbox] mark row %d failed: %v", t.id, uerr)
+					}
+					return
+				}
+				multiplier := 1 << (nextAttempts - 1)
+				if multiplier > 32 {
+					multiplier = 32
+				}
+				nextRetry := time.Now().UTC().Add(time.Duration(backoffMs*multiplier) * time.Millisecond).Format(time.RFC3339)
+				if uerr := execWithRetry(b.db, `UPDATE "_spine_outbox" SET attempts = `+b.ph(1)+`, status = 'pending', next_retry_at = `+b.ph(2)+` WHERE id = `+b.ph(3), nextAttempts, nextRetry, t.id); uerr != nil {
+					log.Printf("[outbox] reschedule row %d failed: %v", t.id, uerr)
 				}
 			}(task)
 		}
 		wg.Wait()
 	}
 
+	var lastPurge time.Time
 	for {
 		select {
 		case <-b.stopCh:
@@ -210,6 +245,15 @@ func (b *Bus) processOutboxQueue() {
 			process()
 		case <-ticker.C:
 			process()
+			// Periodic sweep: bound table growth by dropping terminal rows
+			// older than outboxRetention.
+			if time.Since(lastPurge) >= time.Minute {
+				lastPurge = time.Now()
+				cutoff := time.Now().UTC().Add(-outboxRetention).Format(time.RFC3339)
+				if _, err := b.db.Exec(`DELETE FROM "_spine_outbox" WHERE status IN ('failed', 'completed') AND created_at < `+b.ph(1), cutoff); err != nil {
+					log.Printf("[outbox] purge terminal rows failed: %v", err)
+				}
+			}
 		}
 	}
 }

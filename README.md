@@ -1,7 +1,7 @@
 <p align="center">
   <img src="https://raw.githubusercontent.com/AmritRai1234/spine/main/assets/logo.png?v=2" width="200" alt="Spine Logo"><br>
   <strong>SPINE</strong><br>
-  <em>Declarative Event-Driven Backend Engine (v3.0.0)</em>
+  <em>Declarative Event-Driven Backend Engine (v3.0.1)</em>
 </p>
 
 <p align="center">
@@ -197,9 +197,9 @@ Spine provides a rich command-line toolkit for local dev, scaffolding, codegen, 
 spine serve app.spine [options]    # Start production HTTP/WS engine
 spine dev app.spine [options]      # Start hot-reloading dev server with colored logging
 spine init [dir] [--template X]   # Scaffold new project (templates: chat, dashboard, iot, shadcn)
-spine test [manifest.spine]        # Run manifest-defined assertion tests
+spine test [manifest.spine]        # Smoke-test a manifest (parse + engine init)
 spine deploy [fly|railway|render]  # Generate cloud deployment config (fly.toml, Dockerfile)
-spine plugin add <plugin-name>     # Download & register WASM/Go action plugin modules
+spine plugin add <plugin-name>     # Scaffold a local WASM action plugin module (placeholder)
 spine docs [--port 9090]           # Launch local doc server & visualizer
 spine emit <event> --payload '{...}' # Emit event to running Spine server
 spine context <manifest> <Node>      # Print one node's contract slice (AI-ready context)
@@ -498,7 +498,7 @@ routes:
 | `log.write` | Write a log message with template variables | `message` (required) |
 | `http.post` | Send an HTTP POST webhook | `url` (required) |
 | `notify.webhook` | Like `http.post`, but silently no-ops when the URL resolves empty (e.g. unset `$env`) | `url` (required) |
-| `fts.search` | Full-text search over a table (FTS5 on SQLite, LIKE fallback elsewhere); results land in payload as `fts_results` | `table`, query via `config.query`/`where`/`input` |
+| `fts.search` | Full-text search over a table (FTS5 index auto-provisioned + kept in sync on SQLite/Turso; explicit error on other backends); results land in payload as `fts_results` | `table`, query via `config.query`/`where`/`input` |
 | `emit_to` | Broadcast the event to an external stream target | `stream` (or `table`) |
 | `queue.publish` | Publish the payload to a topic over WebSocket state | `table` = topic (default: current event) |
 | `emit` | Emit a chained event | `event`, `payload` (optional) |
@@ -858,7 +858,7 @@ spine/
 ├── examples/
 │   └── app.spine        # Full example manifest
 ├── sdk/                 # Python & TypeScript client SDKs
-├── tests/               # 158 tests across 42 files (unit, integration, e2e, benchmarks)
+├── tests/               # 207 tests across 52 files (unit, integration, e2e, benchmarks)
 ├── web/                 # Developer web dashboard
 ├── spine.go             # Public Go library API facade
 ├── Dockerfile           # Multi-stage Docker build
@@ -1018,12 +1018,18 @@ Emit() → Contract Validation → Route Steps → Sharded Writer → Batch Flus
 
 Measured on AMD Ryzen 7 5825U (16 threads). All numbers are **in-process**
 micro-benchmarks: they call `Bus.Emit` directly and exclude HTTP, WebSocket,
-and network I/O (see `tests/benchmark_test.go`). For end-to-end HTTP
-comparisons against a traditional server, run `benchmarks/run-benchmarks.ts`.
+and network I/O (see `tests/benchmark_test.go`). NOTE: `Bus.Emit` returns
+once writes are queued to the batched writer — the SQLite commit/fsync is NOT
+in the measured path, so these are enqueue-throughput numbers, not durable-
+write latencies. **DurableWrites** closes that gap: it emits N events, waits for the
+batch writer's flush fence, and reports writes/sec INCLUDING the SQLite commit
+(batched 250–10,000 writes per transaction). For end-to-end HTTP comparisons against a traditional server,
+run `benchmarks/run-benchmarks.ts` (all of its numbers are measured).
 
 | Benchmark | ops/sec | ns/op | B/op | allocs/op |
 |---|---|---|---|---|
-| **EmitSingle** (full pipeline) | 274,000 | 3,655 | 1,405 | 28 |
+| **EmitSingle** (async enqueue; DB commit excluded) | 274,000 | 3,655 | 1,405 | 28 |
+| **DurableWrites** (batched commit via flush fence) | 44,300 | 22,541 | 1,816 | 32 |
 | **EmitE2ELatency** (p50/p95/p99) | 285,000 | 3,512 (p50 1.2μs / p99 4.9μs) | 1,395 | 27 |
 | **EmitParallel** (16 goroutines) | 200,000 | 5,003 | 1,406 | 27 |
 | **EmitWithValidation** (typed) | 222,000 | 4,491 | 1,818 | 33 |
@@ -1045,7 +1051,7 @@ go test ./tests/ -bench=. -benchmem -count=3
 
 ## Tests
 
-**100% of test suites passing cleanly** across 42 test files (158 tests), including in-process fake SMTP and Stripe servers so the email and payment tiers are tested end-to-end without external dependencies:
+**100% of test suites passing cleanly** across 52 test files (207 tests), including in-process fake SMTP and Stripe servers so the email and payment tiers are tested end-to-end without external dependencies:
 
 | Suite | Coverage |
 |---|---|

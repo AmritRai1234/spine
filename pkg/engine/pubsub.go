@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"log"
 	"sync"
 )
 
@@ -24,13 +25,25 @@ func NewLocalPubSub() *LocalPubSub {
 }
 
 // Publish broadcasts a message payload to all local channel subscribers.
+//
+// Delivery is synchronous with a deep copy per subscriber and per-subscriber
+// panic recovery: the old fire-and-forget goroutine per subscriber shared the
+// payload map by reference (a data race if handlers mutate it), had no
+// lifecycle, and a panicking subscriber killed the process.
 func (p *LocalPubSub) Publish(channel string, payload map[string]interface{}) error {
 	p.mu.RLock()
 	handlers := p.subscribers[channel]
 	p.mu.RUnlock()
 
 	for _, fn := range handlers {
-		go fn(payload)
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					log.Printf("[pubsub] subscriber panic on channel %q: %v", channel, r)
+				}
+			}()
+			fn(deepCopyPayload(payload))
+		}()
 	}
 	return nil
 }

@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"errors"
 	"encoding/json"
 	"fmt"
 	"log"
@@ -45,11 +46,26 @@ func (b *Bus) sanitizeIdentCached(s string) string {
 
 // ensureTable creates the table and auto-generates column indexes or adds missing columns.
 // Uses knownTable sync.Map to skip SQL when the same column set has been seen before.
+//
+// Concurrency: the DDL section is single-flighted per table fingerprint.
+// Previously every concurrent first-insert goroutine ran the full
+// CREATE + ALTER + CREATE INDEX sequence (a DDL thundering herd that could
+// stall sync:true inserts for seconds behind SQLite's write lock). The mutex
+// is only contended on a cache miss; the steady-state fast path is a single
+// atomic map load.
 func (b *Bus) ensureTable(table string, colDefs []string) error {
 	// Build a fingerprint of the column definitions for this call
 	colKey := table + "|" + strings.Join(colDefs, ",")
 
 	// Fast path: this exact table+columns combo already ensured — skip all SQL
+	if _, known := b.knownTable.Load(colKey); known {
+		return nil
+	}
+
+	b.tableEnsureMu.Lock()
+	defer b.tableEnsureMu.Unlock()
+	// Double-check under the lock: another goroutine may have ensured it
+	// while we waited.
 	if _, known := b.knownTable.Load(colKey); known {
 		return nil
 	}
@@ -103,11 +119,27 @@ func isColumnExistsErr(err error) bool {
 		strings.Contains(msg, "already exists") // Postgres / others
 }
 
-func normalizeParam(v interface{}, eventName string, payload map[string]interface{}) interface{} {	if strVal, ok := v.(string); ok && strings.HasPrefix(strVal, "$") {
-		return ResolveVariables(strVal, eventName, payload)
-	}
+// normalizeParam coerces a payload value into a bindable SQL parameter.
+//
+// IMPORTANT: payload values are treated as LITERAL DATA. Template variables
+// ($env.X, $now, $uuid, $event.payload.X) are intentionally NOT resolved here:
+// a client-supplied value like "$env.STRIPE_SECRET_KEY" must be stored as the
+// literal string, never resolved against the server environment (exfiltration).
+// Template resolution only ever happens in manifest-declared strings, which
+// call ResolveVariables explicitly (parseWhereCondition, setFields, httpPost,
+// mathCalc, dbLookup value_expr, ...).
+func normalizeParam(v interface{}, eventName string, payload map[string]interface{}) interface{} {
 	switch val := v.(type) {
-	case map[string]interface{}, []interface{}, []string, map[string]string:
+	case bool:
+		// Booleans bind as 0/1: declared boolean fields map to INTEGER
+		// columns (sqliteType), and the Postgres driver cannot encode a Go
+		// bool into an int4 column (SQLite happened to convert for us).
+		// This keeps the same storage form on every backend.
+		if val {
+			return int64(1)
+		}
+		return int64(0)
+	case map[string]interface{}, []interface{}, []string, map[string]string, []map[string]interface{}, []map[string]string:
 		bytes, err := json.Marshal(val)
 		if err == nil {
 			return string(bytes)
@@ -273,6 +305,11 @@ func (b *Bus) dbUpdate(table string, whereExpr string, eventName string, payload
 	if explicitWhere {
 		col, op, val, err := parseWhereCondition(whereExpr, eventName, payload)
 		if err != nil {
+			var unresolvable *errWhereUnresolvable
+			if errors.As(err, &unresolvable) {
+				// Optional where-field absent → no rows qualify → no-op.
+				return nil
+			}
 			return fmt.Errorf("db.update: %w", err)
 		}
 		whereCol = b.sanitizeIdentCached(col)
@@ -398,6 +435,16 @@ func (b *Bus) dbUpdate(table string, whereExpr string, eventName string, payload
 	return nil
 }
 
+// errWhereUnresolvable marks a where expression whose template variable
+// (e.g. $event.payload.country) cannot be resolved because the payload field
+// is absent. Db ops translate it to "matches no rows": the documented
+// optional-field pattern (missing shipping country → no zone row → free
+// shipping) must degrade to an empty match set — not error (breaks optional
+// fields) and not silently match '' (matches the wrong rows).
+type errWhereUnresolvable struct{ msg string }
+
+func (e *errWhereUnresolvable) Error() string { return e.msg }
+
 // parseWhereCondition parses a where expression into column, operator, and value components.
 // Template variables in the value are resolved. The column name is sanitized.
 // This prevents SQL injection by using parameterized queries instead of string interpolation.
@@ -436,8 +483,21 @@ func parseWhereCondition(expr string, eventName string, payload map[string]inter
 				column = strings.TrimSpace(expr[:i])
 				value = strings.TrimSpace(expr[i+len(pattern):])
 
-				// Resolve template variables in the value
-				value = ResolveVariables(value, eventName, payload)
+				// Reject compound conditions: everything after the first
+				// operator is the VALUE, so "a = 1 AND b = 2" would silently
+				// bind "1 AND b = 2" as one parameter and match nothing.
+				if hasUnquotedAndOr(value) {
+					return "", "", "", fmt.Errorf("unsupported compound where expression: '%s' (multiple conditions are not supported — split them into separate steps)", expr)
+				}
+
+				// Resolve template variables in the value. An unresolvable
+				// payload path is reported as errWhereUnresolvable — callers
+				// treat it as "matches no rows".
+				resolved, rerr := ResolveVariablesStrict(value, eventName, payload)
+				if rerr != nil {
+					return "", "", "", &errWhereUnresolvable{msg: fmt.Sprintf("where expression '%s': %v", expr, rerr)}
+				}
+				value = resolved
 
 				// Strip surrounding quotes from value if present
 				if len(value) >= 2 {
@@ -460,6 +520,39 @@ func parseWhereCondition(expr string, eventName string, payload map[string]inter
 	return "", "", "", fmt.Errorf("unsupported where expression format: '%s' (expected 'column op value', e.g. \"email = $event.payload.email\")", expr)
 }
 
+// hasUnquotedAndOr reports whether a value contains AND/OR as space-delimited
+// words OUTSIDE quoted regions — i.e. a compound condition that
+// parseWhereCondition cannot handle (it would be bound as one parameter).
+// `title = 'fish AND chips'` is a plain value and must not trip this.
+func hasUnquotedAndOr(s string) bool {
+	upper := strings.ToUpper(s)
+	inQuote := byte(0)
+	for i := 0; i+3 <= len(s); i++ {
+		c := s[i]
+		if c == '\'' || c == '"' {
+			if inQuote == 0 {
+				inQuote = c
+			} else if inQuote == c {
+				inQuote = 0
+			}
+			continue
+		}
+		if inQuote != 0 {
+			continue
+		}
+		word := upper[i : i+3]
+		if word != "AND" && word != "OR" {
+			continue
+		}
+		beforeOK := i == 0 || s[i-1] == ' '
+		afterOK := i+3 >= len(s) || s[i+3] == ' '
+		if beforeOK && afterOK {
+			return true
+		}
+	}
+	return false
+}
+
 func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload map[string]interface{}) error {
 	table = b.sanitizeIdentCached(table)
 
@@ -469,15 +562,22 @@ func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload
 	if whereExpr == "" {
 		if idVal, ok := payload["id"]; ok {
 			deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE "id" = %s`, table, b.ph(1))
-			params = []interface{}{idVal}
+			params = []interface{}{normalizeParam(idVal, eventName, payload)}
 		} else if len(payload) > 0 {
-			// Fallback: use first payload key as delete condition
-			for k, v := range payload {
-				safeK := b.sanitizeIdentCached(k)
-				deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE "%s" = %s`, table, safeK, b.ph(1))
-				params = []interface{}{v}
-				break
+			// Deterministic fallback: pick the where column from SORTED keys
+			// (mirroring db.update), so a retry always deletes by the SAME
+			// column. Iterating a Go map directly is randomized per
+			// iteration — the same payload could delete by a different
+			// column (and a different row) on every attempt.
+			keys := make([]string, 0, len(payload))
+			for k := range payload {
+				keys = append(keys, k)
 			}
+			sort.Strings(keys)
+			whereKey := keys[0]
+			safeK := b.sanitizeIdentCached(whereKey)
+			deleteSQL = fmt.Sprintf(`DELETE FROM "%s" WHERE "%s" = %s`, table, safeK, b.ph(1))
+			params = []interface{}{normalizeParam(payload[whereKey], eventName, payload)}
 		} else {
 			return fmt.Errorf("db.delete requires 'where' condition or non-empty payload")
 		}
@@ -486,6 +586,11 @@ func (b *Bus) dbDelete(table string, whereExpr string, eventName string, payload
 		// to prevent SQL injection from resolved template variables.
 		col, op, val, err := parseWhereCondition(whereExpr, eventName, payload)
 		if err != nil {
+			var unresolvable *errWhereUnresolvable
+			if errors.As(err, &unresolvable) {
+				// Optional where-field absent → no rows qualify → no-op.
+				return nil
+			}
 			return fmt.Errorf("db.delete: %w", err)
 		}
 		safeCol := b.sanitizeIdentCached(col)
@@ -521,6 +626,12 @@ func (b *Bus) dbSum(table string, column string, whereExpr string, as string, ev
 	if whereExpr != "" {
 		col, op, val, err := parseWhereCondition(whereExpr, eventName, payload)
 		if err != nil {
+			var unresolvable *errWhereUnresolvable
+			if errors.As(err, &unresolvable) {
+				// Optional where-field absent → no rows qualify → sum 0.
+				payload[as] = 0.0
+				return nil
+			}
 			return fmt.Errorf("db.sum: %w", err)
 		}
 		safeWCol := b.sanitizeIdentCached(col)
@@ -608,6 +719,12 @@ func (b *Bus) dbAdjust(step *manifest.RouteStep, eventName string, payload map[s
 
 	whereCol, whereOp, whereVal, err := parseWhereCondition(step.Where, eventName, payload)
 	if err != nil {
+		var unresolvable *errWhereUnresolvable
+		if errors.As(err, &unresolvable) {
+			// Optional where-field absent → no rows qualify → nothing to
+			// adjust. The floor guard must not fire (there is no row).
+			return nil
+		}
 		return fmt.Errorf("db.adjust: %w", err)
 	}
 

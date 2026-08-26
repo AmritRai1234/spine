@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
-set -e
+set -euo pipefail
 
 # Spine One-Line Universal Installer Script
 # Usage: curl -fsSL https://raw.githubusercontent.com/AmritRai1234/spine/main/install.sh | bash
 
-SPINE_VERSION="3.0.0"
 INSTALL_DIR="/usr/local/bin"
 
 # Fallback to user local bin if /usr/local/bin is not writable
@@ -14,7 +13,7 @@ if [ ! -w "$INSTALL_DIR" ]; then
 fi
 
 echo "========================================================"
-echo "      SPINE — Declarative Backend Engine (v${SPINE_VERSION})    "
+echo "      SPINE — Declarative Backend Engine Installer      "
 echo "========================================================"
 echo ""
 
@@ -40,7 +39,7 @@ echo "--> Detected OS: $OS ($ARCH)"
 # Check if Go is installed for source build
 if [ -f "./cmd/spine/main.go" ]; then
     echo "--> Building Spine binary from local source..."
-    go build -ldflags="-s -w" -o spine ./cmd/spine/
+    go build -tags sqlite_fts5 -ldflags="-s -w" -o spine ./cmd/spine/
     mv spine "$INSTALL_DIR/spine"
 elif command -v go >/dev/null 2>&1; then
     echo "--> Building Spine binary from remote source using Go..."
@@ -50,7 +49,7 @@ elif command -v go >/dev/null 2>&1; then
     git clone --depth 1 https://github.com/AmritRai1234/spine.git "$TEMP_DIR/spine" >/dev/null 2>&1 || true
     if [ -d "$TEMP_DIR/spine" ]; then
         cd "$TEMP_DIR/spine"
-        go build -ldflags="-s -w" -o spine ./cmd/spine/
+        go build -tags sqlite_fts5 -ldflags="-s -w" -o spine ./cmd/spine/
         mv spine "$INSTALL_DIR/spine"
     else
         echo "--> Go found, building from package remote..."
@@ -65,8 +64,11 @@ fi
 
 chmod +x "$INSTALL_DIR/spine"
 
+# Report the version the built binary actually reports (never a hardcoded string).
+SPINE_VERSION="$("$INSTALL_DIR/spine" version 2>/dev/null | sed -n 's/^spine v\([0-9][0-9.]*\).*/\1/p' || true)"
+
 echo ""
-echo " Successfully installed Spine v${SPINE_VERSION} to $INSTALL_DIR/spine"
+echo " Successfully installed Spine v${SPINE_VERSION:-unknown} to $INSTALL_DIR/spine"
 echo ""
 echo "Verify installation:"
 echo "  spine version"

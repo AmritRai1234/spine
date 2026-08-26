@@ -1,6 +1,9 @@
 package engine
 
-import "testing"
+import (
+	"strings"
+	"testing"
+)
 
 // TestMaxBodyBytesFromEnv pins the SPINE_MAX_BODY_BYTES parsing: valid
 // positive values win, everything else (empty, garbage, zero, negative)
@@ -21,5 +24,27 @@ func TestMaxBodyBytesFromEnv(t *testing.T) {
 		if got := maxBodyBytesFromEnv(c.env); got != c.want {
 			t.Errorf("maxBodyBytesFromEnv(%q) = %d, want %d", c.env, got, c.want)
 		}
+	}
+}
+
+// TestACMERejectsWildcardDomains pins the fail-loud behavior for wildcard
+// ACME domains: autocert.HostWhitelist matches exact hostnames only, so a
+// "*.example.com" entry would silently fail for every subdomain.
+func TestACMERejectsWildcardDomains(t *testing.T) {
+	_, err := newACMEManager(&TLSConfig{Domains: []string{"*.example.com"}})
+	if err == nil {
+		t.Fatal("wildcard ACME domain must be rejected, got nil error")
+	}
+	if !strings.Contains(err.Error(), "wildcard") {
+		t.Errorf("expected wildcard rejection message, got: %v", err)
+	}
+
+	// Exact domains still work.
+	m, err := newACMEManager(&TLSConfig{Domains: []string{"shop.example.com"}})
+	if err != nil {
+		t.Fatalf("exact domain must be accepted, got: %v", err)
+	}
+	if m == nil {
+		t.Fatal("expected a manager for exact domains")
 	}
 }

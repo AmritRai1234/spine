@@ -32,6 +32,21 @@ func (ac *AccessContext) CanEmit(event string) bool {
 	return false
 }
 
+// CanReceive returns true if this access context may observe state broadcasts
+// and audit-log entries originating from the given event. Mirrors CanEmit:
+// nil whitelist = everything, otherwise only whitelisted events.
+func (ac *AccessContext) CanReceive(event string) bool {
+	if ac.Events == nil {
+		return true
+	}
+	for _, e := range ac.Events {
+		if e == event {
+			return true
+		}
+	}
+	return false
+}
+
 // AccessResolver maps API keys to access contexts using constant-time comparison.
 type AccessResolver struct {
 	rules []manifest.AccessRule

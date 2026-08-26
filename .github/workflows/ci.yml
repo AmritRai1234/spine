@@ -10,6 +10,7 @@ jobs:
   test:
     name: Test
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v4
 
@@ -20,18 +21,55 @@ jobs:
       - name: Install dependencies
         run: go mod download
 
+      - name: Doc lint
+        run: ./scripts/doc_lint.sh
+
       - name: Vet
         run: go vet ./...
 
       - name: Test
-        run: go test ./... -v -count=1
+        run: go test -tags sqlite_fts5 ./... -v -count=1
+
+      - name: Race tests
+        run: go test -tags sqlite_fts5 -race ./pkg/... ./tests/ -count=1
 
       - name: Benchmark
-        run: go test ./tests/ -bench=. -benchmem -count=1 -run='^$'
+        run: go test -tags sqlite_fts5 ./tests/ -bench=. -benchmem -count=1 -run='^$'
+
+  pg-integration:
+    name: Postgres integration
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: spine
+          POSTGRES_PASSWORD: spine
+          POSTGRES_DB: spine
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U spine"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Postgres integration tests
+        env:
+          SPINE_TEST_PG_DSN: postgres://spine:spine@localhost:5432/spine?sslmode=disable
+        run: go test -tags "sqlite_fts5 integration" ./tests/ -run 'TestPG_' -v -count=1
 
   build:
     name: Build
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: test
     steps:
       - uses: actions/checkout@v4
@@ -41,10 +79,20 @@ jobs:
           go-version-file: go.mod
 
       - name: Build CLI
-        run: go build -ldflags="-s -w" -o spine ./cmd/spine/
+        run: go build -tags sqlite_fts5 -ldflags="-s -w" -o spine ./cmd/spine/
 
       - name: Verify CLI
         run: ./spine version
+
+      - name: Verify version consistency
+        run: |
+          SRC_VERSION="$(sed -n 's/^const Version = "\(.*\)"/\1/p' spine.go)"
+          BIN_VERSION="$(./spine version | sed -n 's/^spine v\([0-9][0-9.]*\).*/\1/p')"
+          if [ -z "$SRC_VERSION" ] || [ "$SRC_VERSION" != "$BIN_VERSION" ]; then
+            echo "version mismatch: source=$SRC_VERSION binary=$BIN_VERSION"
+            exit 1
+          fi
+          echo "version consistent: $BIN_VERSION"
 
       - name: Parse example manifest
         run: ./spine parse examples/app.spine

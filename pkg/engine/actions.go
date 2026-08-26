@@ -154,6 +154,12 @@ func (b *Bus) logWrite(step *manifest.RouteStep, eventName string, payload map[s
 	return nil
 }
 
+// ftsSearch runs a full-text search over a table's FTS5 index (SQLite/Turso).
+// The index is provisioned on first use (ensureFTS) and maintained by
+// triggers, so results are always current. Matching rows land in the payload
+// as `fts_results`: [{rowid, content}] where content is the row's indexed
+// text columns joined with spaces. Failures are loud — the route errors —
+// instead of silently returning empty results.
 func (b *Bus) ftsSearch(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
 	tableName := step.Table
 	query := step.Config["query"]
@@ -167,35 +173,67 @@ func (b *Bus) ftsSearch(step *manifest.RouteStep, eventName string, payload map[
 		return fmt.Errorf("fts.search requires 'table' and query")
 	}
 	resolvedQuery := ResolveVariables(query, eventName, payload)
-
-	// Sanitize table identifiers to prevent SQL injection from manifest input
-	safeTable := sanitizeIdent(tableName)
-	ftsTable := safeTable
-	if !strings.HasSuffix(safeTable, "_fts") {
-		ftsTable = safeTable + "_fts"
+	if strings.TrimSpace(resolvedQuery) == "" {
+		return fmt.Errorf("fts.search query resolved empty")
 	}
 
-	// Attempt FTS5 virtual table query with fallback to standard table search.
-	// (FTS5 is SQLite-only; on other backends the first query errors and the
-	// LIKE-based fallback runs instead.)
-	rows, err := b.db.Query(fmt.Sprintf(`SELECT %s, content FROM "%s" WHERE content MATCH %s`, b.dialect.rowIDCol, ftsTable, b.ph(1)), resolvedQuery)
+	// Sanitize table identifiers to prevent SQL injection from manifest input.
+	table := sanitizeIdent(tableName)
+	if err := b.ensureFTS(table); err != nil {
+		return err
+	}
+	ftsTable := ftsTableName(table)
+
+	rows, err := b.db.Query(fmt.Sprintf(`SELECT %s, * FROM "%s" WHERE "%s" MATCH %s`,
+		b.dialect.rowIDCol, ftsTable, ftsTable, b.ph(1)), resolvedQuery)
 	if err != nil {
-		// Fallback: standard table column query
-		rows, err = b.db.Query(fmt.Sprintf(`SELECT %s, created_at FROM "%s" WHERE created_at LIKE %s`, b.dialect.rowIDCol, safeTable, b.ph(1)), "%"+resolvedQuery+"%")
-		if err != nil {
-			return nil // Soft fallback: return empty results if table not ready
-		}
+		// A malformed FTS query (e.g. "a AND") is a user error — surface it.
+		return fmt.Errorf("fts.search on table %q failed: %w", table, err)
 	}
 	defer rows.Close()
 
+	cols, err := rows.Columns()
+	if err != nil {
+		return fmt.Errorf("fts.search: reading result columns failed: %w", err)
+	}
+
 	var results []map[string]interface{}
 	for rows.Next() {
-		var rowid int64
-		var content string
-		if err := rows.Scan(&rowid, &content); err == nil {
-			results = append(results, map[string]interface{}{"rowid": rowid, "content": content})
+		vals := make([]interface{}, len(cols))
+		ptrs := make([]interface{}, len(cols))
+		for i := range vals {
+			ptrs[i] = &vals[i]
 		}
+		if err := rows.Scan(ptrs...); err != nil {
+			return fmt.Errorf("fts.search: scanning result failed: %w", err)
+		}
+		row := make(map[string]interface{}, len(cols))
+		var contentParts []string
+		for i, c := range cols {
+			switch v := vals[i].(type) {
+			case nil:
+				row[c] = nil
+			case []byte:
+				row[c] = string(v)
+				if c != "rowid" {
+					contentParts = append(contentParts, string(v))
+				}
+			default:
+				row[c] = v
+				if c != "rowid" {
+					contentParts = append(contentParts, fmt.Sprintf("%v", v))
+				}
+			}
+		}
+		if len(contentParts) > 0 {
+			row["content"] = strings.Join(contentParts, " ")
+		}
+		results = append(results, row)
 	}
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("fts.search: iterating results failed: %w", err)
+	}
+
 	payload["fts_results"] = results
 	return nil
 }

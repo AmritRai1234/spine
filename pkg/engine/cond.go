@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"log"
 	"strconv"
 	"strings"
 )
@@ -52,6 +53,30 @@ func hasSuspiciousNumericFormat(s string) bool {
 	return len(body) > 1 && body[0] == '0' && body[1] >= '0' && body[1] <= '9'
 }
 
+// findOpOutsideQuotes returns the index of the first occurrence of " op "
+// (space-delimited, like the where parser) that is NOT inside a quoted
+// region, or -1. Scanning inside quotes previously split conditions like
+// `title contains 'big > small'` at the '>' inside the quoted value.
+func findOpOutsideQuotes(s, op string) int {
+	pattern := " " + op + " "
+	inQuote := byte(0)
+	for i := 0; i+len(pattern) <= len(s); i++ {
+		c := s[i]
+		if c == '\'' || c == '"' {
+			if inQuote == 0 {
+				inQuote = c
+			} else if inQuote == c {
+				inQuote = 0
+			}
+			continue
+		}
+		if inQuote == 0 && s[i:i+len(pattern)] == pattern {
+			return i
+		}
+	}
+	return -1
+}
+
 // EvaluateCondition evaluates an "if:" condition expression against an event payload.
 // Returns true if the condition holds, or if cond is empty.
 func EvaluateCondition(cond string, eventName string, payload map[string]interface{}) bool {
@@ -60,53 +85,65 @@ func EvaluateCondition(cond string, eventName string, payload map[string]interfa
 		return true
 	}
 
-	// Remove outer quotes if present
+	// Remove outer quotes if present — but ONLY when the wrapper quote char
+	// does not appear inside. The manifest parser only unquotes double
+	// quotes, so a single-quoted whole condition ('status == "active"') needs
+	// its wrapper stripped here; but "'abc' > '100'" has BOTH operands using
+	// the wrapper char — stripping would corrupt the condition.
 	if (strings.HasPrefix(cond, `"`) && strings.HasSuffix(cond, `"`)) ||
 		(strings.HasPrefix(cond, `'`) && strings.HasSuffix(cond, `'`)) {
-		cond = cond[1 : len(cond)-1]
+		inner := cond[1 : len(cond)-1]
+		if strings.IndexByte(inner, cond[0]) == -1 {
+			cond = inner
+		}
 	}
 
-	// Helper to resolve operand
-	resolve := func(operand string) string {
+	// Helper to resolve operand. quoted reports whether the operand was
+	// explicitly quoted in the manifest — the author's intent to compare
+	// strings (numeric comparison of non-numbers is a guard bug, not a
+	// fallback).
+	resolve := func(operand string) (string, bool) {
 		operand = strings.TrimSpace(operand)
 		if (strings.HasPrefix(operand, `"`) && strings.HasSuffix(operand, `"`)) ||
 			(strings.HasPrefix(operand, `'`) && strings.HasSuffix(operand, `'`)) {
-			return operand[1 : len(operand)-1]
+			return operand[1 : len(operand)-1], true
 		}
 		if strings.HasPrefix(operand, "$") {
-			return ResolveVariables(operand, eventName, payload)
+			return ResolveVariables(operand, eventName, payload), false
 		}
-		return operand
+		return operand, false
 	}
 
-	// Operators to check in order of specificity
-	ops := []string{"==", "!=", ">=", "<=", ">", "<", "contains", "exists"}
+	// Operators to check in order of specificity. Single "=" is the natural
+	// alias for "==" (the where: syntax uses it); it must come after "==",
+	// "!=", ">=", "<=" so multi-char operators win.
+	ops := []string{"==", "!=", ">=", "<=", "=", ">", "<", "contains", "exists"}
 
 	for _, op := range ops {
 		if op == "exists" {
 			if strings.HasSuffix(cond, " exists") {
 				fieldRef := strings.TrimSuffix(cond, " exists")
-				val := resolve(fieldRef)
+				val, _ := resolve(fieldRef)
 				return val != "" && val != "<nil>"
 			}
 			continue
 		}
 
-		idx := strings.Index(cond, " "+op+" ")
+		idx := findOpOutsideQuotes(cond, op)
 		if idx != -1 {
-			leftStr := resolve(cond[:idx])
-			rightStr := resolve(cond[idx+len(op)+2:])
+			leftStr, leftQuoted := resolve(cond[:idx])
+			rightStr, rightQuoted := resolve(cond[idx+len(op)+2:])
 
 			switch op {
-			case "==":
+			case "==", "=":
 				return equalsValue(leftStr, rightStr)
 			case "!=":
 				return !equalsValue(leftStr, rightStr)
 			case "contains":
 				return strings.Contains(leftStr, rightStr)
 			case ">", ">=", "<", "<=":
-				leftNum, err1 := strconv.ParseFloat(leftStr, 64)
-				rightNum, err2 := strconv.ParseFloat(rightStr, 64)
+				leftNum, err1 := strconv.ParseFloat(strings.TrimSpace(leftStr), 64)
+				rightNum, err2 := strconv.ParseFloat(strings.TrimSpace(rightStr), 64)
 				if err1 == nil && err2 == nil {
 					switch op {
 					case ">":
@@ -119,22 +156,29 @@ func EvaluateCondition(cond string, eventName string, payload map[string]interfa
 						return leftNum <= rightNum
 					}
 				}
-				// String fallback comparison
-				switch op {
-				case ">":
-					return leftStr > rightStr
-				case ">=":
-					return leftStr >= rightStr
-				case "<":
-					return leftStr < rightStr
-				case "<=":
-					return leftStr <= rightStr
+				// Only compare as strings when the manifest author explicitly
+				// quoted BOTH operands. A numeric comparison between
+				// non-numeric operands was previously a silent lexicographic
+				// fallback ("abc" > "100" → true) — a guard bug, not intent.
+				if leftQuoted && rightQuoted {
+					switch op {
+					case ">":
+						return leftStr > rightStr
+					case ">=":
+						return leftStr >= rightStr
+					case "<":
+						return leftStr < rightStr
+					case "<=":
+						return leftStr <= rightStr
+					}
 				}
+				log.Printf("[cond] comparison '%s' between non-numeric operands — treating as false: left=%q right=%q (quote both operands to compare as strings)", op, leftStr, rightStr)
+				return false
 			}
 		}
 	}
 
 	// Default: if non-empty boolean expression string, check if truthy
-	val := resolve(cond)
+	val, _ := resolve(cond)
 	return val == "true" || val == "1"
 }

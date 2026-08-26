@@ -1,7 +1,27 @@
 # Spine — 5-Year Strategic Roadmap
 
-> Based on a deep read of the current codebase (~8,100 lines, v2.3.0).
+> Based on a deep read of the current codebase (~10K lines, v3.0.1 — last
+> revised with the v3.0.1 hardening pass).
 > The theme: **depth over breadth, trust over hype.**
+
+---
+
+## ✅ Already shipped (as of v3.0.1) — remove from future planning
+
+Items this roadmap previously listed as *future work* that the codebase now ships:
+
+- **Row-level access control** — `access:` rules in manifests (roles, keys, read_only, event whitelists, table filters), enforced on emit, table queries, `/events`, and WS broadcasts.
+- **Request validation hardening** — global rate limiting (per-IP token bucket), per-route caps on `/ws`, body-size and JSON-depth limits, per-IP WS connection caps.
+- **Outbox processor tests + fixes** — full retry/backoff/lease coverage; the retry loop was found and fixed (no more self-perpetuating re-enqueue).
+- **WebSocket reconnection protocol** — auth-gated replay (`GetEventsSince`) with a working cursor: broadcasts carry the audit id, reconnect replays only missed events.
+- **`spine dev` command** — hot-reload dev server with manifest watching.
+- **Error messages that teach** — "did you mean?" suggestions on unknown keys/events.
+- **`spine init`** — scaffolds with generated secrets.
+- **`spine codegen`** — TypeScript type generation from manifests.
+- **Full-text search** — FTS5 auto-provisioned index on SQLite/Turso (was non-functional; now real).
+- **Event replay** — `spine replay` CLI (dry-run supported).
+- **Benchmark honesty** — the comparative runner now measures (no hardcoded winners); README discloses enqueue-vs-durable semantics.
+- **Durability hardening** — batch-writer statement-failure accounting (`spine_stmt_failures`), spill delete-after-commit, idempotency marked complete only after a durability fence, saga compensation ordering.
 
 ---
 

@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -46,11 +47,26 @@ type TableInfo struct {
 func (b *Bus) GetTables() ([]TableInfo, error) {
 	rows, err := b.db.Query(b.dialect.listTables)
 	if err != nil {
-		// Fallback for non-SQLite / Turso drivers if sqlite_master isn't available
+		// Fallback for non-SQLite / Turso drivers if the catalog query is
+		// unavailable: knownTable keys are "table|colDefs" fingerprints —
+		// use the table-name prefix (deduped), not the raw fingerprint
+		// (sanitizeIdent would mangle it into a garbage "table name").
 		var res []TableInfo
+		seen := make(map[string]bool)
 		b.knownTable.Range(func(key, value interface{}) bool {
-			if name, ok := key.(string); ok {
+			if k, ok := key.(string); ok {
+				name := k
+				if idx := strings.Index(name, "|"); idx > 0 {
+					name = name[:idx]
+				}
+				if name == "" || seen[name] {
+					return true
+				}
+				seen[name] = true
 				safeName := sanitizeIdent(name)
+				if safeName == "" {
+					return true
+				}
 				var count int64
 				_ = b.db.QueryRow(fmt.Sprintf(`SELECT COUNT(*) FROM "%s"`, safeName)).Scan(&count)
 				res = append(res, TableInfo{Name: name, Rows: count})
@@ -430,7 +446,13 @@ func (b *Bus) initEventTable() error {
 
 // logEventAudit enqueues an event emission to the _spine_events audit table.
 // Uses pooled buffer for JSON encoding and pre-built constant SQL.
-func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitted []string) {
+// logEventAudit records an event in the audit log. Returns the audit row id,
+// or 0 when the insert went through the batched async path (no id known).
+//
+// When WebSocket clients are connected the insert runs SYNCHRONOUSLY so the
+// caller can stamp the state broadcasts with the audit id — the reconnect
+// replay cursor. Without clients the write stays batched (throughput).
+func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitted []string) int64 {
 	buf := auditBufPool.Get().(*bytes.Buffer)
 	buf.Reset()
 	json.NewEncoder(buf).Encode(payload)
@@ -447,9 +469,20 @@ func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitte
 
 	params := []interface{}{event, payloadStr, statesStr, nowStr}
 
+	if b.hub.ClientCount() > 0 {
+		res, err := execWithRetryResult(b.db, b.auditSQL, params...)
+		if err != nil {
+			log.Printf("[audit] sync audit insert failed: %v", err)
+			return 0
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+
 	if !b.writer.submitAny(dbTask{query: b.auditSQL, params: params}) {
 		// Non-blocking: audit is best-effort, but the drop is counted so it
 		// is visible on /metrics instead of being fully silent.
 		atomic.AddUint64(&b.droppedAudit, 1)
 	}
+	return 0
 }
