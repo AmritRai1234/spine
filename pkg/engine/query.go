@@ -470,6 +470,17 @@ func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitte
 	params := []interface{}{event, payloadStr, statesStr, nowStr}
 
 	if b.hub.ClientCount() > 0 {
+		if b.dialect.returningID {
+			// PostgreSQL: pgx's stdlib driver does not support LastInsertId,
+			// so read the id back via RETURNING. Without this every broadcast
+			// carries id=0 and the WS reconnect cursor never advances.
+			var id int64
+			if err := b.db.QueryRow(b.auditSQL+` RETURNING id`, params...).Scan(&id); err != nil {
+				log.Printf("[audit] sync audit insert (RETURNING) failed: %v", err)
+				return 0
+			}
+			return id
+		}
 		res, err := execWithRetryResult(b.db, b.auditSQL, params...)
 		if err != nil {
 			log.Printf("[audit] sync audit insert failed: %v", err)

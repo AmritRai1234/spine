@@ -473,6 +473,20 @@ func (b *Bus) startBatchWriter() {
 			}
 		}
 
+		// flushWithFences commits the batch and releases any pending fences.
+		// A fence's contract is "every task submitted before it is durable when
+		// it closes" — so if a fence was drained by the CAPPED drain, we must
+		// fully drain the remaining shards before flushing and releasing.
+		// Releasing after a capped flush was the bug: the fence closed with
+		// only ≤targetSize of its covered writes committed.
+		flushWithFences := func() {
+			if len(releaseFences) > 0 {
+				drainAllShardsFull()
+			}
+			flush()
+			releaseFencesAfterFlush()
+		}
+
 		// Block on shard[0] to avoid busy-wait, then drain all shards
 		for {
 			select {
@@ -516,8 +530,7 @@ func (b *Bus) startBatchWriter() {
 				// its own 1-2 item transaction, making the optimizer's batch
 				// size tuning aspirational.
 				if len(batch) >= targetBatchSize {
-					flush()
-					releaseFencesAfterFlush()
+					flushWithFences()
 				}
 
 				// Dynamically adjust ticker when optimizer changes mode
@@ -529,8 +542,7 @@ func (b *Bus) startBatchWriter() {
 			case <-ticker.C:
 				// Periodic flush — drain all shards
 				drainAllShards(b.optimizer.GetBatchSize())
-				flush()
-				releaseFencesAfterFlush()
+				flushWithFences()
 			}
 		}
 	}()
@@ -810,7 +822,7 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 		if route.EmitState != "" {
 			b.SetState(route.EmitState, payload)
 			if depth == 0 {
-				pendingBroadcasts = append(pendingBroadcasts, stateBroadcast{state: route.EmitState, payload: payload})
+				pendingBroadcasts = append(pendingBroadcasts, stateBroadcast{state: route.EmitState, payload: deepCopyPayload(payload)})
 			} else {
 				b.hub.BroadcastState(route.EmitState, event, payload)
 			}

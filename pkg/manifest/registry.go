@@ -98,13 +98,25 @@ func (r *Registry) ValidatePayload(event string, payload map[string]interface{})
 			if _, ok := val.(bool); !ok {
 				return fmt.Errorf("field '%s' must be a boolean (got %T)", field.Name, val)
 			}
-		case "any":
-			// Explicitly untyped — accepts anything.
+		case "any", "object", "map", "json":
+			// Untyped / structured — accepts anything.
+		case "array", "list":
+			// Structured lists — accept slices and JSON-marshaled strings.
+			if _, ok := val.([]interface{}); !ok {
+				if _, ok2 := val.(string); !ok2 {
+					return fmt.Errorf("field '%s' must be an array (got %T)", field.Name, val)
+				}
+			}
+		case "date", "datetime", "uuid", "email", "url":
+			// String-backed scalar formats — accept strings.
+			if _, ok := val.(string); !ok {
+				return fmt.Errorf("field '%s' must be a string (got %T)", field.Name, val)
+			}
 		default:
-			// Fail closed on unknown declared types: previously a typo'd
-			// type ("stringg", "date", "uuid") silently fell through the
-			// switch and was NEVER validated — the contract vanished.
-			return fmt.Errorf("field '%s' has unknown declared type '%s' (supported: string, number, int, float, bool, any)", field.Name, field.FieldType)
+			// Fail closed on genuinely unknown declared types: previously a
+			// typo'd type ("stringg") silently fell through the switch and
+			// was NEVER validated — the contract vanished.
+			return fmt.Errorf("field '%s' has unknown declared type '%s' (supported: string, number, int, float, bool, any, object, array, date, uuid, email, url)", field.Name, field.FieldType)
 		}
 	}
 

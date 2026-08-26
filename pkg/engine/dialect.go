@@ -25,6 +25,10 @@ type dialect struct {
 	// SQLite-only syntax and would be a syntax error on PG.
 	idemInsertPrefix   string
 	idemConflictSuffix string
+	// returningID selects how the engine reads back an auto-generated id
+	// after an insert: SQLite uses LastInsertId; PostgreSQL's pgx stdlib
+	// driver does NOT support LastInsertId, so it appends " RETURNING id".
+	returningID bool
 }
 
 var (
@@ -45,6 +49,7 @@ var (
 		rowIDCol:           `_spine_id`,
 		idemInsertPrefix:   `INSERT INTO`,
 		idemConflictSuffix: ` ON CONFLICT ("key") DO NOTHING`,
+		returningID:        true,
 	}
 )
 

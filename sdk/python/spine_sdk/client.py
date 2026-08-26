@@ -121,7 +121,7 @@ class SpineClient:
         Raises:
             httpx.HTTPStatusError: If the server returns a 4xx/5xx.
         """
-        body: Dict[str, Any] = {"event": event, "payload": payload or {}}
+        body: Dict[str, Any] = {"event": event, "payload": dict(payload or {})}
         if idempotency_key:
             body["payload"]["_idempotency_key"] = idempotency_key
 
@@ -386,7 +386,13 @@ class SpineClient:
                     async for raw in ws:
                         if self._ws_stop.is_set():
                             break
-                        self._handle_ws_message(raw)
+                        if self._handle_ws_message(raw):
+                            # The server caps a replay at 500 rows; page until
+                            # caught up.
+                            await ws.send(json.dumps({
+                                "type": "reconnect",
+                                "last_seen_id": self._last_seen_id,
+                            }))
 
             except websockets.exceptions.ConnectionClosed:
                 logger.info("WebSocket connection closed")
@@ -403,12 +409,16 @@ class SpineClient:
             )
             await asyncio.sleep(self._reconnect_interval_s)
 
-    def _handle_ws_message(self, raw: str) -> None:
-        """Parse and dispatch a single WebSocket message."""
+    def _handle_ws_message(self, raw: str) -> bool:
+        """Parse and dispatch a single WebSocket message.
+
+        Returns True when the caller should request the next replay page
+        (reconnect_ack with ``has_more``).
+        """
         try:
             data = json.loads(raw)
         except json.JSONDecodeError:
-            return
+            return False
 
         # Track event IDs for reconnect replay
         msg_id = data.get("id")
@@ -423,18 +433,26 @@ class SpineClient:
         # which audit rows never have — replay silently dropped everything).
         if msg_type == "reconnect_ack":
             for evt in data.get("missed_events", []):
+                # Advance the cursor from the replayed rows too — otherwise
+                # every reconnect re-sends the same last_seen_id and
+                # re-dispatches the same events.
+                evt_id = evt.get("id")
+                if isinstance(evt_id, (int, float)):
+                    self._last_seen_id = max(self._last_seen_id, int(evt_id))
                 payload = evt.get("payload")
                 if not payload:
                     continue
                 for state in evt.get("emitted_states", []) or []:
                     self._dispatch(state, payload)
-            return
+            return bool(data.get("has_more"))
 
         # Standard state broadcast
         state = data.get("state")
         payload = data.get("payload")
         if state and payload:
             self._dispatch(state, payload)
+
+        return False
 
     def _dispatch(self, state: str, payload: Dict[str, Any]) -> None:
         """Invoke all registered callbacks for a state."""

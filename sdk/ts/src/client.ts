@@ -74,11 +74,22 @@ export class SpineClient {
               // never have — replay silently dropped everything).
               for (const evt of data.missed_events) {
                 if (!evt.payload) continue;
+                // Advance the cursor from the replayed rows too — otherwise
+                // every reconnect re-sends the same last_seen_id and
+                // re-dispatches the same events.
+                if (typeof evt.id === 'number') {
+                  this.lastSeenID = Math.max(this.lastSeenID, evt.id);
+                }
                 const states: string[] = Array.isArray(evt.emitted_states) ? evt.emitted_states : [];
                 for (const state of states) {
                   const callbacks = this.subscriptions.get(state);
                   if (callbacks) callbacks.forEach((cb) => cb(state, evt.payload));
                 }
+              }
+              // The server caps a replay at 500 rows and sets has_more when
+              // there is more history; page until caught up.
+              if (data.has_more && this.ws) {
+                this.ws.send(JSON.stringify({ type: 'reconnect', last_seen_id: this.lastSeenID }));
               }
             } else if (data.state && data.payload) {
               const callbacks = this.subscriptions.get(data.state);

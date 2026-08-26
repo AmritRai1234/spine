@@ -287,6 +287,15 @@ func flushBatchOnce(db *sql.DB, tasks []dbTask) error {
 			stmtCache[task.query] = stmt
 		}
 		if err := retryStmtExec(stmt, task.params); err != nil {
+			// A lock/busy error that survived the retry loop is TRANSIENT, not
+			// permanent — it must NOT be dropped as a statementError (that
+			// would silently discard a valid write under sustained contention).
+			// Return it as a plain error so flushBatchWithRetry re-runs the
+			// WHOLE batch (safe under WAL: a busy statement means nothing was
+			// applied).
+			if isLockBusyErr(err) {
+				return err
+			}
 			return &statementError{task: task, err: err}
 		}
 	}
@@ -372,18 +381,33 @@ func (sw *shardedWriter) flushAndWait(timeout time.Duration) bool {
 	done := make(chan struct{})
 	fence := dbTask{barrier: done}
 	for attempt := 0; attempt < 3; attempt++ {
-		select {
-		case sw.shards[0] <- fence:
+		// The send can race Bus.Close (closeAll closes the channels after the
+		// closed check) — a send on a closed channel panics, and from the WS
+		// read-loop goroutine there is no recover. Guard with the same
+		// recover pattern as submit/submitAny.
+		sent := func() (ok bool) {
+			defer func() {
+				if recover() != nil {
+					ok = false
+				}
+			}()
+			select {
+			case sw.shards[0] <- fence:
+				return true
+			default:
+				return false
+			}
+		}()
+		if sent {
 			select {
 			case <-done:
 				return true
 			case <-time.After(timeout):
 				return false
 			}
-		default:
-			if attempt < 2 {
-				time.Sleep(100 * time.Microsecond)
-			}
+		}
+		if attempt < 2 {
+			time.Sleep(100 * time.Microsecond)
 		}
 	}
 	return false
