@@ -45,17 +45,16 @@ interface RateRow {
  *
  * Every Canadian province gets its official sales-tax rate (2025, verified
  * against Canada.ca and TaxTips.ca) and a Canada Post-tiered shipping rate,
- * picked from dropdowns. The checkout engine resolves the shopper's rate by
- * region code (CA-ON) → country code (US) → "*" default, so the same tables
- * still serve international orders.
+ * edited inline in the tables below. The checkout engine resolves the
+ * shopper's rate by region code (CA-ON) → country code (US) → "*" default,
+ * so the same tables still serve international orders.
  */
 export default function AdminShippingTax() {
   const [zones, setZones] = useState<RateRow[] | null>(null)
   const [taxes, setTaxes] = useState<RateRow[] | null>(null)
 
-  // Canada tax form
-  const [taxProv, setTaxProv] = useState("CA-ON")
-  const [taxRate, setTaxRate] = useState("")
+  // Tax table — one draft rate per province row (prefilled from server/official)
+  const [taxDrafts, setTaxDrafts] = useState<Record<string, string>>({})
   // Canada shipping form — province + per-city draft rates
   const [shipProv, setShipProv] = useState("CA-ON")
   const [provRateDraft, setProvRateDraft] = useState("")
@@ -103,7 +102,6 @@ export default function AdminShippingTax() {
     return m
   }, [taxes])
 
-  const selectedTaxProv = CA_PROVINCES.find((p) => p.code === taxProv)
   const selectedShipProv = CA_PROVINCES.find((p) => p.code === shipProv)
 
   async function saveZone(region: string, rate: number, label: string) {
@@ -178,6 +176,8 @@ export default function AdminShippingTax() {
 
   const missingTax = CA_PROVINCES.filter((p) => !taxMap.has(p.code))
   const missingZone = CA_PROVINCES.filter((p) => !zoneMap.has(p.code))
+  const intlZones = (zones ?? []).filter((z) => !z.country.startsWith("CA"))
+  const intlTaxes = (taxes ?? []).filter((t) => !t.country.startsWith("CA-"))
 
   return (
     <div className="animate-in fade-in slide-in-from-bottom-2 w-full space-y-4 duration-300">
@@ -191,11 +191,11 @@ export default function AdminShippingTax() {
           </p>
         </div>
         <div className="flex gap-2">
-          <Button size="sm" onClick={applyOfficialTaxRates} disabled={bulkBusy}>
-            <Wand2 className="mr-1 h-4 w-4" /> Apply official 2025 tax rates
-          </Button>
           <Button size="sm" variant="outline" onClick={applySuggestedShipping} disabled={bulkBusy}>
             <Truck className="mr-1 h-4 w-4" /> Apply suggested shipping
+          </Button>
+          <Button size="sm" onClick={applyOfficialTaxRates} disabled={bulkBusy}>
+            <Wand2 className="mr-1 h-4 w-4" /> Apply official 2025 tax rates
           </Button>
         </div>
       </div>
@@ -247,242 +247,47 @@ export default function AdminShippingTax() {
             <Percent className="h-4 w-4" /> Canadian sales tax by province
           </CardTitle>
           <CardDescription>
-            Official 2025 general rates (HST / GST+PST / GST+QST). Applies to the order subtotal.
+            Official 2025 general rates (HST / GST+PST / GST+QST), editable inline. Applies to the order subtotal.
           </CardDescription>
         </CardHeader>
-        <CardContent className="space-y-4">
-          <form
-            className="flex flex-wrap items-end gap-3"
-            onSubmit={(e) => {
-              e.preventDefault()
-              const rate = Number(taxRate)
-              if (!isFinite(rate) || rate < 0) return
-              saveTax(taxProv, rate, selectedTaxProv?.name ?? taxProv)
-              setTaxRate("")
-            }}
-          >
-            <label className="min-w-56 flex-1 space-y-1.5">
-              <span className="text-sm font-medium">Province / territory</span>
-              <Select value={taxProv} onValueChange={(v) => {
-                setTaxProv(v)
-                const p = CA_PROVINCES.find((x) => x.code === v)
-                if (p) setTaxRate(String(p.rate)) // prefill with the official rate
-              }}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Choose a province" />
-                </SelectTrigger>
-                <SelectContent>
-                  {CA_PROVINCES.map((p) => (
-                    <SelectItem key={p.code} value={p.code}>
-                      {p.name} — {p.breakdown}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </label>
-            <label className="w-36 space-y-1.5">
-              <span className="text-sm font-medium">Charged rate (%)</span>
-              <Input
-                type="number"
-                min="0"
-                step="0.001"
-                value={taxRate}
-                onChange={(e) => setTaxRate(e.target.value)}
-                placeholder={selectedTaxProv ? String(selectedTaxProv.rate) : "13"}
-                required
-              />
-            </label>
-            <Button type="submit" variant="outline">
-              <Save className="mr-1 h-4 w-4" /> Save tax rule
-            </Button>
-          </form>
-          {selectedTaxProv && (
-            <p className="flex items-center gap-2 text-xs text-muted-foreground">
-              <Landmark className="h-3.5 w-3.5" />
-              {selectedTaxProv.name}: {selectedTaxProv.breakdown} — official combined rate{" "}
-              <strong>{selectedTaxProv.rate}%</strong>.{" "}
-              {taxMap.has(selectedTaxProv.code) ? (
-                <Badge variant="secondary">configured: {taxMap.get(selectedTaxProv.code)}%</Badge>
-              ) : (
-                <Badge variant="destructive">not configured</Badge>
-              )}
-            </p>
-          )}
-
-          {/* Configured provinces at a glance */}
+        <CardContent>
           {taxes === null ? (
-            <Skeleton className="h-24" />
+            <Skeleton className="h-64" />
           ) : (
             <Table>
               <TableHeader>
                 <TableRow>
-                  <TableHead>Region</TableHead>
-                  <TableHead>System</TableHead>
-                  <TableHead className="text-right">Charged rate</TableHead>
+                  <TableHead>Province / territory</TableHead>
+                  <TableHead className="hidden sm:table-cell">System</TableHead>
+                  <TableHead className="w-28">Charged rate (%)</TableHead>
+                  <TableHead className="w-20" />
                 </TableRow>
               </TableHeader>
               <TableBody>
-                {CA_PROVINCES.filter((p) => taxMap.has(p.code)).map((p) => (
-                  <TableRow key={p.code}>
-                    <TableCell className="font-medium">{p.name}</TableCell>
-                    <TableCell className="text-muted-foreground">{p.breakdown}</TableCell>
-                    <TableCell className="text-right tabular-nums">{taxMap.get(p.code)}%</TableCell>
-                  </TableRow>
-                ))}
-                {taxes.filter((t) => !t.country.startsWith("CA-")).map((t) => (
-                  <TableRow key={t.country}>
-                    <TableCell className="font-medium">
-                      {t.country === "*" ? <span className="italic">default (*)</span> : t.country}
-                    </TableCell>
-                    <TableCell className="text-muted-foreground">international</TableCell>
-                    <TableCell className="text-right tabular-nums">{Number(t.rate)}%</TableCell>
-                  </TableRow>
-                ))}
-                {taxes.length === 0 && (
-                  <TableRow>
-                    <TableCell colSpan={3} className="py-8 text-center text-muted-foreground">
-                      No tax rules — 0% everywhere until configured.
-                    </TableCell>
-                  </TableRow>
-                )}
-              </TableBody>
-            </Table>
-          )}
-        </CardContent>
-      </Card>
-
-      {/* ── Canada — Shipping ────────────────────────────────────────── */}
-      <Card>
-        <CardHeader>
-          <CardTitle className="flex items-center gap-2 text-base">
-            <Truck className="h-4 w-4" /> Canadian shipping by province &amp; city
-          </CardTitle>
-          <CardDescription>
-            Pick a province to edit its rate and its cities. Shoppers are charged the most
-            specific rate: city (big cities) → province → country → default. Unlisted cities
-            automatically get the province rate.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="space-y-4">
-          <div className="flex flex-wrap items-end gap-3">
-            <label className="min-w-64 flex-1 space-y-1.5">
-              <span className="text-sm font-medium">Province / territory</span>
-              <Select value={shipProv} onValueChange={(v: string) => setShipProv(v)}>
-                <SelectTrigger>
-                  <SelectValue placeholder="Choose a province" />
-                </SelectTrigger>
-                <SelectContent>
-                  {CA_PROVINCES.map((p) => {
-                    const tier = SHIP_TIERS[PROVINCE_TIER[p.code] ?? "national"]
-                    return (
-                      <SelectItem key={p.code} value={p.code}>
-                        {p.name} — {tier.label}
-                      </SelectItem>
-                    )
-                  })}
-                </SelectContent>
-              </Select>
-            </label>
-            <Button
-              variant="outline"
-              onClick={() => {
-                const tier = SHIP_TIERS[PROVINCE_TIER[shipProv] ?? "national"]
-                saveZone(shipProv, tier.suggestion, `${selectedShipProv?.name ?? shipProv} (${tier.label})`)
-              }}
-            >
-              <Save className="mr-1 h-4 w-4" /> Apply province rate ({money(SHIP_TIERS[PROVINCE_TIER[shipProv] ?? "national"].suggestion)})
-            </Button>
-          </div>
-          {selectedShipProv && (
-            <p className="text-xs text-muted-foreground">
-              {SHIP_TIERS[PROVINCE_TIER[shipProv] ?? "national"].note}.{" "}
-              {zoneMap.has(shipProv) ? (
-                <Badge variant="secondary">province rate: {money(zoneMap.get(shipProv)!)}</Badge>
-              ) : (
-                <Badge variant="destructive">no province rate — free shipping</Badge>
-              )}
-            </p>
-          )}
-
-          {/* Province rate + city rates, one editable table */}
-          {zones === null ? (
-            <Skeleton className="h-24" />
-          ) : (
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead>Zone</TableHead>
-                  <TableHead>Scope</TableHead>
-                  <TableHead className="w-32">Rate ($)</TableHead>
-                  <TableHead className="w-24" />
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {/* Province row */}
-                <tr className="border-b">
-                  <td className="py-2 font-medium">
-                    {selectedShipProv?.name ?? shipProv}
-                    <span className="ml-2 text-xs text-muted-foreground">everyone in the province</span>
-                  </td>
-                  <td className="text-xs text-muted-foreground">
-                    {SHIP_TIERS[PROVINCE_TIER[shipProv] ?? "national"].label}
-                  </td>
-                  <td>
-                    <Input
-                      type="number"
-                      min="0"
-                      step="0.01"
-                      value={provRateDraft}
-                      onChange={(e) => setProvRateDraft(e.target.value)}
-                      className="h-8"
-                      placeholder={String(SHIP_TIERS[PROVINCE_TIER[shipProv] ?? "national"].suggestion)}
-                    />
-                  </td>
-                  <td className="text-right">
-                    <Button
-                      variant="outline"
-                      size="sm"
-                      className="h-8"
-                      onClick={() => {
-                        const rate = Number(provRateDraft)
-                        if (!isFinite(rate) || rate < 0) return
-                        saveZone(shipProv, rate, selectedShipProv?.name ?? shipProv)
-                      }}
-                    >
-                      Save
-                    </Button>
-                  </td>
-                </tr>
-                {/* City rows for this province */}
-                {CA_CITIES.filter((c) => c.provCode === shipProv).map((c) => {
-                  const configured = zoneMap.has(c.cityKey)
-                  const draft = cityRateDrafts[c.cityKey] ?? (configured ? String(zoneMap.get(c.cityKey)) : String(c.suggestion))
+                {CA_PROVINCES.map((p) => {
+                  const configured = taxMap.has(p.code)
+                  const draft = taxDrafts[p.code] ?? (configured ? String(taxMap.get(p.code)) : String(p.rate))
                   return (
-                    <tr key={c.cityKey} className="border-b last:border-0">
-                      <td className="py-2">
-                        <span className="pl-4 font-medium">{c.name}</span>
-                        <span className="ml-2 text-xs text-muted-foreground">
-                          {c.tier === "metro" ? "metro" : "city"} · overrides province
-                        </span>
-                      </td>
-                      <td className="text-xs text-muted-foreground">
-                        {configured ? (
-                          <Badge variant="secondary">local rate</Badge>
-                        ) : (
-                          <span className="italic">uses province rate</span>
-                        )}
-                      </td>
-                      <td>
+                    <TableRow key={p.code} className={configured ? "" : "bg-amber-500/5"}>
+                      <TableCell>
+                        <span className="font-medium">{p.name}</span>
+                        <span className="ml-2 hidden text-xs text-muted-foreground lg:inline">{p.breakdown}</span>
+                      </TableCell>
+                      <TableCell className="hidden sm:table-cell">
+                        <Badge variant="outline">{p.system}</Badge>
+                      </TableCell>
+                      <TableCell>
                         <Input
                           type="number"
                           min="0"
-                          step="0.01"
+                          step="0.001"
                           value={draft}
-                          onChange={(e) => setCityRateDrafts((m) => ({ ...m, [c.cityKey]: e.target.value }))}
-                          className="h-8"
+                          onChange={(e) => setTaxDrafts((m) => ({ ...m, [p.code]: e.target.value }))}
+                          className="h-8 tabular-nums"
+                          aria-label={`Tax rate for ${p.name}`}
                         />
-                      </td>
-                      <td className="text-right">
+                      </TableCell>
+                      <TableCell className="text-right">
                         <Button
                           variant="outline"
                           size="sm"
@@ -490,36 +295,168 @@ export default function AdminShippingTax() {
                           onClick={() => {
                             const rate = Number(draft)
                             if (!isFinite(rate) || rate < 0) return
-                            saveZone(c.cityKey, rate, `${c.name} (local)`)
+                            saveTax(p.code, rate, p.name)
                           }}
                         >
                           Save
                         </Button>
-                      </td>
-                    </tr>
+                      </TableCell>
+                    </TableRow>
                   )
                 })}
-                {CA_CITIES.filter((c) => c.provCode === shipProv).length === 0 && (
-                  <tr>
-                    <td colSpan={4} className="py-6 text-center text-sm text-muted-foreground">
-                      No city rates listed for {selectedShipProv?.name ?? shipProv} yet — everyone gets the province rate.
-                    </td>
-                  </tr>
-                )}
-                {/* International rows stay visible for context */}
-                {(zones ?? []).filter((z) => !z.country.startsWith("CA")).map((z) => (
-                  <tr key={z.country} className="border-b last:border-0">
-                    <td className="py-2 font-medium">
-                      {z.country === "*" ? <span className="italic">default (*)</span> : z.country}
-                      <span className="ml-2 text-xs text-muted-foreground">country-level</span>
-                    </td>
-                    <td className="text-xs text-muted-foreground">international</td>
-                    <td className="tabular-nums">{money(Number(z.rate))}</td>
-                    <td />
-                  </tr>
-                ))}
               </TableBody>
             </Table>
+          )}
+          {intlTaxes.length > 0 && (
+            <p className="mt-3 flex flex-wrap items-center gap-2 text-xs text-muted-foreground">
+              <Landmark className="h-3.5 w-3.5" />
+              International tax rules:{" "}
+              {intlTaxes.map((t) => (
+                <Badge key={t.country} variant="secondary">
+                  {t.country === "*" ? "default (*)" : t.country} · {Number(t.rate)}%
+                </Badge>
+              ))}
+            </p>
+          )}
+        </CardContent>
+      </Card>
+
+      {/* ── Canada — Shipping ────────────────────────────────────────── */}
+      <Card>
+        <CardHeader>
+          <div className="flex flex-wrap items-center justify-between gap-3">
+            <div>
+              <CardTitle className="flex items-center gap-2 text-base">
+                <Truck className="h-4 w-4" /> Canadian shipping
+              </CardTitle>
+              <CardDescription>
+                City (big cities) → province → country → default — the most specific rate wins.
+                Unlisted cities automatically get the province rate.
+              </CardDescription>
+            </div>
+            <Select value={shipProv} onValueChange={(v: string) => { setShipProv(v); setProvRateDraft("") }}>
+              <SelectTrigger className="w-64">
+                <SelectValue placeholder="Choose a province" />
+              </SelectTrigger>
+              <SelectContent>
+                {CA_PROVINCES.map((p) => {
+                  const tier = SHIP_TIERS[PROVINCE_TIER[p.code] ?? "national"]
+                  return (
+                    <SelectItem key={p.code} value={p.code}>
+                      {p.name} — {tier.label}
+                    </SelectItem>
+                  )
+                })}
+              </SelectContent>
+            </Select>
+          </div>
+        </CardHeader>
+        <CardContent className="space-y-4">
+          {zones === null ? (
+            <Skeleton className="h-48" />
+          ) : (
+            <>
+              {/* Province row */}
+              <div className="flex flex-wrap items-center gap-3 rounded-lg border p-3">
+                <div className="min-w-40 flex-1">
+                  <p className="text-sm font-medium">{selectedShipProv?.name ?? shipProv}</p>
+                  <p className="text-xs text-muted-foreground">
+                    {SHIP_TIERS[PROVINCE_TIER[shipProv] ?? "national"].note} — everyone in the province
+                  </p>
+                </div>
+                {zoneMap.has(shipProv) ? (
+                  <Badge variant="secondary">province rate: {money(zoneMap.get(shipProv)!)}</Badge>
+                ) : (
+                  <Badge variant="destructive">no rate — free shipping</Badge>
+                )}
+                <Input
+                  type="number"
+                  min="0"
+                  step="0.01"
+                  value={provRateDraft}
+                  onChange={(e) => setProvRateDraft(e.target.value)}
+                  className="h-9 w-28"
+                  placeholder={`suggested ${SHIP_TIERS[PROVINCE_TIER[shipProv] ?? "national"].suggestion}`}
+                  aria-label={`Shipping rate for ${selectedShipProv?.name ?? shipProv}`}
+                />
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => {
+                    const rate = Number(provRateDraft)
+                    if (!isFinite(rate) || rate < 0) return
+                    saveZone(shipProv, rate, selectedShipProv?.name ?? shipProv)
+                  }}
+                >
+                  <Save className="mr-1 h-3.5 w-3.5" /> Save
+                </Button>
+              </div>
+
+              {/* City rows for this province */}
+              {CA_CITIES.filter((c) => c.provCode === shipProv).length > 0 && (
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>City</TableHead>
+                      <TableHead className="hidden sm:table-cell">Scope</TableHead>
+                      <TableHead className="w-28">Rate ($)</TableHead>
+                      <TableHead className="w-20" />
+                    </TableRow>
+                  </TableHeader>
+                  <TableBody>
+                    {CA_CITIES.filter((c) => c.provCode === shipProv).map((c) => {
+                      const configured = zoneMap.has(c.cityKey)
+                      const draft = cityRateDrafts[c.cityKey] ?? (configured ? String(zoneMap.get(c.cityKey)) : String(c.suggestion))
+                      return (
+                        <TableRow key={c.cityKey}>
+                          <TableCell>
+                            <span className="font-medium">{c.name}</span>
+                            <span className="ml-2 text-xs text-muted-foreground">overrides province</span>
+                          </TableCell>
+                          <TableCell className="hidden sm:table-cell">
+                            {configured ? (
+                              <Badge variant="secondary">local rate</Badge>
+                            ) : (
+                              <span className="text-xs italic text-muted-foreground">uses province rate</span>
+                            )}
+                          </TableCell>
+                          <TableCell>
+                            <Input
+                              type="number"
+                              min="0"
+                              step="0.01"
+                              value={draft}
+                              onChange={(e) => setCityRateDrafts((m) => ({ ...m, [c.cityKey]: e.target.value }))}
+                              className="h-8"
+                              aria-label={`Shipping rate for ${c.name}`}
+                            />
+                          </TableCell>
+                          <TableCell className="text-right">
+                            <Button
+                              variant="outline"
+                              size="sm"
+                              className="h-8"
+                              onClick={() => {
+                                const rate = Number(draft)
+                                if (!isFinite(rate) || rate < 0) return
+                                saveZone(c.cityKey, rate, `${c.name} (local)`)
+                              }}
+                            >
+                              Save
+                            </Button>
+                          </TableCell>
+                        </TableRow>
+                      )
+                    })}
+                  </TableBody>
+                </Table>
+              )}
+              {CA_CITIES.filter((c) => c.provCode === shipProv).length === 0 && (
+                <p className="rounded-lg border border-dashed p-4 text-center text-sm text-muted-foreground">
+                  No city rates listed for {selectedShipProv?.name ?? shipProv} — everyone gets the province rate.
+                </p>
+              )}
+            </>
           )}
         </CardContent>
       </Card>
@@ -573,6 +510,16 @@ export default function AdminShippingTax() {
                 <Save className="mr-1 h-3.5 w-3.5" /> Save
               </Button>
             </div>
+            {intlZones.length > 0 && (
+              <div className="space-y-1.5 pt-1">
+                {intlZones.map((z) => (
+                  <div key={z.country} className="flex items-center justify-between rounded border px-3 py-1.5 text-sm">
+                    <span className="font-medium">{z.country === "*" ? <span className="italic">Default (everywhere else)</span> : OTHER_REGIONS.find((r) => r.code === z.country)?.name ?? z.country}</span>
+                    <span className="tabular-nums text-muted-foreground">{money(Number(z.rate))}</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </form>
           <form
             className="space-y-3"
@@ -611,6 +558,16 @@ export default function AdminShippingTax() {
                 <Save className="mr-1 h-3.5 w-3.5" /> Save
               </Button>
             </div>
+            {intlTaxes.length > 0 && (
+              <div className="space-y-1.5 pt-1">
+                {intlTaxes.map((t) => (
+                  <div key={t.country} className="flex items-center justify-between rounded border px-3 py-1.5 text-sm">
+                    <span className="font-medium">{t.country === "*" ? <span className="italic">Default (everywhere else)</span> : OTHER_REGIONS.find((r) => r.code === t.country)?.name ?? t.country}</span>
+                    <span className="tabular-nums text-muted-foreground">{Number(t.rate)}%</span>
+                  </div>
+                ))}
+              </div>
+            )}
           </form>
         </CardContent>
       </Card>
