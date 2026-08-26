@@ -2,7 +2,6 @@ import { Suspense, lazy } from "react"
 import {
   BarChart3,
   Boxes,
-  Globe,
   LayoutDashboard,
   Lock,
   Mail,
@@ -207,7 +206,7 @@ export default function AdminLayout({ tab, onTab, onLock, role = "admin", onStor
         {/* Topbar */}
         <div className="flex items-center justify-between gap-3 border-b px-6 py-3">
           <div className="flex items-center gap-2 text-sm">
-            <Globe className="h-4 w-4 text-muted-foreground" />
+            <img src="/logo.png" alt="" className="h-5 w-5 invert dark:invert-0" />
             <span className="font-medium">{settings.store_name}</span>
             <Badge variant="outline" className="text-muted-foreground">
               {role === "staff" ? "staff" : "admin"}

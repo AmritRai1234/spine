@@ -148,6 +148,12 @@ export default function App() {
             >
               <Menu className="h-4 w-4" />
             </Button>
+            <img
+              src="/logo.png"
+              alt=""
+              className="h-7 w-7 cursor-pointer invert dark:invert-0"
+              onClick={() => setView("catalog")}
+            />
             <span
               className="cursor-pointer text-lg font-bold tracking-tight"
               onClick={() => setView("catalog")}
