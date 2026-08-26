@@ -147,8 +147,12 @@ Test-mode runbook:
    (test mode: use the Stripe CLI: `stripe listen --forward-to localhost:8080/webhook/stripe`).
 3. Complete a test payment → the order flips to `paid` on the shopper's screen live.
 
-> Signature verification is not implemented yet — put TLS + auth proxying in front of
-> production deployments (see below) until then. No live keys belong in this repo.
+> Webhook signatures ARE verified: the engine checks the `Stripe-Signature` HMAC
+> (300s replay window) against `STRIPE_WEBHOOK_SECRET` (or
+> `SPINE_WEBHOOK_SECRET_STRIPE`). In test mode with the Stripe CLI, export the
+> CLI's signing secret: `export STRIPE_WEBHOOK_SECRET=$(stripe listen --print-secret)`
+> before starting the engine — otherwise the engine returns
+> `webhook_provider_not_configured` (503). No live keys belong in this repo.
 
 ## Notifications
 

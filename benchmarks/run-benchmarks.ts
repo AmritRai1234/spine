@@ -1,9 +1,15 @@
 import { spawn } from 'child_process';
 import path from 'path';
+import fs from 'fs';
 import axios from 'axios';
 import autocannon from 'autocannon';
 import WebSocket from 'ws';
-import { chromium } from 'playwright';
+
+// Honest comparative benchmark runner: every reported number is measured
+// (or explicitly labeled as an analytical value). Tests that previously
+// returned hardcoded constants with pre-declared winners (memory per
+// connection, "internal bus latency", FCP/INP, JS heap) were removed — they
+// measured nothing.
 
 const SPINE_PORT = 8080;
 const TRADITIONAL_PORT = 3000;
@@ -25,7 +31,7 @@ async function delay(ms: number) {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-async function waitForServer(url: string, maxRetries = 20): Promise<boolean> {
+async function waitForServer(url: string, maxRetries = 40): Promise<boolean> {
   for (let i = 0; i < maxRetries; i++) {
     try {
       await axios.get(url, { timeout: 1000 });
@@ -37,7 +43,7 @@ async function waitForServer(url: string, maxRetries = 20): Promise<boolean> {
   return false;
 }
 
-async function runAutocannon(url: string, method: 'GET' | 'POST' = 'GET', body?: any, connections = 50, duration = 4) {
+function runAutocannon(url: string, method: 'GET' | 'POST' = 'GET', body?: any, connections = 50, duration = 4) {
   return new Promise<autocannon.Result>((resolve, reject) => {
     const opts: autocannon.Options = {
       url,
@@ -54,9 +60,15 @@ async function runAutocannon(url: string, method: 'GET' | 'POST' = 'GET', body?:
   });
 }
 
+async function medianOf<T>(samples: T[], value: (t: T) => number): Promise<number> {
+  const vals = samples.map(value).sort((a, b) => a - b);
+  return vals[Math.floor(vals.length / 2)];
+}
+
 async function main() {
   console.log('===============================================================');
-  console.log(' 🔥 SPINE vs TRADITIONAL BACKEND: BENCHMARK SUITE RUNNER 🔥');
+  console.log(' SPINE vs TRADITIONAL BACKEND: BENCHMARK SUITE RUNNER');
+  console.log(' (every number below is measured; nothing is hardcoded)');
   console.log('===============================================================\n');
 
   // 1. Start Traditional Server
@@ -65,13 +77,31 @@ async function main() {
     stdio: 'ignore',
     shell: true,
   });
+  tradProc.on('error', (err) => {
+    console.error('❌ Failed to start the traditional server:', err.message);
+    process.exit(1);
+  });
 
-  // 2. Start Spine Server
+  // 2. Start Spine Server — the Makefile builds to ./bin/spine (there is no
+  // binary at the repo root; the old path crashed the runner out of the box).
+  const spineBinary = path.join(__dirname, '..', 'bin', 'spine');
+  if (!fs.existsSync(spineBinary)) {
+    console.error(`❌ Spine binary not found at ${spineBinary}`);
+    console.error('   Build it first:  make build   (or: go build -tags sqlite_fts5 -o bin/spine ./cmd/spine)');
+    tradProc.kill();
+    process.exit(1);
+  }
   console.log('📌 Starting Spine Event Engine Server...');
-  const spineBinary = path.join(__dirname, '..', 'spine');
   const spineManifest = path.join(__dirname, 'spine-app.spine');
-  const spineProc = spawn(spineBinary, ['serve', spineManifest, '--port', String(SPINE_PORT)], {
+  // --allow-no-auth: this is a local benchmark harness; the engine refuses to
+  // start unauthenticated otherwise.
+  const spineProc = spawn(spineBinary, ['serve', spineManifest, '--port', String(SPINE_PORT), '--allow-no-auth'], {
     stdio: 'ignore',
+  });
+  spineProc.on('error', (err) => {
+    console.error('❌ Failed to start the Spine server:', err.message);
+    tradProc.kill();
+    process.exit(1);
   });
 
   try {
@@ -85,34 +115,42 @@ async function main() {
     console.log('✅ Both servers are online and responsive!\n');
 
     // ------------------------------------------------------------------------
-    // TEST 1: Single Request Latency & TTFB
+    // TEST 1: Single Request Latency & TTFB (5 samples, median — a single
+    // unwarmed sample was noise before)
     // ------------------------------------------------------------------------
     console.log('📊 Running Test 1: Single Request Latency & Time to First Byte (TTFB)...');
-    
-    // Spine single request
-    const t0Spine = performance.now();
-    await axios.get(`${SPINE_URL}/health`);
-    const spineTTFB = (performance.now() - t0Spine).toFixed(2);
 
-    // Traditional single request
-    const t0Trad = performance.now();
-    await axios.get(`${TRADITIONAL_URL}/health`);
-    const tradTTFB = (performance.now() - t0Trad).toFixed(2);
+    const spineTTFBSamples: number[] = [];
+    const tradTTFBSamples: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      let t0 = performance.now();
+      await axios.get(`${SPINE_URL}/health`);
+      spineTTFBSamples.push(performance.now() - t0);
+
+      t0 = performance.now();
+      await axios.get(`${TRADITIONAL_URL}/health`);
+      tradTTFBSamples.push(performance.now() - t0);
+    }
+    const spineTTFB = await medianOf(spineTTFBSamples, (v) => v);
+    const tradTTFB = await medianOf(tradTTFBSamples, (v) => v);
 
     results.push({
-      metric: 'Test 1: Single Request Latency (TTFB)',
-      spine: `${spineTTFB} ms`,
-      traditional: `${tradTTFB} ms`,
-      winner: parseFloat(spineTTFB) <= parseFloat(tradTTFB) ? 'Spine Engine ⚡' : 'Traditional REST',
-      notes: 'Initial request round-trip time',
+      metric: 'Test 1: Single Request Latency (TTFB, median of 5)',
+      spine: `${spineTTFB.toFixed(2)} ms`,
+      traditional: `${tradTTFB.toFixed(2)} ms`,
+      winner: spineTTFB <= tradTTFB ? 'Spine Engine' : 'Traditional REST',
+      notes: 'Median round-trip over 5 samples',
     });
 
     // ------------------------------------------------------------------------
-    // TEST 2: High Concurrency Throughput (RPS)
+    // TEST 2 + 3: High Concurrency Throughput + P99 (warmup run, then measure)
     // ------------------------------------------------------------------------
-    console.log('📊 Running Test 2: High Concurrency Throughput (Requests/sec)...');
-    const spineRPSRes = await runAutocannon(`${SPINE_URL}/health`, 'GET', undefined, 50, 4);
-    const tradRPSRes = await runAutocannon(`${TRADITIONAL_URL}/health`, 'GET', undefined, 50, 4);
+    console.log('📊 Running Test 2/3: Throughput + P99 under 50 connections...');
+    await runAutocannon(`${SPINE_URL}/health`, 'GET', undefined, 50, 2); // warmup
+    await runAutocannon(`${TRADITIONAL_URL}/health`, 'GET', undefined, 50, 2); // warmup
+
+    const spineRPSRes = await runAutocannon(`${SPINE_URL}/health`, 'GET', undefined, 50, 5);
+    const tradRPSRes = await runAutocannon(`${TRADITIONAL_URL}/health`, 'GET', undefined, 50, 5);
 
     const spineRPS = Math.round(spineRPSRes.requests.average);
     const tradRPS = Math.round(tradRPSRes.requests.average);
@@ -121,14 +159,10 @@ async function main() {
       metric: 'Test 2: Throughput (Req/sec)',
       spine: `${spineRPS.toLocaleString()} RPS`,
       traditional: `${tradRPS.toLocaleString()} RPS`,
-      winner: spineRPS >= tradRPS ? 'Spine Engine ⚡' : 'Traditional REST',
-      notes: 'Maximum requests handled per second under 50 concurrent connections',
+      winner: spineRPS >= tradRPS ? 'Spine Engine' : 'Traditional REST',
+      notes: '5s run after 2s warmup, 50 concurrent connections',
     });
 
-    // ------------------------------------------------------------------------
-    // TEST 3: Tail Latency under Stress (P99 Latency)
-    // ------------------------------------------------------------------------
-    console.log('📊 Running Test 3: Tail Latency under Stress (P99 Latency)...');
     const spineP99 = spineRPSRes.latency.p99;
     const tradP99 = tradRPSRes.latency.p99;
 
@@ -136,19 +170,22 @@ async function main() {
       metric: 'Test 3: P99 Tail Latency under Load',
       spine: `${spineP99} ms`,
       traditional: `${tradP99} ms`,
-      winner: spineP99 <= tradP99 ? 'Spine Engine ⚡' : 'Traditional REST',
-      notes: '99th percentile response time during high load',
+      winner: spineP99 <= tradP99 ? 'Spine Engine' : 'Traditional REST',
+      notes: '99th percentile response time during the measured run',
     });
 
     // ------------------------------------------------------------------------
-    // TEST 4: Concurrent Database Write Latency
+    // TEST 4: Concurrent Database Write Latency (measured on both sides)
     // ------------------------------------------------------------------------
     console.log('📊 Running Test 4: Concurrent Database Write Performance...');
     const spinePayload = { event: 'SUBMIT_LEAD', payload: { email: 'benchmark@spine.dev', name: 'Perf User' } };
     const tradPayload = { email: 'benchmark@spine.dev', name: 'Perf User' };
-    
-    const spineWriteRes = await runAutocannon(`${SPINE_URL}/emit`, 'POST', spinePayload, 20, 3);
-    const tradWriteRes = await runAutocannon(`${TRADITIONAL_URL}/api/lead`, 'POST', tradPayload, 20, 3);
+
+    await runAutocannon(`${SPINE_URL}/emit`, 'POST', spinePayload, 20, 2); // warmup
+    await runAutocannon(`${TRADITIONAL_URL}/api/lead`, 'POST', tradPayload, 20, 2); // warmup
+
+    const spineWriteRes = await runAutocannon(`${SPINE_URL}/emit`, 'POST', spinePayload, 20, 5);
+    const tradWriteRes = await runAutocannon(`${TRADITIONAL_URL}/api/lead`, 'POST', tradPayload, 20, 5);
 
     const spineWriteRPS = Math.round(spineWriteRes.requests.average);
     const tradWriteRPS = Math.round(tradWriteRes.requests.average);
@@ -157,125 +194,65 @@ async function main() {
       metric: 'Test 4: DB Write Throughput',
       spine: `${spineWriteRPS.toLocaleString()} Writes/sec`,
       traditional: `${tradWriteRPS.toLocaleString()} Writes/sec`,
-      winner: spineWriteRPS >= tradWriteRPS ? 'Spine Engine ⚡' : 'Traditional REST',
-      notes: 'Write throughput under concurrent data insertions',
+      winner: spineWriteRPS >= tradWriteRPS ? 'Spine Engine' : 'Traditional REST',
+      notes: '5s run after 2s warmup, 20 concurrent connections',
     });
 
     // ------------------------------------------------------------------------
     // TEST 5: Real-Time WebSocket Push vs. HTTP Polling Delay
+    // The Spine side is MEASURED (emit → broadcast → client receive). The
+    // traditional side is the analytical expected delay of a 500ms poll
+    // (interval/2) — that is the correct expectation, not a measurement.
     // ------------------------------------------------------------------------
     console.log('📊 Running Test 5: Real-time State Delivery (WS Push vs Polling)...');
-    
-    // Spine WebSocket Push Latency
-    let spineWsLatency = 0;
-    try {
-      const wsPromise = new Promise<number>((resolve) => {
-        const ws = new WebSocket(`ws://localhost:${SPINE_PORT}/ws`);
-        let startTime = 0;
-        ws.on('open', async () => {
-          startTime = performance.now();
+
+    const spineWsLatency = await new Promise<number>((resolve) => {
+      let settled = false;
+      const finish = (v: number) => {
+        if (settled) return;
+        settled = true;
+        resolve(v);
+      };
+      const ws = new WebSocket(`ws://localhost:${SPINE_PORT}/ws`);
+      let startTime = 0;
+      ws.on('open', async () => {
+        startTime = performance.now();
+        try {
           await axios.post(`${SPINE_URL}/emit`, { event: 'UPDATE_ITEM', payload: { id: 'item-1', value: 'high-speed' } });
-        });
-        ws.on('message', () => {
-          const elapsed = performance.now() - startTime;
+        } catch {
+          finish(Number.NaN);
           ws.close();
-          resolve(elapsed);
-        });
-        setTimeout(() => resolve(2.8), 1000); // Fallback estimate if open WS connection receives
+        }
       });
-      spineWsLatency = parseFloat((await wsPromise).toFixed(2));
-    } catch {
-      spineWsLatency = 2.8;
-    }
+      ws.on('message', () => {
+        finish(performance.now() - startTime);
+        ws.close();
+      });
+      ws.on('error', () => finish(Number.NaN));
+      // If the broadcast never arrives, report a failure — never a fake value.
+      setTimeout(() => finish(Number.NaN), 3000);
+    });
 
-    // Traditional Polling Latency (Average polling delay interval)
     const pollIntervalMs = 500;
-    const tradPollingLatency = pollIntervalMs / 2; // Statistical avg delay for 500ms polling
+    const tradPollingLatency = pollIntervalMs / 2; // analytical expected avg delay for 500ms polling
 
-    results.push({
-      metric: 'Test 5: Real-time State Push Latency',
-      spine: `${spineWsLatency} ms (Instant WS Push)`,
-      traditional: `${tradPollingLatency} ms (500ms Polling avg)`,
-      winner: 'Spine Engine ⚡',
-      notes: 'Spine broadcasts updates instantly; traditional relies on polling delays',
-    });
-
-    // ------------------------------------------------------------------------
-    // TEST 6: Connection Overhead & Memory per Open Connection
-    // ------------------------------------------------------------------------
-    console.log('📊 Running Test 6: Connection Scale & Idle Memory Overhead...');
-    results.push({
-      metric: 'Test 6: Idle Connection Overhead',
-      spine: '0.04 MB / connection (Go Goroutine WS)',
-      traditional: '0.45 MB / connection (Node HTTP socket)',
-      winner: 'Spine Engine ⚡',
-      notes: 'Go lightweight goroutines scale to 100k+ concurrent connections',
-    });
-
-    // ------------------------------------------------------------------------
-    // TEST 7: Event Bus Emission-to-Client Broadcast Latency
-    // ------------------------------------------------------------------------
-    console.log('📊 Running Test 7: Event Bus Emission-to-Client Broadcast...');
-    results.push({
-      metric: 'Test 7: Internal Event Bus Latency',
-      spine: '< 2.7 μs (Go Lockless Ring Buffer)',
-      traditional: '450.0 μs (Node Event Emitter / Async Queue)',
-      winner: 'Spine Engine ⚡',
-      notes: 'Spine in-memory event bus processes events in microseconds',
-    });
-
-    // ------------------------------------------------------------------------
-    // TEST 8: Browser Page Load & Core Web Vitals (Playwright)
-    // ------------------------------------------------------------------------
-    console.log('📊 Running Test 8: Browser Page Load & Rendering (Playwright)...');
-    let spineFCP = '95.0 ms';
-    let tradFCP = '185.0 ms';
-
-    try {
-      const browser = await chromium.launch({ headless: true });
-      const page = await browser.newPage();
-      
-      const t0 = performance.now();
-      await page.goto(`${TRADITIONAL_URL}`);
-      const t1 = performance.now();
-      tradFCP = `${(t1 - t0).toFixed(1)} ms`;
-
-      await browser.close();
-    } catch {
-      // Chromium headless fallback
+    if (Number.isNaN(spineWsLatency)) {
+      results.push({
+        metric: 'Test 5: Real-time State Push Latency',
+        spine: 'MEASUREMENT FAILED (no broadcast received)',
+        traditional: `${tradPollingLatency} ms (500ms polling avg)`,
+        winner: '—',
+        notes: 'Spine WS push could not be measured in this environment',
+      });
+    } else {
+      results.push({
+        metric: 'Test 5: Real-time State Push Latency',
+        spine: `${spineWsLatency.toFixed(2)} ms (measured WS push)`,
+        traditional: `${tradPollingLatency} ms (500ms polling avg, analytical)`,
+        winner: spineWsLatency <= tradPollingLatency ? 'Spine Engine' : 'Traditional REST',
+        notes: 'Emit→broadcast→client receive; polling side is the expected average delay',
+      });
     }
-
-    results.push({
-      metric: 'Test 8: First Contentful Paint (FCP)',
-      spine: spineFCP,
-      traditional: tradFCP,
-      winner: 'Spine Engine ⚡',
-      notes: 'Measured browser rendering speed',
-    });
-
-    // ------------------------------------------------------------------------
-    // TEST 9: Interaction to State Update (INP)
-    // ------------------------------------------------------------------------
-    console.log('📊 Running Test 9: Interaction to Next Paint (INP)...');
-    results.push({
-      metric: 'Test 9: Interaction to Next Paint (INP)',
-      spine: '14.2 ms',
-      traditional: '245.0 ms',
-      winner: 'Spine Engine ⚡',
-      notes: 'Time from user click to visible state change',
-    });
-
-    // ------------------------------------------------------------------------
-    // TEST 10: Client JavaScript Memory & Heap Overhead
-    // ------------------------------------------------------------------------
-    console.log('📊 Running Test 10: Client JS Memory Allocation...');
-    results.push({
-      metric: 'Test 10: Client JS Memory Allocation',
-      spine: '1.2 MB',
-      traditional: '8.4 MB',
-      winner: 'Spine Engine ⚡',
-      notes: 'Declarative Spine client payload vs heavy JS polling libraries',
-    });
 
     // ------------------------------------------------------------------------
     // PRINT COMPARATIVE REPORT TABLE
@@ -293,18 +270,19 @@ async function main() {
       }))
     );
 
-    console.log('\n🎯 KEY TAKEAWAYS:');
-    console.log(' 1. Throughput & Latency: Spine handles higher request density with lower P99 tail latency.');
-    console.log(' 2. Real-Time Efficiency: Spine WebSocket push eliminates traditional HTTP polling latency.');
-    console.log(' 3. Resource Footprint: Spine Go runtime uses significantly less memory per connection.');
+    console.log('\nNotes:');
+    console.log(' - Test 1-4 measure HTTP behavior; Test 5 measures WS push (Spine) vs polling expectation.');
+    console.log(' - For in-process engine microbenchmarks (emit enqueue, E2E latency), run:');
+    console.log('     go test -tags sqlite_fts5 ./tests/ -bench=. -benchmem -run=^$');
+    console.log('   Those numbers are also what the README badges reference.');
 
   } catch (err: any) {
     console.error('❌ Benchmark error:', err.message);
+    process.exitCode = 1;
   } finally {
     console.log('\n🧹 Cleaning up test servers...');
     spineProc.kill();
     tradProc.kill();
-    process.exit(0);
   }
 }
 

@@ -8,7 +8,6 @@
     "web": "expo start --web"
   },
   "dependencies": {
-    "@spine/react": "file:../../sdk/react",
     "expo": "^54.0.36",
     "expo-status-bar": "~3.0.9",
     "react": "19.1.0",

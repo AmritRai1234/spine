@@ -43,7 +43,11 @@ export class SpineClient {
       },
       body: JSON.stringify({ event, payload }),
     })
-    return res.json()
+    const data = (await res.json()) as EmitResponse
+    if (!res.ok || data.status === "error") {
+      throw new Error(data.error ?? `emit failed (HTTP ${res.status})`)
+    }
+    return data
   }
 
   async queryTable(name: string, params: Record<string, string | number> = {}): Promise<{ count: number; rows: Record<string, unknown>[] }> {
@@ -52,7 +56,11 @@ export class SpineClient {
     const res = await fetch(`${this.baseUrl}/tables/${encodeURIComponent(name)}?${qs}`, {
       headers: { "X-API-Key": this.apiKey },
     })
-    return res.json()
+    const data = await res.json()
+    if (!res.ok || data.status === "error") {
+      throw new Error(data.error ?? `table query failed (HTTP ${res.status})`)
+    }
+    return data
   }
 
   /** Query the event audit log (admin). */

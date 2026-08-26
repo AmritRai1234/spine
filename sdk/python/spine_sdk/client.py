@@ -67,6 +67,7 @@ class SpineClient:
         self._base_url = base_url.rstrip("/")
         self._api_key = api_key
         self._auto_reconnect = auto_reconnect
+        self._auto_reconnect_option = auto_reconnect  # configured value; connect() restores it
         self._reconnect_interval_s = reconnect_interval_s
 
         # Derive WebSocket URL from base_url if not provided
@@ -297,10 +298,14 @@ class SpineClient:
         Handles authentication, auto-reconnect, and missed-event replay.
         This method returns immediately; messages are dispatched to
         registered subscription callbacks.
+
+        A prior ``disconnect()`` does not permanently disable reconnection:
+        every connect() restores the configured ``auto_reconnect`` value.
         """
         if self._ws_thread and self._ws_thread.is_alive():
             return
 
+        self._auto_reconnect = self._auto_reconnect_option
         self._ws_stop.clear()
         self._ws_thread = threading.Thread(
             target=self._ws_run_loop,
@@ -412,12 +417,16 @@ class SpineClient:
 
         msg_type = data.get("type", "")
 
-        # Replay missed events from reconnect_ack
+        # Replay missed events from reconnect_ack. Audit-log rows carry
+        # {id, event, payload, emitted_states} — dispatch the payload to
+        # every state the event emitted (the old code looked for evt["state"],
+        # which audit rows never have — replay silently dropped everything).
         if msg_type == "reconnect_ack":
             for evt in data.get("missed_events", []):
-                state = evt.get("state")
                 payload = evt.get("payload")
-                if state and payload:
+                if not payload:
+                    continue
+                for state in evt.get("emitted_states", []) or []:
                     self._dispatch(state, payload)
             return
 

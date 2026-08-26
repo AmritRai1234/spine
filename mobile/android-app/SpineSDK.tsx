@@ -1,4 +1,4 @@
-import React, { createContext, useContext, useEffect, useState, useRef } from 'react';
+import React, { createContext, useContext, useEffect, useState, useRef, useMemo } from 'react';
 
 export interface SpineContextValue {
   connected: boolean;
@@ -102,8 +102,14 @@ export const SpineProvider: React.FC<SpineProviderProps> = ({ url, children }) =
     };
   };
 
+  const contextValue = useMemo(
+    () => ({ connected, emit, subscribe, serverUrl: httpUrl }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [connected, httpUrl]
+  );
+
   return (
-    <SpineContext.Provider value={{ connected, emit, subscribe, serverUrl: httpUrl }}>
+    <SpineContext.Provider value={contextValue}>
       {children}
     </SpineContext.Provider>
   );

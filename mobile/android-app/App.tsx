@@ -157,7 +157,7 @@ function MainMobileApp() {
 
 export default function App() {
   return (
-    <SpineProvider url="http://172.16.1.145:8080">
+    <SpineProvider url={process.env.EXPO_PUBLIC_SPINE_URL ?? 'http://localhost:8080'}>
       <MainMobileApp />
     </SpineProvider>
   );

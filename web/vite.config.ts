@@ -9,6 +9,8 @@ export default defineConfig({
       '/emit': 'http://localhost:8080',
       '/health': 'http://localhost:8080',
       '/schema': 'http://localhost:8080',
+      '/tables': 'http://localhost:8080',
+      '/events': 'http://localhost:8080',
       '/ws': { target: 'ws://localhost:8080', ws: true }
     }
   }

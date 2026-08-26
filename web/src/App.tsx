@@ -17,7 +17,7 @@ interface FeedItem {
 }
 
 /* ===== Hook: WebSocket ===== */
-function useSpineWS(onMessage: (data: FeedItem) => void) {
+function useSpineWS(onMessage: (data: FeedItem) => void, apiKey: string) {
   const [connected, setConnected] = useState(false)
   const idRef = useRef(0)
   const onMsgRef = useRef(onMessage)
@@ -31,10 +31,15 @@ function useSpineWS(onMessage: (data: FeedItem) => void) {
     function connect() {
       if (!alive) return
       const proto = window.location.protocol === 'https:' ? 'wss:' : 'ws:'
-      const url = `${proto}//${window.location.host}/ws`
+      let url = `${proto}//${window.location.host}/ws`
+      if (apiKey) url += `?token=${encodeURIComponent(apiKey)}`
       ws = new WebSocket(url)
 
-      ws.onopen = () => setConnected(true)
+      ws.onopen = () => {
+        setConnected(true)
+        // In-band auth handshake (browser clients can't set headers on WS).
+        if (apiKey) ws?.send(JSON.stringify({ type: 'auth', token: apiKey }))
+      }
       ws.onclose = () => {
         setConnected(false)
         if (alive) timer = setTimeout(connect, 3000)
@@ -57,22 +62,24 @@ function useSpineWS(onMessage: (data: FeedItem) => void) {
 
     connect()
     return () => { alive = false; if (timer) clearTimeout(timer); ws?.close() }
-  }, [])
+  }, [apiKey])
 
   return connected
 }
 
 /* ===== Hook: Schema ===== */
-function useSchema() {
+function useSchema(apiKey: string) {
   const [schema, setSchema] = useState<Schema | null>(null)
   useEffect(() => {
-    fetch('/schema').then(r => r.json()).then(setSchema).catch(() => {})
-  }, [])
+    const headers: Record<string, string> = {}
+    if (apiKey) headers['X-API-Key'] = apiKey
+    fetch('/schema', { headers }).then(r => r.json()).then(setSchema).catch(() => {})
+  }, [apiKey])
   return schema
 }
 
 /* ===== Component: Emit Console ===== */
-function EmitConsole({ schema, onEmit }: { schema: Schema | null; onEmit: (item: FeedItem) => void }) {
+function EmitConsole({ schema, onEmit, apiKey }: { schema: Schema | null; onEmit: (item: FeedItem) => void; apiKey: string }) {
   const events = schema?.nodes.flatMap(n => n.emits?.map(e => e.event) ?? []) ?? []
   const uniqueEvents = [...new Set(events)]
 
@@ -105,9 +112,11 @@ function EmitConsole({ schema, onEmit }: { schema: Schema | null; onEmit: (item:
     setSending(true)
     try {
       const body = { event, payload: JSON.parse(payload) }
+      const headers: Record<string, string> = { 'Content-Type': 'application/json' }
+      if (apiKey) headers['X-API-Key'] = apiKey
       const res = await fetch('/emit', {
         method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
+        headers,
         body: JSON.stringify(body),
       })
       const data = await res.json()
@@ -299,7 +308,7 @@ function SchemaInspector({ schema }: { schema: Schema | null }) {
 }
 
 /* ===== Component: Table Browser ===== */
-function TableBrowser({ tables }: { tables: string[] }) {
+function TableBrowser({ tables, apiKey }: { tables: string[]; apiKey: string }) {
   const [selectedTable, setSelectedTable] = useState<string>(tables[0] ?? '')
   const [rows, setRows] = useState<Record<string, unknown>[]>([])
   const [loading, setLoading] = useState(false)
@@ -313,7 +322,9 @@ function TableBrowser({ tables }: { tables: string[] }) {
   useEffect(() => {
     if (!selectedTable) return
     setLoading(true)
-    fetch(`/tables/${selectedTable}`)
+    const headers: Record<string, string> = {}
+    if (apiKey) headers['X-API-Key'] = apiKey
+    fetch(`/tables/${selectedTable}`, { headers })
       .then(r => r.json())
       .then(data => {
         if (data.rows) setRows(data.rows)
@@ -321,7 +332,7 @@ function TableBrowser({ tables }: { tables: string[] }) {
       })
       .catch(() => setRows([]))
       .finally(() => setLoading(false))
-  }, [selectedTable])
+  }, [selectedTable, apiKey])
 
   const columns = rows.length > 0 ? Object.keys(rows[0]) : []
 
@@ -382,16 +393,27 @@ export default function App() {
     else if (item.type === 'emit') setEmitCount(c => c + 1)
   }, [])
 
-  const connected = useSpineWS(addItem)
-  const schema = useSchema()
+  const [apiKey, setApiKey] = useState<string>(() => localStorage.getItem('spine_api_key') ?? '')
+  const connected = useSpineWS(addItem, apiKey)
+  const schema = useSchema(apiKey)
 
   return (
     <div className="app">
       <header className="header">
         <div className="brand">
           <span className="logo-text">SPINE // ENGINE</span>
-          <span className="brand-badge">v2.3.0</span>
+          <span className="brand-badge">spine-go</span>
         </div>
+        <input
+          className="select-control"
+          style={{ width: 240 }}
+          placeholder="API key (optional)"
+          value={apiKey}
+          onChange={e => {
+            setApiKey(e.target.value)
+            localStorage.setItem('spine_api_key', e.target.value)
+          }}
+        />
         <div className="status-pill">
           <div className={`status-dot ${connected ? 'active' : 'inactive'}`} />
           <span>{connected ? 'CONNECTED (WS: LIVE)' : 'DISCONNECTED'}</span>
@@ -424,14 +446,14 @@ export default function App() {
 
       <div className="grid-layout">
         <div className="col-sidebar">
-          <EmitConsole schema={schema} onEmit={addItem} />
+          <EmitConsole schema={schema} onEmit={addItem} apiKey={apiKey} />
           <SchemaInspector schema={schema} />
         </div>
         <div className="col-main">
           {activeTab === 'stream' ? (
             <EventStream items={feed} onClear={() => setFeed([])} />
           ) : (
-            <TableBrowser tables={schema?.db_tables ?? []} />
+            <TableBrowser tables={schema?.db_tables ?? []} apiKey={apiKey} />
           )}
         </div>
       </div>

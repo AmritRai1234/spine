@@ -11,8 +11,10 @@ Usage:
 from spine_sdk.client import SpineClient
 from spine_sdk.types import (
     EmitResponse,
+    EventLog,
     QueryOptions,
     SpineClientOptions,
+    TableInfo,
     TableQueryResponse,
 )
 
@@ -20,7 +22,9 @@ __all__ = [
     "SpineClient",
     "SpineClientOptions",
     "EmitResponse",
+    "EventLog",
     "QueryOptions",
+    "TableInfo",
     "TableQueryResponse",
 ]
 
