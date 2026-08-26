@@ -6,6 +6,8 @@ import {
   LayoutDashboard,
   Lock,
   Mail,
+  PackageSearch,
+  Repeat,
   ScrollText,
   Settings,
   ShoppingCart,
@@ -24,9 +26,11 @@ import type { AdminTab } from "@/pages/admin/tabs"
 // Code-split admin pages — recharts & co. never reach the storefront bundle.
 const Dashboard = lazy(() => import("@/pages/admin/Dashboard"))
 const AdminProducts = lazy(() => import("@/pages/admin/AdminProducts"))
+const AdminInventory = lazy(() => import("@/pages/admin/AdminInventory"))
 const AdminOrders = lazy(() => import("@/pages/admin/AdminOrders"))
 const AdminCustomers = lazy(() => import("@/pages/admin/AdminCustomers"))
 const AdminMarketing = lazy(() => import("@/pages/admin/AdminMarketing"))
+const AdminSubscriptions = lazy(() => import("@/pages/admin/AdminSubscriptions"))
 const AdminAnalytics = lazy(() => import("@/pages/admin/AdminAnalytics"))
 const AdminEvents = lazy(() => import("@/pages/admin/AdminEvents"))
 const AdminSettings = lazy(() => import("@/pages/admin/AdminSettings"))
@@ -37,6 +41,9 @@ interface NavItem {
   label: string
   icon: React.ReactNode
   adminOnly?: boolean
+  /** Sub-item rendered indented under its parent (visual only until wired). */
+  sub?: boolean
+  disabled?: boolean
 }
 interface NavGroup {
   title: string
@@ -59,12 +66,16 @@ const NAV_GROUPS: NavGroup[] = [
   },
   {
     title: "Products",
-    items: [{ id: "products", label: "Products", icon: <Boxes className="h-4 w-4" />, adminOnly: true }],
+    items: [
+      { id: "products", label: "Products", icon: <Boxes className="h-4 w-4" />, adminOnly: true },
+      { id: "inventory", label: "Inventory", icon: <PackageSearch className="h-4 w-4" />, adminOnly: true, sub: true },
+    ],
   },
   {
     title: "Commerce",
     items: [
       { id: "shipping", label: "Shipping & Tax", icon: <Truck className="h-4 w-4" />, adminOnly: true },
+      { id: "subscriptions", label: "Subscriptions", icon: <Repeat className="h-4 w-4" />, adminOnly: true },
       { id: "marketing", label: "Marketing", icon: <Mail className="h-4 w-4" />, adminOnly: true },
     ],
   },
@@ -114,17 +125,45 @@ export default function AdminLayout({ tab, onTab, onLock, role = "admin", onStor
                 {group.title}
               </p>
               <div className="space-y-0.5">
-                {group.items.map((item) => (
-                  <button key={item.id} onClick={() => onTab(item.id)} className={itemClass(activeTab === item.id)}>
-                    {item.icon}
-                    {item.label}
-                    {item.id === "orders" && (
-                      <Badge variant="secondary" className="ml-auto h-5 bg-white/15 px-1.5 text-xs text-zinc-200">
-                        live
-                      </Badge>
-                    )}
-                  </button>
-                ))}
+                {group.items.map((item, idx) => {
+                  // Shopify-style sub-items: indented to align with the parent's
+                  // LABEL (icon is 16px + gap-3 12px = 28px), no icon, lighter
+                  // and slightly smaller text.
+                  if (item.sub) {
+                    return (
+                      <button
+                        key={`${item.label}-${idx}`}
+                        onClick={item.disabled ? undefined : () => onTab(item.id)}
+                        disabled={item.disabled}
+                        className={
+                          item.disabled
+                            ? "flex w-full cursor-not-allowed items-center gap-3 rounded-md px-3 py-1.5 text-[13px] text-zinc-600"
+                            : activeTab === item.id
+                              ? "flex w-full items-center gap-3 rounded-md px-3 py-1.5 text-[13px] font-medium bg-white text-black"
+                              : "flex w-full items-center gap-3 rounded-md px-3 py-1.5 text-[13px] text-zinc-400 hover:bg-white/10 hover:text-white transition-colors"
+                        }
+                      >
+                        {item.icon}
+                        {item.label}
+                      </button>
+                    )
+                  }
+                  return (
+                    <button
+                      key={item.id}
+                      onClick={() => onTab(item.id)}
+                      className={itemClass(activeTab === item.id)}
+                    >
+                      {item.icon}
+                      {item.label}
+                      {item.id === "orders" && (
+                        <Badge variant="secondary" className="ml-auto h-5 bg-white/15 px-1.5 text-xs text-zinc-200">
+                          live
+                        </Badge>
+                      )}
+                    </button>
+                  )
+                })}
               </div>
             </div>
           ))}
@@ -182,9 +221,11 @@ export default function AdminLayout({ tab, onTab, onLock, role = "admin", onStor
           <Suspense fallback={<Skeleton className="h-96" />}>
             {activeTab === "dashboard" && <Dashboard />}
             {activeTab === "products" && <AdminProducts />}
+            {activeTab === "inventory" && <AdminInventory />}
             {activeTab === "orders" && <AdminOrders />}
             {activeTab === "customers" && <AdminCustomers />}
             {activeTab === "marketing" && <AdminMarketing />}
+            {activeTab === "subscriptions" && <AdminSubscriptions />}
             {activeTab === "analytics" && <AdminAnalytics />}
             {activeTab === "settings" && <AdminSettings />}
             {activeTab === "shipping" && <AdminShippingTax />}

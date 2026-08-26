@@ -44,6 +44,8 @@ database:
     - tax_rules
     - subscribers
     - payments
+    - subscription_plans
+    - subscriptions
 
 # ── Nodes & Contracts ─────────────────────────────────────────────
 # owns_files = the AI-codability map: every frontend file belongs to
@@ -102,6 +104,9 @@ nodes:
           qty: integer
           variant_id: string
           variant_label: string
+          # Purchase mode: "onetime" (default) or "subscription". Extension
+          # columns ride along via schema evolution — plan_id names the
+          # subscription_plans row when mode is "subscription".
       - event: UPDATE_CART_ITEM
         payload:
           cart_id: string
@@ -284,6 +289,40 @@ nodes:
           email: string
       - state: CAMPAIGN_SENT
 
+  # Subscriptions — admin-managed selling plans + shopper subscription rows.
+  # Plans are reusable across products (Marketing-style section); products
+  # reference plan ids through their sell_subscription / plan_ids columns.
+  # The cron route (every 3600s) fires SUBSCRIPTIONS_DUE which auto-places
+  # repeat orders for every active subscription past its next_run_at.
+  Subscriptions:
+    owns_files:
+      - web/src/pages/admin/AdminSubscriptions.tsx
+    emits:
+      - event: SAVE_SUBSCRIPTION_PLAN
+        payload:
+          name: string
+          interval_months: integer
+          percent_off: number
+      - event: TOGGLE_SUBSCRIPTION
+        payload:
+          id: string
+          action: string  # pause | resume | cancel | reactivate
+      # Engine-internal: fired by the cron worker (route cron: 3600s).
+      - event: SUBSCRIPTIONS_DUE
+      # Engine-internal: fired by subscriptions.sweep per due subscription.
+      - event: SUBSCRIPTION_RENEWAL
+    listens:
+      - state: SUBSCRIPTION_PLAN_SAVED
+        payload:
+          name: string
+      - state: SUBSCRIPTION_UPDATED
+        payload:
+          id: string
+          status: string
+      - state: SUBSCRIPTIONS_RENEWED
+        payload:
+          renewed: integer
+
 # ── Routes (event → action pipelines) ─────────────────────────────
 routes:
   # Admin publishes/updates a product (upsert by SKU)
@@ -331,7 +370,7 @@ routes:
   - on: ADD_TO_CART
     steps:
       - action: set
-        line_key: "$event.payload.cart_id|$event.payload.product_id|$event.payload.variant_id"
+        line_key: "$event.payload.cart_id|$event.payload.product_id|$event.payload.variant_id|$event.payload.purchase_mode"
         updated_at: $now
       - action: db.upsert
         table: cart_items
@@ -346,7 +385,7 @@ routes:
         condition: "$event.payload.qty >= 1"
         message: "cart quantity must be at least 1"
       - action: set
-        line_key: "$event.payload.cart_id|$event.payload.product_id|$event.payload.variant_id"
+        line_key: "$event.payload.cart_id|$event.payload.product_id|$event.payload.variant_id|$event.payload.purchase_mode"
         updated_at: $now
       - action: db.update
         table: cart_items
@@ -356,7 +395,7 @@ routes:
   - on: REMOVE_FROM_CART
     steps:
       - action: set
-        line_key: "$event.payload.cart_id|$event.payload.product_id|$event.payload.variant_id"
+        line_key: "$event.payload.cart_id|$event.payload.product_id|$event.payload.variant_id|$event.payload.purchase_mode"
       - action: db.delete
         table: cart_items
         where: "line_key = '$event.payload.line_key'"
@@ -371,6 +410,26 @@ routes:
   - on: ADD_ORDER_ITEM
     on_failure: CHECKOUT_FAILED
     steps:
+      # Subscription mode FIRST (before the one-time price guards): the plan
+      # lookup pulls SERVER-SIDE percent_off + interval — client numbers are
+      # ignored. The product must be subscription-enabled, and the claimed
+      # price must equal plan-discounted price computed from the live row.
+      - action: db.lookup
+        table: subscription_plans
+        key_column: id
+        value_expr: $event.payload.plan_id
+        as: plan_
+        if: "$event.payload.purchase_mode == 'subscription'"
+      # Expected subscription price bounds (arith in math.calc, not in the
+      # condition evaluator — conditions compare plain values only).
+      - action: math.calc
+        set: sub_price_lo
+        expr: "$event.payload.price - 0.005"
+        if: "$event.payload.purchase_mode == 'subscription'"
+      - action: math.calc
+        set: sub_price_hi
+        expr: "$event.payload.price + 0.005"
+        if: "$event.payload.purchase_mode == 'subscription'"
       # Variant path — live row from product_variants
       - action: db.lookup
         table: product_variants
@@ -378,10 +437,31 @@ routes:
         value_expr: $event.payload.variant_id
         as: variant_
         if: "$event.payload.variant_id exists"
+      # Product path — no variant claimed
+      - action: db.lookup
+        table: products
+        key_column: id
+        value_expr: $event.payload.product_id
+        as: product_
+        if: "$event.payload.variant_id == ''"
+      # Expected subscription price from the SERVER-side list price + plan
+      # percent_off (lookups above merged product_price/variant_price).
+      - action: math.calc
+        set: expected_sub_price
+        expr: "$event.payload.product_price * (1 - $event.payload.plan_percent_off / 100)"
+        if: "$event.payload.purchase_mode == 'subscription' && $event.payload.variant_id == ''"
+      - action: math.calc
+        set: expected_sub_price
+        expr: "$event.payload.variant_price * (1 - $event.payload.plan_percent_off / 100)"
+        if: "$event.payload.purchase_mode == 'subscription' && $event.payload.variant_id exists"
       - action: assert
         condition: "$event.payload.price == $event.payload.variant_price"
         message: "price mismatch: '$event.payload.name' variant sells for $event.payload.variant_price, request claimed $event.payload.price"
-        if: "$event.payload.variant_id exists"
+        if: "$event.payload.variant_id exists && $event.payload.purchase_mode != 'subscription'"
+      - action: assert
+        condition: "$event.payload.expected_sub_price >= $event.payload.sub_price_lo && $event.payload.expected_sub_price <= $event.payload.sub_price_hi"
+        message: "price mismatch: subscription price should be $event.payload.expected_sub_price, request claimed $event.payload.price"
+        if: "$event.payload.variant_id exists && $event.payload.purchase_mode == 'subscription'"
       - action: assert
         condition: "$event.payload.qty <= $event.payload.variant_stock"
         message: "insufficient stock: '$event.payload.name' variant has $event.payload.variant_stock left, requested $event.payload.qty"
@@ -396,25 +476,70 @@ routes:
       - action: assert
         condition: "$event.payload.price == $event.payload.product_price"
         message: "price mismatch: '$event.payload.product_name' sells for $event.payload.product_price, request claimed $event.payload.price"
-        if: "$event.payload.variant_id == ''"
+        if: "$event.payload.variant_id == '' && $event.payload.purchase_mode != 'subscription'"
+      - action: assert
+        condition: "$event.payload.expected_sub_price >= $event.payload.sub_price_lo && $event.payload.expected_sub_price <= $event.payload.sub_price_hi"
+        message: "price mismatch: subscription price should be $event.payload.expected_sub_price, request claimed $event.payload.price"
+        if: "$event.payload.variant_id == '' && $event.payload.purchase_mode == 'subscription'"
       - action: assert
         condition: "$event.payload.qty <= $event.payload.product_stock"
         message: "insufficient stock: '$event.payload.product_name' has $event.payload.product_stock left, requested $event.payload.qty"
         if: "$event.payload.variant_id == ''"
+      # Subscription-enabled gate: product lookup above merged sell_subscription.
+      - action: assert
+        condition: "$event.payload.product_sell_subscription == 1"
+        message: "'$event.payload.name' is not available on subscription"
+        if: "$event.payload.purchase_mode == 'subscription' && $event.payload.variant_id == ''"
       # Server-calculated line total (verified price × qty) — the client never
       # supplies dollar amounts; the price guard above ran first.
       - action: math.calc
         set: line_total
         expr: "$event.payload.price * $event.payload.qty"
+      # Compute the subscription unit price + renewal timing BEFORE pruning —
+      # plan helpers (percent_off, interval, name) are still in the payload.
+      # unit_price is the plan-discounted server-verified per-cycle price.
+      - action: math.calc
+        set: unit_price
+        expr: "$event.payload.price * (1 - $event.payload.plan_percent_off / 100)"
+        if: "$event.payload.purchase_mode == 'subscription'"
+      - action: math.calc
+        set: next_run_at_epoch
+        expr: "$now_epoch + $event.payload.plan_interval_months * 2592000"
+        if: "$event.payload.purchase_mode == 'subscription'"
       # Prune looked-up helper columns so db.insert persists only line data.
       # product_id stays — order_items carries it and the stock adjust needs it.
       - action: unset
-        fields: "product_sku product_name product_price product_stock product_description product_image_url product_category product_created_at variant_sku variant_option1_name variant_option1_value variant_option2_name variant_option2_value variant_price variant_stock variant_created_at"
+        fields: "product_sku product_name product_price product_stock product_description product_image_url product_category product_created_at variant_sku variant_option1_name variant_option1_value variant_option2_name variant_option2_value variant_price variant_stock variant_created_at expected_sub_price sub_price_lo sub_price_hi"
       # Accept the line item… synchronously: the server-side subtotal at
       # PLACE_ORDER reads this row, so the insert must be durable first.
       - action: db.insert
         table: order_items
         sync: true
+      # Subscription line? Persist the customer's subscription so the cron
+      # sweep renews it. Keyed per (order line × plan).
+      - action: set
+        id: "$event.payload.order_id|$event.payload.product_id|$event.payload.variant_id|$event.payload.plan_id"
+        status: active
+        email: pending
+        order_ref: $event.payload.order_id
+        product_id: $event.payload.product_id
+        variant_id: $event.payload.variant_id
+        name: $event.payload.name
+        qty: $event.payload.qty
+        plan_name: $event.payload.plan_name
+        interval_months: $event.payload.plan_interval_months
+        unit_price: $event.payload.unit_price
+        next_run_at: "$now"
+        created_at: $now
+        if: "$event.payload.purchase_mode == 'subscription'"
+      - action: db.insert
+        table: subscriptions
+        sync: true
+        if: "$event.payload.purchase_mode == 'subscription'"
+      # Prune plan helpers now that the subscription row carries what it needs
+      - action: unset
+        fields: "plan_name plan_interval_months plan_percent_off unit_price next_run_at_epoch plan_created_at"
+        if: "$event.payload.purchase_mode == 'subscription'"
       # …and atomically decrement the right stock counter (floor 0)
       - action: db.adjust
         table: product_variants
@@ -510,19 +635,77 @@ routes:
       - action: assert
         condition: "$event.payload.subtotal > 0"
         message: "cannot place an order with no items (subtotal = $event.payload.subtotal)"
-      # Flat shipping rate for the country ("*" zone row = default); missing
-      # zone → free shipping (0). Tax: percentage rule for the country;
-      # missing rule → 0% tax.
+      # Stamp the shopper's email onto any subscription rows this order just
+      # created (ADD_ORDER_ITEM inserts them with email='pending' because the
+      # address arrives with PLACE_ORDER, not the line items). The sweep
+      # enriches any leftovers from their originating order row.
+      - action: set
+        email: $event.payload.email
+        status: active
+        order_ref: $event.payload.order_id
+      - action: db.update
+        table: subscriptions
+        where: "order_ref = '$event.payload.order_id'"
+      # Flat shipping rate — precedence (most specific wins):
+      #   1. city row      "CA-ON-KINGSTON"  (city_key, configured big cities)
+      #   2. province row  "CA-ON"           (region — everyone else in ON)
+      #   3. country row   "US" / "CA"
+      #   4. "*" default
+      # db.sum writes 0 when no row matches, so each fallback fires only
+      # while shipping_cost is still 0. Unlisted cities → province rate
+      # automatically; unlisted provinces → country → default.
+      # NOTE: the accumulator fields must EXIST before the fallback chain —
+      # an if-guard comparing a missing field to 0 evaluates false and would
+      # skip every fallback (shipping silently free).
+      - action: math.calc
+        set: shipping_cost
+        expr: "0"
+      - action: math.calc
+        set: tax_rate
+        expr: "0"
+      - action: db.sum
+        table: shipping_zones
+        column: rate
+        where: "country = '$event.payload.city_key'"
+        as: shipping_cost
+        if: "$event.payload.city_key != ''"
+      - action: db.sum
+        table: shipping_zones
+        column: rate
+        where: "country = '$event.payload.region'"
+        as: shipping_cost
+        if: "$event.payload.shipping_cost == 0"
       - action: db.sum
         table: shipping_zones
         column: rate
         where: "country = '$event.payload.country'"
         as: shipping_cost
+        if: "$event.payload.shipping_cost == 0"
+      - action: db.sum
+        table: shipping_zones
+        column: rate
+        where: "country = '*'"
+        as: shipping_cost
+        if: "$event.payload.shipping_cost == 0"
+      # Tax rate — same precedence: region rule → country rule → default.
+      - action: db.sum
+        table: tax_rules
+        column: rate
+        where: "country = '$event.payload.region'"
+        as: tax_rate
+        if: "$event.payload.region != ''"
       - action: db.sum
         table: tax_rules
         column: rate
         where: "country = '$event.payload.country'"
         as: tax_rate
+        if: "$event.payload.tax_rate == 0"
+      - action: db.sum
+        table: tax_rules
+        column: rate
+        where: "country = '*'"
+        as: tax_rate
+        if: "$event.payload.tax_rate == 0"
       # Coupon guard chain — re-verified against the coupons table. The
       # DISCOUNT DOLLARS are computed here server-side (never client-claimed).
       - action: db.lookup
@@ -535,10 +718,11 @@ routes:
         condition: "$event.payload.coupon_active == true"
         message: "coupon '$event.payload.coupon_code' is not active"
         if: "$event.payload.coupon_code exists"
-      # Server-side tax = subtotal × rate%
+      # Server-side tax = (subtotal + shipping) × rate% — Canadian sales
+      # taxes apply to shipping charges too, so the taxable base includes it.
       - action: math.calc
         set: tax_amount
-        expr: "$event.payload.subtotal * $event.payload.tax_rate / 100"
+        expr: "($event.payload.subtotal + $event.payload.shipping_cost) * $event.payload.tax_rate / 100"
       # Server-side discount = subtotal × coupon% — replaces the client claim
       - action: math.calc
         set: coupon_discount
@@ -814,6 +998,157 @@ routes:
       - action: log.write
         message: "Tax rule saved: $event.payload.country → $event.payload.rate%"
     emit: TAX_RULE_SAVED
+
+  # ── Subscriptions ─────────────────────────────────────────────────
+  # Admin creates/updates a selling plan (upsert by name). Plans are reusable
+  # across products: "Monthly refill — every 1 month — 10% off". The product
+  # sheet attaches plan ids; checkout prices a subscription line as
+  # price × (1 − percent_off/100) computed SERVER-SIDE.
+  - on: SAVE_SUBSCRIPTION_PLAN
+    steps:
+      - action: assert
+        condition: "$event.payload.interval_months >= 1"
+        message: "interval must be at least 1 month"
+      - action: set
+        id: $uuid
+        created_at: $now
+      - action: db.upsert
+        table: subscription_plans
+        key: name
+      - action: log.write
+        message: "Subscription plan saved: '$event.payload.name' every $event.payload.interval_months month(s) at $event.payload.percent_off% off"
+    emit: SUBSCRIPTION_PLAN_SAVED
+
+  # Admin pauses / resumes / cancels / reactivates a shopper's subscription.
+  # Cancelled is terminal; paused keeps next_run_at frozen until resume,
+  # which pushes the next charge a full interval into the future.
+  - on: TOGGLE_SUBSCRIPTION
+    if: "$event.payload.action != 'cancel'"
+    steps:
+      # Interval months resolved per subscription: look up its row first so
+      # pause/resume can roll next_run_at correctly.
+      - action: db.lookup
+        table: subscriptions
+        key_column: id
+        value_expr: $event.payload.id
+        as: sub_
+      - action: math.calc
+        set: next_run_at_epoch
+        expr: "$now_epoch + $event.payload.sub_interval_months * 2592000"
+      - action: set
+        updated_at: $now
+        if: "$event.payload.action == 'pause'"
+      - action: set
+        status: paused
+        if: "$event.payload.action == 'pause'"
+      - action: set
+        status: active
+        next_run_at: "$now"
+        if: "$event.payload.action != 'pause'"
+      - action: set
+        next_run_at: "$now"
+        if: "$event.payload.action == 'resume'"
+      - action: db.update
+        table: subscriptions
+        where: "id = '$event.payload.id'"
+      - action: log.write
+        message: "Subscription $event.payload.id → $event.payload.status (by admin)"
+    emit: SUBSCRIPTION_UPDATED
+
+  # Cancel is terminal — separate route so the if-guard stays simple.
+  - on: TOGGLE_SUBSCRIPTION
+    if: "$event.payload.action == 'cancel'"
+    steps:
+      - action: set
+        status: cancelled
+        cancelled_at: $now
+        updated_at: $now
+      - action: db.update
+        table: subscriptions
+        where: "id = '$event.payload.id'"
+      - action: email.send
+        to: $event.payload.sub_email
+        subject: "Your subscription has been cancelled"
+        body: "Your subscription ($event.payload.plan_name) will not renew again."
+        optional: true
+        on_failure: EMAIL_FAILED
+      - action: log.write
+        message: "Subscription $event.payload.id cancelled (by admin)"
+    emit: SUBSCRIPTION_UPDATED
+
+  # Recurring engine — cron fires the sweep hourly; subscriptions.sweep
+  # (engine Go action) rolls next_run_at forward for every due row and emits
+  # SUBSCRIPTION_RENEWAL per subscriber. Renewals place a repeat order
+  # directly (bypassing carts): fresh order id, one order_item, then the
+  # normal PLACE_ORDER pricing chain recomputes totals server-side.
+  - on: SUBSCRIPTIONS_DUE
+    cron: 3600s
+    steps:
+      - action: subscriptions.sweep
+    emit: SUBSCRIPTIONS_RENEWED
+
+  # One renewal = a new pending order + its line, priced from the stored
+  # subscription facts (never re-trusted from an external caller beyond the
+  # engine's own sweep emission).
+  - on: SUBSCRIPTION_RENEWAL
+    on_failure: CHECKOUT_FAILED
+    steps:
+      - action: set
+        id: $event.payload.order_id
+        status: pending
+        created_at: $now
+        coupon_discount: 0
+        email: $event.payload.email
+        ship_name: ""
+        address1: ""
+        city: ""
+        country: ""
+      - action: db.insert
+        table: orders
+        sync: true
+      - action: math.calc
+        set: line_total
+        expr: "$event.payload.price * $event.payload.qty"
+      - action: set
+        name: $event.payload.name
+        price: $event.payload.price
+        qty: $event.payload.qty
+        product_id: $event.payload.product_id
+        variant_id: $event.payload.variant_id
+        purchase_mode: subscription
+        plan_id: $event.payload.id
+      - action: unset
+        fields: "interval_months scheduled_at _cron id_status order_row"
+      - action: db.insert
+        table: order_items
+        sync: true
+      - action: math.calc
+        set: subtotal
+        expr: "$event.payload.line_total"
+      - action: db.sum
+        table: shipping_zones
+        column: rate
+        where: "country = '*'"
+        as: shipping_cost
+      - action: db.sum
+        table: tax_rules
+        column: rate
+        where: "country = '*'"
+        as: tax_rate
+      - action: math.calc
+        set: tax_amount
+        expr: "($event.payload.subtotal + $event.payload.shipping_cost) * $event.payload.tax_rate / 100"
+      - action: math.calc
+        set: total
+        expr: "$event.payload.subtotal + $event.payload.shipping_cost + $event.payload.tax_amount"
+      - action: unset
+        fields: "tax_rate"
+      - action: db.update
+        table: orders
+        where: "id = '$event.payload.order_id'"
+      - action: log.write
+        message: "Subscription renewed: $event.payload.name × $event.payload.qty for $event.payload.email — order $event.payload.order_id ($event.payload.total)"
+    emit: ORDER_CREATED
 
   # Failure handler — alert log entry when checkout breaks
   - on: CHECKOUT_FAILED

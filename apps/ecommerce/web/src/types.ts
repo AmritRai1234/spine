@@ -14,6 +14,11 @@ export interface Product {
   /** Additional images. Stored as a JSON column; may come back as a JSON
    * string (queryTable) or an array (in-memory). Use parseGallery(). */
   gallery?: string[] | string
+  /** Purchase-mode switches (schema-evolved columns; absent on old rows). */
+  sell_onetime?: number | boolean
+  sell_subscription?: number | boolean
+  /** JSON array of subscription_plans ids attached to this product. */
+  plan_ids?: string | string[]
 }
 
 export interface ProductVariantRow {
@@ -40,6 +45,10 @@ export interface CartItemRow {
   // Variants (optional — plain products carry no variant)
   variant_id?: string
   variant_label?: string
+  // Purchase mode: "onetime" (default) or "subscription" + attached plan
+  purchase_mode?: string
+  plan_id?: string
+  plan_name?: string
 }
 
 export interface OrderRow {

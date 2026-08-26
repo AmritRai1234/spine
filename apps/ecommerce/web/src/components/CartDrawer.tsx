@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react"
-import { Minus, Plus, ShoppingCart, Trash2 } from "lucide-react"
+import { Minus, Plus, Repeat, ShoppingCart, Trash2 } from "lucide-react"
 
 import { Button } from "@/components/ui/button"
 import {
@@ -55,6 +55,7 @@ export default function CartDrawer({ open, onOpenChange, onCheckout }: CartDrawe
       cart_id: cartId,
       product_id: item.product_id,
       variant_id: item.variant_id ?? "",
+      purchase_mode: item.purchase_mode ?? "onetime",
       qty,
     })
   }
@@ -64,6 +65,7 @@ export default function CartDrawer({ open, onOpenChange, onCheckout }: CartDrawe
       cart_id: cartId,
       product_id: item.product_id,
       variant_id: item.variant_id ?? "",
+      purchase_mode: item.purchase_mode ?? "onetime",
     })
   }
 
@@ -97,6 +99,11 @@ export default function CartDrawer({ open, onOpenChange, onCheckout }: CartDrawe
                   <p className="truncate text-sm font-medium">{item.name}</p>
                   {item.variant_label && (
                     <p className="text-xs text-muted-foreground">{item.variant_label}</p>
+                  )}
+                  {item.purchase_mode === "subscription" && item.plan_name && (
+                    <p className="flex items-center gap-1 text-xs font-medium text-emerald-600 dark:text-emerald-400">
+                      <Repeat className="h-3 w-3" /> {item.plan_name} — subscription
+                    </p>
                   )}
                   <p className="text-xs text-muted-foreground">{money(Number(item.price))} each</p>
                 </div>

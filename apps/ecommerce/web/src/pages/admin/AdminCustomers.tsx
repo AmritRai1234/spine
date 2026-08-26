@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useMemo, useState } from "react"
-import { ChevronRight, Download } from "lucide-react"
+import { ChevronRight, Download, Users } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
+import EmptyState from "@/components/EmptyState"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { Skeleton } from "@/components/ui/skeleton"
 import { useSpineStateTick } from "@/hooks/use-spine"
@@ -121,6 +122,15 @@ export default function AdminCustomers() {
           <Download className="mr-1 h-4 w-4" /> CSV
         </Button>
       </div>
+      {customers.length === 0 ? (
+        <EmptyState
+          icon={Users}
+          title="Your customers will show here"
+          description="Customers are derived automatically from order emails — every checkout adds one. No manual entry needed."
+          actionLabel="View storefront"
+          onAction={() => window.open("/", "_blank")}
+        />
+      ) : (
       <Card>
         <CardContent className="pt-6">
           <table className="w-full text-sm">
@@ -154,6 +164,7 @@ export default function AdminCustomers() {
           </table>
         </CardContent>
       </Card>
+      )}
 
       {/* Customer drill-down */}
       <Sheet open={!!drillDown} onOpenChange={(o) => !o && setDrillDown(null)}>

@@ -1,9 +1,10 @@
 import { useCallback, useEffect, useState, type FormEvent } from "react"
-import { Ban, ChevronDown, ChevronLeft, ChevronRight, Download, Eye, HandCoins } from "lucide-react"
+import { Ban, ChevronDown, ChevronLeft, ChevronRight, Download, Eye, HandCoins, ShoppingCart } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
+import EmptyState from "@/components/EmptyState"
 import { Input } from "@/components/ui/input"
 import {
   DropdownMenu,
@@ -240,6 +241,15 @@ export default function AdminOrders() {
 
       {!orders ? (
         <Skeleton className="h-96" />
+      ) : orders.length === 0 ? (
+        <EmptyState
+          icon={ShoppingCart}
+          title={`Your ${filter === "all" ? "" : filter + " "}orders will show here`}
+          description="Once customers check out, their orders appear here with payments, fulfilment status, and refunds. Create a test order from the storefront to see the flow end-to-end."
+          actionLabel="View storefront"
+          onAction={() => window.open("/", "_blank")}
+          hint="Orders arrive in real time over WebSocket — no refresh needed."
+        />
       ) : (
         <Card>
           <CardContent className="pt-6">

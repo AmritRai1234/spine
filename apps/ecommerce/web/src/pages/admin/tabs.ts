@@ -1,9 +1,11 @@
 export type AdminTab =
   | "dashboard"
   | "products"
+  | "inventory"
   | "orders"
   | "customers"
   | "marketing"
+  | "subscriptions"
   | "analytics"
   | "events"
   | "settings"

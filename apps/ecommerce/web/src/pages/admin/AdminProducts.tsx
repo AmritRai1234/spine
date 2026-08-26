@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react"
-import { ArrowUpDown, Boxes, MoreHorizontal, Pencil, Plus, Search, Trash2 } from "lucide-react"
+import { ArrowUpDown, Boxes, Download, MoreHorizontal, Pencil, Plus, Search, Trash2 } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -33,11 +33,21 @@ type SortKey = "name" | "price" | "stock" | "sku"
 const EMPTY_FORM = {
   sku: "", name: "", price: "", stock: "", category: "", description: "", image_url: "",
   gallery: [] as string[],
+  sell_onetime: true,
+  sell_subscription: false,
+  plan_ids: [] as string[],
 }
 
 const EMPTY_VARIANT_FORM = {
   sku: "", option1_name: "Size", option1_value: "", option2_name: "", option2_value: "",
   price: "", stock: "",
+}
+
+interface PlanRow {
+  id: string
+  name: string
+  interval_months: number
+  percent_off: number
 }
 
 export default function AdminProducts() {
@@ -148,6 +158,40 @@ export default function AdminProducts() {
 
       {!products ? (
         <Skeleton className="h-96" />
+      ) : products.length === 0 ? (
+        <Card>
+          <CardContent className="space-y-0 px-0 py-0">
+            {/* Primary empty card — "Add your products" (Shopify-style) */}
+            <div className="border-b px-6 py-10">
+              <h3 className="text-xl font-semibold tracking-tight">Add your products</h3>
+              <p className="mt-1 max-w-lg text-sm text-muted-foreground">
+                Start by stocking your store with products your customers will love.
+              </p>
+              <div className="mt-5 flex flex-wrap gap-2">
+                <Button onClick={() => { setEditing(null); setFormOpen(true) }}>
+                  <Plus className="mr-1 h-4 w-4" /> Add product
+                </Button>
+                <Button
+                  variant="outline"
+                  onClick={() => toast.info("CSV import: export the catalog first (header row: sku,name,price,stock,description,category), fill your rows, then re-import via the seed script.")}
+                >
+                  <Download className="mr-1 h-4 w-4" /> Import
+                </Button>
+              </div>
+            </div>
+            {/* Secondary card — sourcing suggestion */}
+            <div className="px-6 py-8">
+              <h4 className="text-base font-semibold tracking-tight">Find products to sell</h4>
+              <p className="mt-1 max-w-xl text-sm leading-relaxed text-muted-foreground">
+                Source from wholesalers or print-on-demand suppliers and have orders shipped directly
+                to your customer — you only pay for what you sell.
+              </p>
+              <Button variant="outline" size="sm" className="mt-4" onClick={() => toast.info("Sourcing integrations coming soon — for now, add supplier products manually.")}>
+                Discover products to sell
+              </Button>
+            </div>
+          </CardContent>
+        </Card>
       ) : (
         <Card>
           <CardContent className="pt-6">
@@ -272,6 +316,9 @@ function ProductSheet({
         stock: String(product.stock), category: product.category ?? "",
         description: product.description ?? "", image_url: product.image_url ?? "",
         gallery: parseGallery(product.gallery),
+        sell_onetime: product.sell_onetime !== 0 && product.sell_onetime !== false,
+        sell_subscription: product.sell_subscription === 1 || product.sell_subscription === true,
+        plan_ids: parsePlanIds(product.plan_ids),
       } : EMPTY_FORM)
     }
   }, [open, product])
@@ -292,6 +339,9 @@ function ProductSheet({
         image_url: form.image_url.trim(),
         category: form.category.trim(),
         gallery: form.gallery,
+        sell_onetime: form.sell_onetime ? 1 : 0,
+        sell_subscription: form.sell_subscription ? 1 : 0,
+        plan_ids: form.plan_ids,
       })
       if (res.status === "ok") {
         toast.success(product ? `Updated ${form.name}` : `Published ${form.name}`)
@@ -369,6 +419,46 @@ function ProductSheet({
               className="border-input placeholder:text-muted-foreground focus-visible:border-ring focus-visible:ring-ring/50 flex w-full rounded-md border bg-transparent px-3 py-2 text-sm shadow-xs focus-visible:ring-[3px] focus-visible:outline-none"
             />
           </Field>
+
+          {/* ── Purchase modes ─────────────────────────────────── */}
+          <div className="space-y-2 rounded-md border p-3">
+            <span className="block text-sm font-medium">Ways to buy</span>
+            <label className="flex items-start gap-2.5">
+              <input
+                type="checkbox"
+                checked={form.sell_onetime}
+                onChange={(e) => setForm({ ...form, sell_onetime: e.target.checked })}
+                className="mt-0.5 h-4 w-4"
+              />
+              <span className="text-sm">
+                One-time purchase
+                <span className="block text-xs text-muted-foreground">Customer buys once at the list price.</span>
+              </span>
+            </label>
+            <label className="flex items-start gap-2.5">
+              <input
+                type="checkbox"
+                checked={form.sell_subscription}
+                onChange={(e) => setForm({ ...form, sell_subscription: e.target.checked })}
+                className="mt-0.5 h-4 w-4"
+              />
+              <span className="text-sm">
+                Subscribe &amp; save
+                <span className="block text-xs text-muted-foreground">Customer is charged on a repeating schedule from an attached plan.</span>
+              </span>
+            </label>
+
+            {form.sell_subscription && (
+              <PlanAttach
+                selected={form.plan_ids}
+                onChange={(plan_ids) => setForm({ ...form, plan_ids })}
+              />
+            )}
+            {!form.sell_onetime && !form.sell_subscription && (
+              <p className="text-xs text-destructive">At least one way to buy must be enabled.</p>
+            )}
+          </div>
+
           <SheetFooter className="px-0 pt-2">
             <Button type="submit" disabled={busy} className="w-full">
               {product ? "Save changes" : "Publish product"}
@@ -521,5 +611,81 @@ function VariantSheet({
         </div>
       </SheetContent>
     </Sheet>
+  )
+}
+
+/** parsePlanIds decodes the JSON plan_ids column into an array of plan ids. */
+function parsePlanIds(raw: string | string[] | undefined): string[] {
+  if (!raw) return []
+  if (Array.isArray(raw)) return raw.map(String)
+  try {
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.map(String) : []
+  } catch {
+    // tolerate a bare comma/space-separated list
+    return raw.split(/[,\s]+/).filter(Boolean)
+  }
+}
+
+/**
+ * PlanAttach — pick which selling plans (subscription_plans rows) apply to
+ * this product. Plans are managed on the Subscriptions page; a hint links
+ * there when none exist yet.
+ */
+function PlanAttach({
+  selected,
+  onChange,
+}: {
+  selected: string[]
+  onChange: (ids: string[]) => void
+}) {
+  const [plans, setPlans] = useState<PlanRow[] | null>(null)
+
+  useEffect(() => {
+    ;(async () => {
+      try {
+        const res = await adminClient().queryTable("subscription_plans", { limit: 100 })
+        setPlans((res.rows ?? []) as unknown as PlanRow[])
+      } catch {
+        setPlans([])
+      }
+    })()
+  }, [])
+
+  function toggle(id: string) {
+    onChange(
+      selected.includes(id) ? selected.filter((p) => p !== id) : [...selected, id]
+    )
+  }
+
+  if (plans === null) return <Skeleton className="h-16" />
+  if (plans.length === 0) {
+    return (
+      <p className="rounded-md border border-dashed p-2 text-xs text-muted-foreground">
+        No selling plans yet — create one under <strong>Subscriptions</strong> first.
+      </p>
+    )
+  }
+
+  const intervalLabel = (m: number) => (m === 1 ? "monthly" : `every ${m} mo`)
+  return (
+    <div className="space-y-1.5">
+      <span className="block text-xs text-muted-foreground">Attached plans</span>
+      {plans.map((p) => (
+        <label key={p.id} className="flex items-center gap-2 text-sm">
+          <input
+            type="checkbox"
+            checked={selected.includes(p.id)}
+            onChange={() => toggle(p.id)}
+            className="h-4 w-4"
+          />
+          {p.name}
+          <span className="text-xs text-muted-foreground">
+            ({intervalLabel(Number(p.interval_months))}
+            {Number(p.percent_off) > 0 ? `, ${Number(p.percent_off)}% off` : ""})
+          </span>
+        </label>
+      ))}
+    </div>
   )
 }

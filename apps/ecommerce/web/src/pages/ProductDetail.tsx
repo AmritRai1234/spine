@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react"
-import { ArrowLeft, Minus, Plus, ShoppingCart } from "lucide-react"
+import { ArrowLeft, Minus, Plus, Repeat, ShoppingCart } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -18,6 +18,25 @@ interface ProductDetailProps {
   onAddToCart: (p: Product) => void
 }
 
+interface PlanRow {
+  id: string
+  name: string
+  interval_months: number
+  percent_off: number
+}
+
+/** Decode the product's JSON plan_ids column. */
+function parsePlanIds(raw: string | string[] | undefined): string[] {
+  if (!raw) return []
+  if (Array.isArray(raw)) return raw.map(String)
+  try {
+    const parsed = JSON.parse(raw)
+    return Array.isArray(parsed) ? parsed.map(String) : []
+  } catch {
+    return raw.split(/[,\s]+/).filter(Boolean)
+  }
+}
+
 /**
  * Full product view — live stock via PRODUCT_PUBLISHED / STOCK_ADJUSTED
  * broadcasts, quantity picker, add-to-cart. When the product has variants
@@ -30,6 +49,10 @@ export default function ProductDetail({ productId, onBack, onAddToCart }: Produc
   const [selectedVariantId, setSelectedVariantId] = useState<string | null>(null)
   const [qty, setQty] = useState(1)
   const [imgIndex, setImgIndex] = useState(0)
+  // Purchase mode: "onetime" or "subscription" (plan index into productPlans)
+  const [mode, setMode] = useState<"onetime" | "subscription">("onetime")
+  const [selectedPlanId, setSelectedPlanId] = useState<string | null>(null)
+  const [plans, setPlans] = useState<PlanRow[]>([])
 
   const pubTick = useSpineStateTick("PRODUCT_PUBLISHED")
   const stockTick = useSpineStateTick("STOCK_ADJUSTED")
@@ -70,6 +93,25 @@ export default function ProductDetail({ productId, onBack, onAddToCart }: Produc
       }
     })()
   }, [productId, variantTick, stockTick])
+
+  // Load selling plans attached to this product (subscription mode).
+  useEffect(() => {
+    if (!product || !(product.sell_subscription === 1 || product.sell_subscription === true)) return
+    const ids = parsePlanIds(product.plan_ids)
+    if (ids.length === 0) return
+    ;(async () => {
+      try {
+        const res = await spine.queryTable("subscription_plans", { limit: 100 })
+        const rows = ((res.rows ?? []) as unknown as PlanRow[]).filter((p) =>
+          ids.includes(String(p.id))
+        )
+        setPlans(rows)
+        setSelectedPlanId((cur) => (cur && rows.some((p) => p.id === cur) ? cur : rows[0]?.id ?? null))
+      } catch {
+        setPlans([])
+      }
+    })()
+  }, [product])
 
   const selectedVariant = useMemo(
     () => variants.find((v) => v.id === selectedVariantId) ?? null,
@@ -115,29 +157,46 @@ export default function ProductDetail({ productId, onBack, onAddToCart }: Produc
   }
 
   // Displayed price/stock come from the selected variant when one exists
-  const price = hasVariants && selectedVariant ? Number(selectedVariant.price) : Number(product.price)
+  const basePrice = hasVariants && selectedVariant ? Number(selectedVariant.price) : Number(product.price)
   const stock = hasVariants && selectedVariant ? Number(selectedVariant.stock) : Number(product.stock)
   const inStock = stock > 0
   const variantLabel = selectedVariant
     ? [selectedVariant.option1_value, selectedVariant.option2_value].filter(Boolean).join(" / ")
     : ""
 
+  const subEnabled = product.sell_subscription === 1 || product.sell_subscription === true
+  const oneTimeEnabled = product.sell_onetime !== 0 && product.sell_onetime !== false
+  const selectedPlan = plans.find((p) => p.id === selectedPlanId) ?? null
+  // Effective unit price: plan discount applied client-side for DISPLAY only —
+  // the server re-derives it from the plan row at checkout.
+  const effPrice =
+    mode === "subscription" && selectedPlan
+      ? basePrice * (1 - Number(selectedPlan.percent_off) / 100)
+      : basePrice
+
   async function addToCart() {
+    if (!oneTimeEnabled && !subEnabled) return
+    if (mode === "subscription" && !selectedPlan) return
     const res = await spine.emit("ADD_TO_CART", {
       cart_id: getCartId(),
       product_id: product!.id,
       variant_id: selectedVariant?.id ?? "",
       variant_label: variantLabel,
       name: product!.name,
-      price,
+      price: effPrice,
       qty,
+      purchase_mode: mode,
+      ...(mode === "subscription" && selectedPlan
+        ? { plan_id: String(selectedPlan.id), plan_name: selectedPlan.name }
+        : {}),
     })
     if (res.status !== "ok") {
       toast.error(res.error ?? "Could not add to cart")
       return
     }
     onAddToCart(product!)
-    toast.success(`${qty} × ${product!.name}${variantLabel ? ` (${variantLabel})` : ""} added to cart`)
+    const suffix = mode === "subscription" && selectedPlan ? ` (${selectedPlan.name})` : ""
+    toast.success(`${qty} × ${product!.name}${variantLabel ? ` (${variantLabel})` : ""}${suffix} added to cart`)
   }
 
   return (
@@ -192,11 +251,80 @@ export default function ProductDetail({ productId, onBack, onAddToCart }: Produc
           </div>
 
           <div className="flex items-center gap-3">
-            <span className="text-3xl font-bold">{money(price)}</span>
+            <span className="text-3xl font-bold">{money(effPrice)}</span>
+            {mode === "subscription" && selectedPlan && Number(selectedPlan.percent_off) > 0 && (
+              <>
+                <span className="text-lg text-muted-foreground line-through">{money(basePrice)}</span>
+                <Badge variant="secondary">Save {Number(selectedPlan.percent_off)}%</Badge>
+              </>
+            )}
             <Badge variant={inStock ? "secondary" : "destructive"}>
               {inStock ? `${stock} in stock` : "out of stock"}
             </Badge>
           </div>
+
+          {/* ── Purchase-mode picker ───────────────────────────── */}
+          {(oneTimeEnabled || (subEnabled && plans.length > 0)) && (
+            <div className="space-y-2">
+              {oneTimeEnabled && (
+                <button
+                  type="button"
+                  onClick={() => setMode("onetime")}
+                  className={`flex w-full items-center justify-between rounded-md border px-4 py-3 text-left text-sm transition-colors ${
+                    mode === "onetime" ? "border-primary bg-primary/5 ring-1 ring-primary" : "hover:bg-muted"
+                  }`}
+                >
+                  <span className="font-medium">One-time purchase</span>
+                  <span className="tabular-nums">{money(basePrice)}</span>
+                </button>
+              )}
+              {subEnabled && plans.length > 0 && (
+                <div
+                  className={`rounded-md border px-4 py-3 transition-colors ${
+                    mode === "subscription" ? "border-primary bg-primary/5 ring-1 ring-primary" : ""
+                  }`}
+                >
+                  <button
+                    type="button"
+                    onClick={() => setMode("subscription")}
+                    className="flex w-full items-center justify-between text-left text-sm"
+                  >
+                    <span className="flex items-center gap-1.5 font-medium">
+                      <Repeat className="h-3.5 w-3.5" /> Subscribe &amp; save
+                    </span>
+                    <span className="tabular-nums">from {money(Math.min(...plans.map((p) => basePrice * (1 - Number(p.percent_off) / 100))))}</span>
+                  </button>
+                  {mode === "subscription" && (
+                    <div className="mt-2 space-y-1 border-t pt-2">
+                      {plans.map((p) => (
+                        <label key={p.id} className="flex cursor-pointer items-center gap-2 text-sm">
+                          <input
+                            type="radio"
+                            name="plan"
+                            checked={selectedPlanId === p.id}
+                            onChange={() => setSelectedPlanId(p.id)}
+                            className="h-3.5 w-3.5"
+                          />
+                          {p.name}
+                          <span className="text-xs text-muted-foreground">
+                            every {p.interval_months === 1 ? "month" : `${p.interval_months} months`}
+                          </span>
+                          {Number(p.percent_off) > 0 && (
+                            <span className="ml-auto tabular-nums">
+                              {money(basePrice * (1 - Number(p.percent_off) / 100))}
+                              <span className="ml-1 text-xs text-emerald-600 dark:text-emerald-400">
+                                −{Number(p.percent_off)}%
+                              </span>
+                            </span>
+                          )}
+                        </label>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
 
           {hasVariants && (
             <div className="space-y-3">
@@ -271,7 +399,7 @@ export default function ProductDetail({ productId, onBack, onAddToCart }: Produc
             </div>
             <Button className="flex-1" disabled={!inStock} onClick={addToCart}>
               <ShoppingCart className="mr-2 h-4 w-4" />
-              Add to cart — {money(price * qty)}
+              {mode === "subscription" ? "Subscribe" : "Add to cart"} — {money(effPrice * qty)}
             </Button>
           </div>
         </div>

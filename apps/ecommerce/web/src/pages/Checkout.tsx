@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useState, type FormEvent } from "react"
-import { BadgeCheck, CheckCircle2, CreditCard, Loader2, PackageSearch, XCircle } from "lucide-react"
+import { BadgeCheck, CheckCircle2, CreditCard, Loader2, MapPin, PackageSearch, XCircle } from "lucide-react"
 
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -13,6 +13,8 @@ import {
 import { Input } from "@/components/ui/input"
 import { useSpineStateTick } from "@/hooks/use-spine"
 import { spine } from "@/lib/spine"
+import { CA_PROVINCES } from "@/lib/canada"
+import { cityKeyFor, matchCity } from "@/lib/canada-cities"
 import { getCartId } from "@/lib/cart"
 import { money } from "@/lib/format"
 import type { CartItemRow, OrderRow } from "@/types"
@@ -41,6 +43,8 @@ export default function Checkout({ onTrackOrders }: CheckoutProps) {
   const [address1, setAddress1] = useState("")
   const [city, setCity] = useState("")
   const [country, setCountry] = useState("")
+  const [province, setProvince] = useState("")
+  const [cityMatched, setCityMatched] = useState(false)
   const [zip, setZip] = useState("")
   const [phase, setPhase] = useState<Phase>("form")
   const [order, setOrder] = useState<OrderRow | null>(null)
@@ -87,16 +91,29 @@ export default function Checkout({ onTrackOrders }: CheckoutProps) {
     let cancelled = false
     ;(async () => {
       try {
-        const [z, t] = await Promise.all([
-          spine.queryTable("shipping_zones", { where: `country:${c}`, limit: 1 }),
-          spine.queryTable("tax_rules", { where: `country:${c}`, limit: 1 }),
+        // Mirror the server's lookup precedence exactly:
+        //   region row (CA-XX) → country row → "*" default.
+        // The "*" row keeps a default shipping price available even when no
+        // country/province rule was configured — matching PLACE_ORDER.
+        const base = c === "CA" && province ? `CA-${province}` : ""
+        const regions = [base, c, "*"].filter(Boolean)
+        const [zRes, tRes] = await Promise.all([
+          spine.queryTable("shipping_zones", { limit: 500 }),
+          spine.queryTable("tax_rules", { limit: 500 }),
         ])
         if (cancelled) return
-        const zoneRows = (z.rows ?? []) as unknown as { rate?: number }[]
-        const taxRows = (t.rows ?? []) as unknown as { rate?: number }[]
+        const zoneRows = (zRes.rows ?? []) as unknown as { country?: string; rate?: number }[]
+        const taxRows = (tRes.rows ?? []) as unknown as { country?: string; rate?: number }[]
+        const findRate = (rows: { country?: string; rate?: number }[]) => {
+          for (const r of regions) {
+            const hit = rows.find((row) => String(row.country ?? "") === r)
+            if (hit) return Number(hit.rate ?? 0)
+          }
+          return 0
+        }
         setEstimate({
-          shipping: Number(zoneRows[0]?.rate ?? 0),
-          taxRate: Number(taxRows[0]?.rate ?? 0),
+          shipping: findRate(zoneRows),
+          taxRate: findRate(taxRows),
         })
       } catch {
         /* keep previous estimate */
@@ -105,7 +122,7 @@ export default function Checkout({ onTrackOrders }: CheckoutProps) {
     return () => {
       cancelled = true
     }
-  }, [country])
+  }, [country, province])
 
   // Coupon results arrive as COUPON_VALIDATED / COUPON_REJECTED broadcasts,
   // keyed by cart_id so concurrent shoppers don't cross wires.
@@ -152,7 +169,8 @@ export default function Checkout({ onTrackOrders }: CheckoutProps) {
   )
   const discount = appliedCoupon ? (subtotal * appliedCoupon.percentOff) / 100 : 0
   const shippingEst = estimate?.shipping ?? 0
-  const taxEst = (subtotal * (estimate?.taxRate ?? 0)) / 100
+  // Tax applies to goods + shipping (mirrors the server's PLACE_ORDER math).
+  const taxEst = ((subtotal + shippingEst) * (estimate?.taxRate ?? 0)) / 100
   // Pre-payment ESTIMATE only — the engine recomputes every dollar at
   // PLACE_ORDER and the confirmed view shows the authoritative total.
   const total = Math.max(0, subtotal - discount + shippingEst + taxEst)
@@ -192,6 +210,8 @@ export default function Checkout({ onTrackOrders }: CheckoutProps) {
         name: line.name,
         price: Number(line.price),
         qty: Number(line.qty),
+        purchase_mode: line.purchase_mode ?? "onetime",
+        plan_id: line.plan_id ?? "",
       })
       if (r.status !== "ok") {
         failed = true
@@ -215,6 +235,14 @@ export default function Checkout({ onTrackOrders }: CheckoutProps) {
       address1: address1.trim(),
       city: city.trim(),
       country: country.trim().toUpperCase(),
+      // Region code drives the shipping/tax lookup precedence (CA-ON → CA
+      // → *). Canadian provinces send CA-XX; everyone else sends the country
+      // (or "OTHER" which simply matches nothing and falls through).
+      region: country === "CA" && province ? `CA-${province}` : country.trim().toUpperCase(),
+      ...(country === "CA" && province ? { province: province.trim().toUpperCase() } : {}),
+      // City key gives city-tier shipping (CA-ON-KINGSTON) when the city is
+      // configured; unlisted cities send "" and fall back to province rate.
+      city_key: country === "CA" && province && city ? cityKeyFor(`CA-${province}`, city) : "",
       zip: zip.trim(),
       ...(appliedCoupon ? { coupon_code: appliedCoupon.code } : {}),
     })
@@ -229,6 +257,8 @@ export default function Checkout({ onTrackOrders }: CheckoutProps) {
       await spine.emit("REMOVE_FROM_CART", {
         cart_id: cartId,
         product_id: line.product_id,
+        variant_id: line.variant_id ?? "",
+        purchase_mode: line.purchase_mode ?? "onetime",
       })
     }
     setLines([])
@@ -326,9 +356,68 @@ export default function Checkout({ onTrackOrders }: CheckoutProps) {
             required
           />
           <div className="grid grid-cols-3 gap-3">
-            <Input placeholder="City" value={city} onChange={(e) => setCity(e.target.value)} required />
-            <Input placeholder="Country" value={country} onChange={(e) => setCountry(e.target.value)} required />
-            <Input placeholder="ZIP" value={zip} onChange={(e) => setZip(e.target.value)} required />
+            <Input placeholder="City" value={city} onChange={(e) => { setCity(e.target.value); setCityMatched(false) }} required />
+            <Input placeholder="ZIP / Postal code" value={zip} onChange={(e) => setZip(e.target.value)} required />
+          </div>
+          {country === "CA" && province && city && (
+            (() => {
+              const m = matchCity(`CA-${province}`, city)
+              if (!m) {
+                return (
+                  <p className="text-xs text-muted-foreground">
+                    {city} isn't in our city-rate list yet — you'll get the {CA_PROVINCES.find((p) => p.code === `CA-${province}`)?.name} rate.
+                  </p>
+                )
+              }
+              // Auto-select the matched city for exact-rate lookup
+              if (!cityMatched) setCityMatched(true)
+              return (
+                <p className="flex items-center gap-1.5 text-xs text-emerald-600 dark:text-emerald-400">
+                  <MapPin className="h-3.5 w-3.5" /> Local shipping rate available for {m.name}
+                </p>
+              )
+            })()
+          )}
+          <div className="grid grid-cols-2 gap-3">
+            <label className="space-y-1">
+              <span className="text-xs text-muted-foreground">Country</span>
+              <select
+                value={country}
+                onChange={(e) => { setCountry(e.target.value); setProvince("") }}
+                className="h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm"
+                required
+              >
+                <option value="" disabled>Select country…</option>
+                <option value="CA">Canada</option>
+                <option value="US">United States</option>
+                <option value="GB">United Kingdom</option>
+                <option value="AU">Australia</option>
+                <option value="DE">Germany</option>
+                <option value="OTHER">Other</option>
+              </select>
+            </label>
+            {country === "CA" && (
+              <label className="space-y-1">
+                <span className="text-xs text-muted-foreground">Province / territory</span>
+                <select
+                  value={province}
+                  onChange={(e) => setProvince(e.target.value)}
+                  className="h-9 w-full rounded-md border border-input bg-transparent px-2 text-sm"
+                  required
+                >
+                  <option value="" disabled>Select province…</option>
+                  {CA_PROVINCES.map((p) => (
+                    <option key={p.code} value={p.code.replace("CA-", "")}>{p.name}</option>
+                  ))}
+                </select>
+              </label>
+            )}
+            {country !== "CA" && country !== "" && (
+              <label className="space-y-1">
+                <span className="text-xs text-muted-foreground">State / region</span>
+                <Input value={province} onChange={(e) => setProvince(e.target.value)} placeholder="Optional" />
+              </label>
+            )}
           </div>
 
           {couponError && (
