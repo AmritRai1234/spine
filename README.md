@@ -354,6 +354,53 @@ ws.onmessage = (event) => {
 | `- action: email.send` | Delivers transactional mail over SMTP (dev-safe no-op without config) |
 | `- action: stripe.checkout` | Creates a Stripe Checkout Session from the verified order total |
 | `- cron: 5m` on a route | Fires the pipeline on schedule — digests, abandoned carts, cleanups |
+| `- action: db.fanout` | On a cron tick, scans a table and independently fires an event for every due row — recurring billing, renewals, reminders |
+
+### `db.fanout` — Timer-Driven Scan-and-Emit
+
+Where `- cron:` fires one route per tick, `db.fanout` turns one tick into **many independent events** — one per due row. This is the recurring-billing primitive: scan a table, fire an event for every row whose due date has passed.
+
+```yaml
+routes:
+  - on: BILLING_TICK
+    cron: 86400s
+    steps:
+      - action: db.fanout
+        table: subscriptions
+        where: "next_charge_date <= $now"
+        emit_event: SUBSCRIPTION_DUE
+        due_column: next_charge_date
+        interval_column: interval_months
+        batch_size: 1000          # optional, default 1000
+
+  # SUBSCRIPTION_DUE is an ordinary event — handle it like any other route.
+  - on: SUBSCRIPTION_DUE
+    steps:
+      - action: stripe.checkout     # or email.send, db.insert, http.post …
+    on_failure: CHARGE_FAILED      # business failure lives HERE, not in the fanout
+```
+
+**Step config:**
+
+| Key | Meaning |
+|---|---|
+| `table` | Table to scan (required) |
+| `where` | Single-column comparison gating the scan — `$now`, literals and event fields all resolve (required) |
+| `emit_event` | Event fired once per matching row; the full row arrives as `$event.payload` (required) |
+| `due_column` | Timestamp column rolled forward after firing (required) |
+| `interval_column` | Row's own cycle length in months — used to advance the due date (required) |
+| `batch_size` | Rows scanned per internal page (default 1000) |
+
+The step injects `fanned_out` (count of events fired this tick) into the route payload for dashboards/emit state.
+
+**Safety properties (all tested in `tests/features/fanout_test.go`):**
+
+1. **Idempotency.** Each emitted event carries a deterministic `_idempotency_key` = sha256(`table | rowid | stored due value`) fed into the durable `_spine_idem` claim protocol. Re-running the same scan — cron double-fire, crash mid-batch, server restart — is a no-op for already-processed rows. The key hashes only *stored* column values, never the dynamic `$now` used to find the row.
+2. **Advance-first ordering.** The due date is pushed forward by the row's interval BEFORE emission. The tempting alternative (advance only on downstream success) permanently blocks retry: a failed charge would leave the old due date, so the identical idempotency key would be claimed again next tick and never re-fire. Declined-card semantics belong to the downstream route's `on_failure`/`compensate` — the layer that knows what "declined" means. If the date-update itself fails, the row stays due and the next scan retries it.
+3. **Outage catch-up.** On resume after downtime, each overdue row's date rolls forward in monthly hops until strictly past now — so one missed month fires once, not once-per-missed-tick. No backlog stampede.
+4. **Batching.** Keyset pagination (`_spine_id > cursor ORDER BY _spine_id LIMIT n`) — stable under concurrent writes, O(1) memory from 500 rows to 500,000+. Overlapping scans are serialized by the cron worker's running-guard, and even a racing scan just hits idempotency claims instead of double-firing.
+
+`db.fanout` requires `spine_version: 3`. It generalizes the built-in `subscriptions.sweep` action, which remains as the zero-config special case for the ecommerce template's hardcoded subscription shape.
 
 ### Frontend with Vite + shadcn/ui (native template)
 
@@ -1102,7 +1149,7 @@ The `.spine` manifest parser includes production-grade hardening:
 |---|---|
 | `1` | Classic tier: all `db.*`, `set`/`unset`, `assert`, `math.calc`, `http.post`, `notify.webhook`, `log.write`, `fts.search`, `emit_to`, `queue.publish`, cron routes |
 | `2` | v1 + email marketing: `email.send`, `email.broadcast` |
-| `3` | v2 + money movement: `stripe.checkout` (Stripe Checkout Session creation) |
+| `3` | v2 + money movement: `stripe.checkout` (Stripe Checkout Session creation) + `db.fanout` (timer-driven scan-and-emit) |
 
 ```
 route 'SEND_MAIL', step 1: action 'email.send' requires 'spine_version: 2'

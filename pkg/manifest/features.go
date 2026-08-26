@@ -34,4 +34,9 @@ var actionMinVersion = map[string]int{
 
 	// Tier 3 — money movement: outbound Stripe API calls with a live secret.
 	"stripe.checkout": 3,
+
+	// Tier 3 — general-purpose scan-and-emit on a timer (recurring billing,
+	// renewals, reminders). Not money- or comms-specific, but it mutates rows
+	// and fires unbounded events per tick, so it joins the tier-3 adult table.
+	"db.fanout": 3,
 }

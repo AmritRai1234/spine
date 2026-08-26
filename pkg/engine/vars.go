@@ -4,6 +4,7 @@ import (
 	"crypto/rand"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -69,6 +70,7 @@ func resolvePath(data map[string]interface{}, path string) (interface{}, bool) {
 // - $event.name -> event name
 // - $env.KEY -> environment variable
 // - $event.payload[.path] -> field from payload
+// $now_epoch -> current UTC unix seconds (integer string)
 func ResolveVariables(input string, eventName string, payload map[string]interface{}) string {
 	if input == "" {
 		return ""
@@ -82,6 +84,9 @@ func ResolveVariables(input string, eventName string, payload map[string]interfa
 	// Exact string replacements for standalone tokens
 	if input == "$now" {
 		return time.Now().UTC().Format(time.RFC3339)
+	}
+	if input == "$now_epoch" {
+		return strconv.FormatInt(time.Now().UTC().Unix(), 10)
 	}
 	if input == "$uuid" {
 		return generateUUID()
@@ -109,6 +114,9 @@ func ResolveVariables(input string, eventName string, payload map[string]interfa
 			switch {
 			case token == "$now":
 				res.WriteString(time.Now().UTC().Format(time.RFC3339))
+				idx = end
+			case token == "$now_epoch":
+				res.WriteString(strconv.FormatInt(time.Now().UTC().Unix(), 10))
 				idx = end
 			case token == "$uuid":
 				res.WriteString(generateUUID())
@@ -161,7 +169,7 @@ func ResolveVariablesStrict(input string, eventName string, payload map[string]i
 		}
 		token := input[idx:end]
 		switch {
-		case token == "$now", token == "$uuid", token == "$event.name":
+		case token == "$now", token == "$now_epoch", token == "$uuid", token == "$event.name":
 			res.WriteString(ResolveVariables(token, eventName, payload))
 		case strings.HasPrefix(token, "$env."):
 			res.WriteString(os.Getenv(token[5:]))

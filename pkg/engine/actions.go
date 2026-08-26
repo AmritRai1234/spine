@@ -92,6 +92,10 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		return b.emailSend(step, eventName, payload)
 	case "email.broadcast":
 		return b.emailBroadcast(step, eventName, payload)
+	case "subscriptions.sweep":
+		return b.subscriptionsSweep(step, eventName, payload)
+	case "db.fanout":
+		return b.dbFanout(step, eventName, payload)
 	case "stripe.checkout":
 		return b.stripeCheckout(step, eventName, payload)
 	default:

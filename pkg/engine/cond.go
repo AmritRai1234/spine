@@ -79,11 +79,64 @@ func findOpOutsideQuotes(s, op string) int {
 
 // EvaluateCondition evaluates an "if:" condition expression against an event payload.
 // Returns true if the condition holds, or if cond is empty.
+// Compound expressions: clauses joined with && (AND) / || (OR) are evaluated
+// left-to-right; || binds looser than && ("a && b || c" = "(a&&b) || c").
 func EvaluateCondition(cond string, eventName string, payload map[string]interface{}) bool {
 	cond = strings.TrimSpace(cond)
 	if cond == "" {
 		return true
 	}
+
+	// Split on || first (lowest precedence), each side on &&.
+	for _, orPart := range splitTopLevel(cond, "||") {
+		all := true
+		for _, clause := range splitTopLevel(orPart, "&&") {
+			if !evalClause(strings.TrimSpace(clause), eventName, payload) {
+				all = false
+				break
+			}
+		}
+		if all {
+			return true
+		}
+	}
+	return false
+}
+
+// splitTopLevel splits s on sep (outside single/double quotes) returning
+// at least one part. Quoted substrings never split.
+func splitTopLevel(s, sep string) []string {
+	var parts []string
+	var cur strings.Builder
+	inQuote := byte(0)
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if inQuote != 0 {
+			if c == inQuote {
+				inQuote = 0
+			}
+			cur.WriteByte(c)
+			continue
+		}
+		if c == '\'' || c == '"' {
+			inQuote = c
+			cur.WriteByte(c)
+			continue
+		}
+		if strings.HasPrefix(s[i:], sep) {
+			parts = append(parts, cur.String())
+			cur.Reset()
+			i += len(sep) - 1
+			continue
+		}
+		cur.WriteByte(c)
+	}
+	parts = append(parts, cur.String())
+	return parts
+}
+
+// evalClause evaluates one && / || -free condition atom.
+func evalClause(cond string, eventName string, payload map[string]interface{}) bool {
 
 	// Remove outer quotes if present — but ONLY when the wrapper quote char
 	// does not appear inside. The manifest parser only unquotes double

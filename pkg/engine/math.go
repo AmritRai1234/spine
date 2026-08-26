@@ -6,6 +6,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/AmritRai1234/spine/pkg/manifest"
 )
@@ -71,6 +72,12 @@ func mathResolveTokens(expr string, eventName string, payload map[string]interfa
 
 		var raw interface{}
 		switch {
+		case token == "$now_epoch":
+			// Server clock as a plain-number operand — used for next_run_at
+			// arithmetic ($now_epoch + months * 2592000).
+			res.WriteString(strconv.FormatInt(time.Now().UTC().Unix(), 10))
+			idx = end
+			continue
 		case strings.HasPrefix(token, "$event.payload."):
 			var ok bool
 			raw, ok = resolvePath(payload, token[len("$event.payload."):])
