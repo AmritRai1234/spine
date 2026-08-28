@@ -102,6 +102,12 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		return b.stripeConnect(step, eventName, payload)
 	case "domain.connect":
 		return b.domainConnect(step, eventName, payload)
+	case "auth.hash":
+		return b.authHash(step, eventName, payload)
+	case "auth.verify":
+		return b.authVerify(step, eventName, payload)
+	case "tracking.register":
+		return b.trackingRegister(step, eventName, payload)
 	default:
 		if val, ok := b.customActions.Load(step.Action); ok {
 			if fn, isFn := val.(ActionFunc); isFn {

@@ -6,7 +6,7 @@ import (
 )
 
 // Version represents the current release version of Spine.
-const Version = "3.0.2"
+const Version = "3.0.4"
 
 // Type aliases for top-level engine & manifest components.
 type Engine = engine.Engine

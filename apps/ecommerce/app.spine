@@ -29,6 +29,13 @@ access:
       - CREATE_CHECKOUT
       - SUBSCRIBE_EMAIL
       - UNSUBSCRIBE_EMAIL
+      - REGISTER_ACCOUNT
+      - LOGIN_ACCOUNT
+      - LOGOUT_ACCOUNT
+      - REQUEST_PASSWORD_RESET
+      - RESET_PASSWORD
+      - REGISTER_TRACKING
+      - SEARCH_PRODUCTS
 
 # ── Tables (auto-created with schema evolution) ───────────────────
 database:
@@ -46,6 +53,11 @@ database:
     - payments
     - subscription_plans
     - subscriptions
+    - users
+    - sessions
+    - password_resets
+    - trackings
+    - tracking_events
 
 # ── Nodes & Contracts ─────────────────────────────────────────────
 # owns_files = the AI-codability map: every frontend file belongs to
@@ -79,7 +91,15 @@ nodes:
           option1_value: string
           price: number
           stock: integer
+      # Storefront search — engine fts.search over products, results land in
+      # the payload as fts_results (rowid + joined text) for the UI.
+      - event: SEARCH_PRODUCTS
+        payload:
+          query: string
     listens:
+      - state: SEARCH_RESULTS
+        payload:
+          query: string
       - state: PRODUCT_PUBLISHED
         payload:
           sku: string
@@ -177,10 +197,34 @@ nodes:
   Tracking:
     owns_files:
       - web/src/pages/MyOrders.tsx
+    emits:
+      # Admin registers a tracking number with the configured tracking
+      # provider (17TRACK by default; any HTTP register API works via
+      # tracking.register's generic url/headers/body config).
+      - event: REGISTER_TRACKING
+        payload:
+          order_id: string
+          tracking_number: string
+          # Optional extension columns ride along via schema evolution:
+          #   carrier, carrier_url
+      # Engine-internal: fired by POST /webhook/track17 ingestion (17TRACK
+      # pushes TRACKING_UPDATED payloads; any provider that can POST a JSON
+      # payload with tracking_number + status works).
+      - event: WEBHOOK_TRACK17
+        payload:
+          tracking_number: string
     listens:
       - state: ORDER_STATUS_CHANGED
         payload:
           order_id: string
+          status: string
+      - state: TRACKING_REGISTERED
+        payload:
+          order_id: string
+          tracking_number: string
+      - state: TRACKING_EVENT_SAVED
+        payload:
+          tracking_number: string
           status: string
 
   # Stripe reaches the engine through POST /webhook/stripe ingestion.
@@ -338,8 +382,283 @@ nodes:
         payload:
           renewed: integer
 
+  # Shopper accounts — register/login with bcrypt-hashed passwords
+  # (engine actions auth.hash / auth.verify). Sessions are opaque random
+  # tokens stored in the sessions table; the frontend keeps the token in
+  # localStorage and sends it with account-gated calls.
+  Account:
+    owns_files:
+      - web/src/pages/Account.tsx
+    emits:
+      - event: REGISTER_ACCOUNT
+        payload:
+          email: string
+          password: string
+          name: string
+      - event: LOGIN_ACCOUNT
+        payload:
+          email: string
+          password: string
+      - event: LOGOUT_ACCOUNT
+        payload:
+          token: string
+      # Password reset: request emails a one-time token (15-min expiry);
+      # reset consumes it and swaps in the new bcrypt hash.
+      - event: REQUEST_PASSWORD_RESET
+        payload:
+          email: string
+      - event: RESET_PASSWORD
+        payload:
+          token: string
+          password: string
+      # Engine-internal: fired by LOGIN_ACCOUNT when credentials verify.
+      - event: ACCOUNT_SESSION_ISSUED
+        payload:
+          email: string
+          token: string
+    listens:
+      - state: ACCOUNT_CREATED
+        payload:
+          email: string
+      - state: ACCOUNT_LOGIN_OK
+        payload:
+          email: string
+          token: string
+      - state: ACCOUNT_LOGIN_FAILED
+        payload:
+          email: string
+          error: string
+
 # ── Routes (event → action pipelines) ─────────────────────────────
 routes:
+  # ── Shopper accounts ────────────────────────────────────────────
+  # Register: reject duplicate email, then store a bcrypt hash (never the
+  # plaintext — auth.hash overwrites the password field in-payload).
+  - on: REGISTER_ACCOUNT
+    steps:
+      - action: db.lookup
+        table: users
+        key_column: email
+        value_expr: $event.payload.email
+        as: existing_
+        optional: "true"
+      - action: assert
+        condition: "$event.payload.existing_email == ''"
+        message: "an account with this email already exists"
+      - action: auth.hash
+        password: $event.payload.password
+        set: password_hash
+      # Scrub the plaintext before it can land in the table.
+      - action: unset
+        fields: password
+      - action: set
+        id: $uuid
+        created_at: $now
+      - action: db.insert
+        table: users
+    emit: ACCOUNT_CREATED
+
+  # Login: look up the stored hash, verify, issue an opaque session token.
+  # auth.verify burns a bcrypt round even for unknown emails so timing
+  # doesn't leak which addresses have accounts.
+  - on: LOGIN_ACCOUNT
+    steps:
+      - action: db.lookup
+        table: users
+        key_column: email
+        value_expr: $event.payload.email
+        as: user_
+        optional: "true"
+      - action: auth.verify
+        password: $event.payload.password
+        hash: $event.payload.user_password_hash
+        set: auth_ok
+      - action: assert
+        condition: "$event.payload.auth_ok == true"
+        message: "invalid email or password"
+      # Session row gets only clean columns: scrub the plaintext, the user_*
+      # lookup fields, and the verify flag before insert.
+      - action: unset
+        fields: "password user_id user_email user_name user_password user_password_hash user_created_at auth_ok existing_"
+      - action: set
+        token: $uuid
+        created_at: $now
+      - action: db.insert
+        table: sessions
+    emit: ACCOUNT_LOGIN_OK
+
+  # Logout: delete the session row (idempotent — already-gone tokens are fine).
+  - on: LOGOUT_ACCOUNT
+    steps:
+      - action: db.delete
+        table: sessions
+        where: "token = '$event.payload.token'"
+    emit: ACCOUNT_LOGGED_OUT
+
+  # ── Password reset ──────────────────────────────────────────────
+  # Request: always succeed silently from the caller's perspective (no
+  # account-existence leak) — the email only goes out when the user exists.
+  # Reset tokens: opaque uuid + 15-minute expiry, single row per email
+  # (a new request invalidates older tokens).
+  - on: REQUEST_PASSWORD_RESET
+    steps:
+      - action: db.lookup
+        table: users
+        key_column: email
+        value_expr: $event.payload.email
+        as: user_
+        optional: "true"
+      - action: set
+        token: $uuid
+        expires_at: "$now_epoch + 900"
+        created_at: $now
+        if: "$event.payload.user_email exists"
+      - action: db.upsert
+        table: password_resets
+        key: email
+        if: "$event.payload.user_email exists"
+      - action: email.send
+        to: $event.payload.email
+        subject: "Reset your password"
+        body: "We received a request to reset your password.\n\nReset code: $event.payload.token\n\nThis code expires in 15 minutes. If you didn't request it, ignore this email.\n\n— $event.payload.st_value"
+        if: "$event.payload.user_email exists"
+        on_failure: EMAIL_FAILED
+      - action: db.lookup
+        table: store_settings
+        key_column: key
+        value_expr: store_name
+        as: st_
+        optional: "true"
+        if: "$event.payload.user_email exists"
+      - action: unset
+        fields: "user_id user_email user_name user_password user_password_hash user_created_at st_key st_value st_created_at expires_at"
+        if: "$event.payload.user_email exists"
+
+  # Reset: consume the token (expired/unknown → hard fail), hash the new
+  # password, update the user row, burn the token so it can't be reused.
+  - on: RESET_PASSWORD
+    on_failure: PASSWORD_RESET_FAILED
+    steps:
+      - action: db.lookup
+        table: password_resets
+        key_column: token
+        value_expr: $event.payload.token
+        as: reset_
+      - action: assert
+        condition: "$event.payload.reset_expires_at >= $now_epoch"
+        message: "this reset code has expired — request a new one"
+      - action: auth.hash
+        password: $event.payload.password
+        set: password_hash
+      - action: unset
+        fields: "password"
+      - action: db.update
+        table: users
+        where: "email = '$event.payload.reset_email'"
+      # One-time use: delete every reset row for this email.
+      - action: db.delete
+        table: password_resets
+        where: "email = '$event.payload.reset_email'"
+      # Security: kill all existing sessions for this account.
+      - action: db.delete
+        table: sessions
+        where: "email = '$event.payload.reset_email'"
+      - action: unset
+        fields: "reset_email reset_token reset_expires_at reset_created_at reset__spine_id"
+      - action: log.write
+        message: "Password reset completed for $event.payload.reset_email"
+    emit: ACCOUNT_PASSWORD_RESET
+
+  # Reset failure is loud in logs but safe to expose: same generic error.
+  - on: PASSWORD_RESET_FAILED
+    steps:
+      - action: log.write
+        message: "[WARN] Password reset failed: $event.payload.error"
+
+  # ── Storefront search ───────────────────────────────────────────
+  # FTS5 over the products table. The index builds on first search and is
+  # kept current by triggers; fts.search falls back to LIKE on FTS failure.
+  # Results land in fts_results: [{rowid, content}] — the UI joins them back
+  # to products by rowid. Empty query → hard error (shopper sees "type
+  # something"), and the input is parameterized so it's injection-safe.
+  - on: SEARCH_PRODUCTS
+    steps:
+      - action: assert
+        condition: "$event.payload.query != ''"
+        message: "search query is required"
+      - action: fts.search
+        table: products
+        query: $event.payload.query
+    emit: SEARCH_RESULTS
+
+  # ── Package tracking (any provider) ─────────────────────────────
+  # Admin registers a shipment with the tracking provider. The provider
+  # endpoint/headers/body come from the manifest so switching providers
+  # (17TRACK → Shippo → EasyPost → AfterShip → self-hosted) is a config
+  # edit, not code. Unconfigured provider env → optional no-op in dev.
+  - on: REGISTER_TRACKING
+    steps:
+      - action: tracking.register
+        url: "$env.TRACKING_API_URL"
+        numbers: "$event.payload.tracking_number"
+        headers: "$env.TRACKING_API_HEADERS"
+        optional: "true"
+      - action: set
+        id: $uuid
+        created_at: $now
+        status: registered
+      - action: db.upsert
+        table: trackings
+        key: tracking_number
+    emit: TRACKING_REGISTERED
+
+  # Provider pushes a tracking update (POST /webhook/track17 or any provider
+  # name — webhook ingestion fires WEBHOOK_<PROVIDER>; the generic route
+  # below catches them all via the Tracking node's declared emit). Payload
+  # carries tracking_number + latest status text; we persist a timeline row.
+  - on: WEBHOOK_TRACK17
+    steps:
+      - action: set
+        id: $uuid
+        created_at: $now
+      - action: db.insert
+        table: tracking_events
+    emit: TRACKING_EVENT_SAVED
+
+  # Delivered: auto-close the order when the provider reports delivery, and
+  # email the customer. Lookup fields are pruned so nothing leaks into the
+  # next insert; email is a no-op without SMTP configured.
+  - on: TRACKING_EVENT_SAVED
+    steps:
+      - action: db.update
+        table: orders
+        where: "id = '$event.payload.order_id'"
+        if: "$event.payload.status == 'Delivered' && $event.payload.order_id exists"
+      - action: db.lookup
+        table: orders
+        key_column: id
+        value_expr: $event.payload.order_id
+        as: ord_
+        if: "$event.payload.status == 'Delivered' && $event.payload.order_id exists"
+        optional: true
+      - action: email.send
+        to: $event.payload.ord_email
+        subject: "Order $event.payload.order_id delivered"
+        body: "Good news — your order $event.payload.order_id has been delivered!\n\nIf anything looks wrong, just reply to this email.\n\n— $event.payload.st_value"
+        if: "$event.payload.status == 'Delivered' && $event.payload.ord_email exists"
+        on_failure: EMAIL_FAILED
+      - action: db.lookup
+        table: store_settings
+        key_column: key
+        value_expr: store_name
+        as: st_
+        if: "$event.payload.status == 'Delivered' && $event.payload.order_id exists"
+        optional: true
+      - action: unset
+        fields: "ord_id ord_cart_id ord_email ord_status ord_created_at ord_updated_at ord_total ord_coupon_code ord_coupon_discount ord_subtotal ord_shipping_cost ord_tax_amount ord_ship_name ord_address1 ord_city ord_country ord_zip st_key st_value st_created_at"
+        if: "$event.payload.status == 'Delivered' && $event.payload.order_id exists"
+    emit: ORDER_STATUS_CHANGED
+
   # Admin publishes/updates a product (upsert by SKU)
   - on: PUBLISH_PRODUCT
     steps:
@@ -621,6 +940,44 @@ routes:
       - action: unset
         fields: "order_id order_cart_id order_email order_status order_created_at order_total order_coupon_code order_coupon_discount order_ship_name order_address1 order_city order_country order_zip"
         if: "$event.payload.status == 'shipped'"
+      # ── Cancelled notification ──────────────────────────────────────
+      # Paid order → "refunded"; unpaid → "no payment was taken". Net paid
+      # comes from the payments ledger (sum of amounts, refunds negative).
+      - action: db.sum
+        table: payments
+        column: amount
+        where: "order_id = '$event.payload.id'"
+        as: cancel_net_paid
+        if: "$event.payload.status == 'cancelled'"
+      - action: db.lookup
+        table: orders
+        key_column: id
+        value_expr: $event.payload.id
+        as: order_
+        if: "$event.payload.status == 'cancelled'"
+        optional: true
+      - action: email.send
+        to: $event.payload.order_email
+        subject: "Order $event.payload.id cancelled — refund on the way"
+        body: "Your order $event.payload.id has been cancelled and refunded.\n\nThe refund goes back to your original payment method within 5–10 business days.\n\n— $event.payload.st_value"
+        if: "$event.payload.status == 'cancelled' && $event.payload.order_email exists && $event.payload.cancel_net_paid > 0"
+        on_failure: EMAIL_FAILED
+      - action: email.send
+        to: $event.payload.order_email
+        subject: "Order $event.payload.id cancelled"
+        body: "Your order $event.payload.id has been cancelled.\n\nNo payment was taken, so there is nothing to refund.\n\n— $event.payload.st_value"
+        if: "$event.payload.status == 'cancelled' && $event.payload.order_email exists && $event.payload.cancel_net_paid <= 0"
+        on_failure: EMAIL_FAILED
+      - action: db.lookup
+        table: store_settings
+        key_column: key
+        value_expr: store_name
+        as: st_
+        if: "$event.payload.status == 'cancelled' && $event.payload.order_email exists"
+        optional: true
+      - action: unset
+        fields: "order_id order_cart_id order_email order_status order_created_at order_total order_coupon_code order_coupon_discount order_ship_name order_address1 order_city order_country order_zip cancel_net_paid st_key st_value st_created_at"
+        if: "$event.payload.status == 'cancelled'"
       - action: log.write
         message: "Order $event.payload.id → $event.payload.status (by $event.payload.actor)"
     emit: ORDER_STATUS_CHANGED
@@ -915,6 +1272,30 @@ routes:
         fields: "type data _provider _idempotency_key object api_version created livemode request pending_webhook updated_at"
       - action: db.insert
         table: payments
+      # Thank-you email — money has actually moved, so THIS is the order
+      # confirmation moment. Lookup the order row for the customer email +
+      # store signature, mail only when both resolve.
+      - action: db.lookup
+        table: orders
+        key_column: id
+        value_expr: $event.payload.data.object.client_reference_id
+        as: ord_
+        optional: true
+      - action: db.lookup
+        table: store_settings
+        key_column: key
+        value_expr: store_name
+        as: st_
+        optional: true
+      - action: email.send
+        to: $event.payload.ord_email
+        subject: "Order $event.payload.data.object.client_reference_id confirmed"
+        body: "Thanks for your order!\n\nOrder: $event.payload.data.object.client_reference_id\nTotal paid: $event.payload.amount $event.payload.ord_currency\n\nWe'll email you again when it ships.\n\n— $event.payload.st_value"
+        if: "$event.payload.ord_email exists"
+        on_failure: EMAIL_FAILED
+      - action: unset
+        fields: "ord_id ord_cart_id ord_email ord_status ord_created_at ord_updated_at ord_total ord_coupon_code ord_coupon_discount ord_subtotal ord_shipping_cost ord_tax_amount ord_ship_name ord_address1 ord_city ord_country ord_zip st_key st_value st_created_at"
+        if: "$event.payload.ord_email exists"
       - action: log.write
         message: "Stripe payment captured for order $event.payload.order_id — $event.payload.amount $event.payload.currency"
     emit: ORDER_STATUS_CHANGED
@@ -974,6 +1355,34 @@ routes:
         fields: "net_paid"
       - action: db.insert
         table: payments
+      # Refund confirmation — look up the order for the customer email, and
+      # flip a positive refund amount back for the customer-facing message.
+      - action: db.lookup
+        table: orders
+        key_column: id
+        value_expr: $event.payload.order_id
+        as: ord_
+        optional: true
+      - action: db.lookup
+        table: store_settings
+        key_column: key
+        value_expr: store_name
+        as: st_
+        optional: true
+      - action: math.calc
+        set: refund_display
+        expr: "-$event.payload.amount"
+      - action: set
+        currency_sign: "$"
+      - action: email.send
+        to: $event.payload.ord_email
+        subject: "Refund issued for order $event.payload.order_id"
+        body: "We've refunded $event.payload.currency_sign$event.payload.refund_display for your order.\n\nIt should appear on your original payment method within 5–10 business days.\n\n— $event.payload.st_value"
+        if: "$event.payload.ord_email exists"
+        on_failure: EMAIL_FAILED
+      - action: unset
+        fields: "ord_id ord_cart_id ord_email ord_status ord_created_at ord_updated_at ord_total ord_coupon_code ord_coupon_discount ord_subtotal ord_shipping_cost ord_tax_amount ord_ship_name ord_address1 ord_city ord_country ord_zip st_key st_value st_created_at refund_display currency_sign"
+        if: "$event.payload.ord_email exists"
       - action: log.write
         message: "Refund recorded for order $event.payload.order_id — $event.payload.amount"
     emit: PAYMENT_RECORDED

@@ -1,8 +1,8 @@
 package engine
 
 import (
-	"errors"
 	"encoding/base64"
+	"errors"
 	"fmt"
 	"log"
 	"net/smtp"
@@ -96,7 +96,7 @@ func mimeBEncode(s string) string {
 	var words []string
 	for start := 0; start < len(s); {
 		end := start + chunkMax
-		if end > len(s) {
+		if end >= len(s) {
 			end = len(s)
 		} else {
 			for end > start && s[end]&0xC0 == 0x80 { // don't split runes
