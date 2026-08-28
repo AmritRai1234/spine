@@ -523,6 +523,8 @@ routes:
         body: "We received a request to reset your password.\n\nReset code: $event.payload.token\n\nThis code expires in 15 minutes. If you didn't request it, ignore this email.\n\n— $event.payload.st_value"
         if: "$event.payload.user_email exists"
         on_failure: EMAIL_FAILED
+        max_attempts: 3
+        backoff_ms: 250
       - action: db.lookup
         table: store_settings
         key_column: key
@@ -647,6 +649,8 @@ routes:
         body: "Good news — your order $event.payload.order_id has been delivered!\n\nIf anything looks wrong, just reply to this email.\n\n— $event.payload.st_value"
         if: "$event.payload.status == 'Delivered' && $event.payload.ord_email exists"
         on_failure: EMAIL_FAILED
+        max_attempts: 3
+        backoff_ms: 250
       - action: db.lookup
         table: store_settings
         key_column: key
@@ -937,6 +941,8 @@ routes:
         body: "Good news — order $event.payload.id is on its way!\n\nTrack it any time under My Orders."
         if: "$event.payload.order_email exists"
         on_failure: EMAIL_FAILED
+        max_attempts: 3
+        backoff_ms: 250
       - action: unset
         fields: "order_id order_cart_id order_email order_status order_created_at order_total order_coupon_code order_coupon_discount order_ship_name order_address1 order_city order_country order_zip"
         if: "$event.payload.status == 'shipped'"
@@ -962,12 +968,16 @@ routes:
         body: "Your order $event.payload.id has been cancelled and refunded.\n\nThe refund goes back to your original payment method within 5–10 business days.\n\n— $event.payload.st_value"
         if: "$event.payload.status == 'cancelled' && $event.payload.order_email exists && $event.payload.cancel_net_paid > 0"
         on_failure: EMAIL_FAILED
+        max_attempts: 3
+        backoff_ms: 250
       - action: email.send
         to: $event.payload.order_email
         subject: "Order $event.payload.id cancelled"
         body: "Your order $event.payload.id has been cancelled.\n\nNo payment was taken, so there is nothing to refund.\n\n— $event.payload.st_value"
         if: "$event.payload.status == 'cancelled' && $event.payload.order_email exists && $event.payload.cancel_net_paid <= 0"
         on_failure: EMAIL_FAILED
+        max_attempts: 3
+        backoff_ms: 250
       - action: db.lookup
         table: store_settings
         key_column: key
@@ -1120,6 +1130,8 @@ routes:
         subject: "Order $event.payload.order_id confirmed"
         body: "Thanks for your order!\n\nOrder: $event.payload.order_id\nSubtotal: $event.payload.subtotal\nShipping: $event.payload.shipping_cost\nTax: $event.payload.tax_amount\nTotal: $event.payload.total\n\nWe'll email you again when it ships."
         on_failure: EMAIL_FAILED
+        max_attempts: 3
+        backoff_ms: 250
       - action: log.write
         message: "Order placed for cart $event.payload.cart_id by $event.payload.email — total $event.payload.total (subtotal $event.payload.subtotal, shipping $event.payload.shipping_cost, tax $event.payload.tax_amount)"
     emit: ORDER_CREATED
@@ -1293,6 +1305,8 @@ routes:
         body: "Thanks for your order!\n\nOrder: $event.payload.data.object.client_reference_id\nTotal paid: $event.payload.amount $event.payload.ord_currency\n\nWe'll email you again when it ships.\n\n— $event.payload.st_value"
         if: "$event.payload.ord_email exists"
         on_failure: EMAIL_FAILED
+        max_attempts: 3
+        backoff_ms: 250
       - action: unset
         fields: "ord_id ord_cart_id ord_email ord_status ord_created_at ord_updated_at ord_total ord_coupon_code ord_coupon_discount ord_subtotal ord_shipping_cost ord_tax_amount ord_ship_name ord_address1 ord_city ord_country ord_zip st_key st_value st_created_at"
         if: "$event.payload.ord_email exists"
@@ -1380,6 +1394,8 @@ routes:
         body: "We've refunded $event.payload.currency_sign$event.payload.refund_display for your order.\n\nIt should appear on your original payment method within 5–10 business days.\n\n— $event.payload.st_value"
         if: "$event.payload.ord_email exists"
         on_failure: EMAIL_FAILED
+        max_attempts: 3
+        backoff_ms: 250
       - action: unset
         fields: "ord_id ord_cart_id ord_email ord_status ord_created_at ord_updated_at ord_total ord_coupon_code ord_coupon_discount ord_subtotal ord_shipping_cost ord_tax_amount ord_ship_name ord_address1 ord_city ord_country ord_zip st_key st_value st_created_at refund_display currency_sign"
         if: "$event.payload.ord_email exists"
@@ -1527,6 +1543,8 @@ routes:
         body: "Your subscription ($event.payload.plan_name) will not renew again."
         optional: true
         on_failure: EMAIL_FAILED
+        max_attempts: 3
+        backoff_ms: 250
       - action: log.write
         message: "Subscription $event.payload.id cancelled (by admin)"
     emit: SUBSCRIPTION_UPDATED

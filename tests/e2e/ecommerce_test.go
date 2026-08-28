@@ -331,6 +331,8 @@ routes:
         if: "$event.payload.status == 'shipped'"
         optional: true
       - action: email.send
+        max_attempts: 3
+        backoff_ms: 250
         to: $event.payload.order_email
         subject: "Order $event.payload.id has shipped"
         body: "Good news — order $event.payload.id is on its way!"
@@ -391,6 +393,8 @@ routes:
       - action: db.insert
         table: orders
       - action: email.send
+        max_attempts: 3
+        backoff_ms: 250
         to: $event.payload.email
         subject: "Order $event.payload.order_id confirmed"
         body: "Total: $event.payload.total"
@@ -627,6 +631,7 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }
+
 // publishProduct upserts a catalog row and waits for the batched write to
 // land, returning the engine-assigned id.
 func publishProduct(t *testing.T, bus *spine.Bus, sku string, price float64, stock int) string {
@@ -1613,7 +1618,6 @@ func TestEcommerceStripeCheckout(t *testing.T) {
 		t.Fatalf("place order failed: %v %v", err, res)
 	}
 
-
 	waitUntil(t, "order row flushed", func() bool {
 		var st string
 		return bus.DB().QueryRow(`SELECT status FROM orders WHERE id = ?`, orderID).Scan(&st) == nil
@@ -1632,13 +1636,13 @@ func TestEcommerceStripeCheckout(t *testing.T) {
 		t.Errorf("Authorization = %q, want bearer secret", req.auth)
 	}
 	for k, want := range map[string]string{
-		"mode":                                        "payment",
-		"client_reference_id":                         orderID,
-		"line_items[0][price_data][unit_amount]":      "1200", // $12.00 → cents, server-side
-		"line_items[0][price_data][currency]":         "usd",
-		"line_items[0][quantity]":                     "1",
-		"customer_email":                              "payer@example.com",
-		"success_url":                                 "https://shop.example.com/#/orders",
+		"mode":                                   "payment",
+		"client_reference_id":                    orderID,
+		"line_items[0][price_data][unit_amount]": "1200", // $12.00 → cents, server-side
+		"line_items[0][price_data][currency]":    "usd",
+		"line_items[0][quantity]":                "1",
+		"customer_email":                         "payer@example.com",
+		"success_url":                            "https://shop.example.com/#/orders",
 	} {
 		if req.form.Get(k) != want {
 			t.Errorf("form %s = %q, want %q", k, req.form.Get(k), want)
@@ -1668,7 +1672,6 @@ func TestEcommerceStripeCheckoutSilentWithoutKey(t *testing.T) {
 		"cart_id": "cart-nk", "email": "x@example.com",
 		"order_id": orderID, "country": "*",
 	})
-
 
 	waitUntil(t, "order row flushed", func() bool {
 		var st string
