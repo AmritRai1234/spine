@@ -4,7 +4,7 @@
     <img src="https://raw.githubusercontent.com/AmritRai1234/spine/main/assets/logo.png?v=3" width="200" alt="Spine Logo">
   </picture><br>
   <strong>SPINE</strong><br>
-  <em>Declarative Event-Driven Backend Engine (v3.0.4)</em>
+  <em>Declarative Event-Driven Backend Engine (v3.0.5)</em>
 </p>
 
 <p align="center">
@@ -20,7 +20,7 @@
 
 **Spine** is a high-performance, declarative event-driven runtime and orchestration engine written in Go. It replaces complex API controllers and scattered database handlers with a single, type-safe `.spine` manifest file.
 
-With Spine, you declare database tables, event nodes, and multi-step action routes in code. The runtime automatically handles type contract validation, high-throughput database persistence (SQLite WAL / Turso libSQL), durable outbox webhook retries, full-text search (`fts.search`), email marketing & transactional mail (`email.send`, `email.broadcast`), Stripe Checkout payments (`stripe.checkout`), real-time WebSocket state broadcasting, and cloud deployment generation (`spine deploy`).
+With Spine, you declare database tables, event nodes, and multi-step action routes in code. The runtime automatically handles type contract validation, high-throughput database persistence (SQLite WAL / PostgreSQL / Turso libSQL), durable outbox webhook retries, full-text search (`fts.search`), email marketing & transactional mail (`email.send`, `email.broadcast`), Stripe Checkout payments (`stripe.checkout`), real-time WebSocket state broadcasting, and cloud deployment generation (`spine deploy`).
 
 ```
 Client Event → Load Balancer → Spine Node (RLAC Auth & Rate Limit) → Event Bus → PubSub Backplane → Batched DB / WebSocket
@@ -984,8 +984,12 @@ Prefer your own certificates? Skip `--domain` and use `--tls-cert cert.pem --tls
 | Connection String | Driver |
 |---|---|
 | `spine.db` | SQLite (local, WAL mode) |
+| `postgres://user:pass@host:5432/db` | PostgreSQL (website/production workloads) |
+| `postgresql://…` | PostgreSQL (alternate URL scheme) |
 | `libsql://your-db.turso.io` | Turso / libSQL (cloud) |
 | `turso://your-db.turso.io` | Turso / libSQL (cloud) |
+
+The backend is selected automatically from the DSN prefix: URLs starting with `postgres://` / `postgresql://` use the built-in PostgreSQL dialect (schema/table SQL translated per backend — the same `.spine` manifest works unchanged). Parity is exercised by an integration test against real Postgres 16 (`tests/features/postgres_integration_test.go`, enabled by setting `SPINE_TEST_PG_DSN`).
 
 ### SQLite Performance Pragmas
 

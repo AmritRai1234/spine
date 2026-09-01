@@ -1,8 +1,8 @@
 package engine
 
 import (
-	"errors"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sort"
@@ -440,7 +440,7 @@ func (b *Bus) dbUpdate(table string, whereExpr string, eventName string, payload
 // is absent. Db ops translate it to "matches no rows": the documented
 // optional-field pattern (missing shipping country → no zone row → free
 // shipping) must degrade to an empty match set — not error (breaks optional
-// fields) and not silently match '' (matches the wrong rows).
+// fields) and not silently match ” (matches the wrong rows).
 type errWhereUnresolvable struct{ msg string }
 
 func (e *errWhereUnresolvable) Error() string { return e.msg }
@@ -833,10 +833,23 @@ func (b *Bus) ensureUniqueIndex(table, col string) {
 	if _, ok := b.uniqueIdx.Load(fp); ok {
 		return
 	}
-	idxSQL := fmt.Sprintf(`CREATE UNIQUE INDEX IF NOT EXISTS "uq_%s_%s" ON "%s"("%s")`,
-		table, col, table, col)
+	// Composite key form: "a,b" → quoted multi-column unique index.
+	cols := strings.Split(col, ",")
+	quoted := make([]string, len(cols))
+	nameParts := make([]string, len(cols))
+	for i, c := range cols {
+		c = b.sanitizeIdentCached(strings.TrimSpace(c))
+		if c == "" {
+			log.Printf("[upsert] ensure unique index %s: invalid column in '%s'", table, col)
+			return
+		}
+		quoted[i] = `"` + c + `"`
+		nameParts[i] = c
+	}
+	idxSQL := fmt.Sprintf(`CREATE UNIQUE INDEX IF NOT EXISTS "uq_%s_%s" ON "%s"(%s)`,
+		table, strings.Join(nameParts, "_"), table, strings.Join(quoted, ","))
 	if _, err := b.db.Exec(idxSQL); err != nil {
-		log.Printf("[upsert] ensure unique index uq_%s_%s failed: %v", table, col, err)
+		log.Printf("[upsert] ensure unique index uq_%s_%s failed: %v", table, strings.Join(nameParts, "_"), err)
 		return
 	}
 	b.uniqueIdx.Store(fp, struct{}{})
@@ -970,5 +983,144 @@ func (b *Bus) dbUpsert(table string, conflictKey string, eventName string, paylo
 		}
 	}
 
+	return nil
+}
+
+// dbUpsertComposite is the constraint-enforcement path: a multi-column key
+// turns db.upsert into a claim primitive (booking, one-per-customer, seat
+// claims). Semantics by key arity — one column = identity (merge on conflict,
+// unchanged historical behavior); two or more = constraint (a second row with
+// the same key combination is a rejection, never a silent merge).
+//
+// Conflict detection REQUIRES synchronous execution: the batched writer
+// reports UNIQUE violations later as batch error logs, which on_failure can
+// never see. Same rationale as dbAdjust (db_ops.go:702) — read-modify-write
+// steps must surface errors to the route pipeline.
+//
+// SQL: INSERT ... ON CONFLICT("a","b") DO NOTHING — RowsAffected()==0 then
+// means the composite key already exists (an INSERT either inserts 1 row or
+// conflicts; there is no row-not-found case, unlike db.adjust). Works on both
+// dialects: SQLite and PostgreSQL both return 0 rows affected for DO NOTHING.
+func (b *Bus) dbUpsertComposite(table string, conflictKeys []string, eventName string, payload map[string]interface{}) error {
+	for _, k := range conflictKeys {
+		if _, exists := payload[k]; !exists {
+			return fmt.Errorf("db.upsert failed: conflict key '%s' not present in payload", k)
+		}
+	}
+
+	table = b.sanitizeIdentCached(table)
+	safeKeys := make([]string, len(conflictKeys))
+	for i, k := range conflictKeys {
+		safeKeys[i] = b.sanitizeIdentCached(k)
+		if safeKeys[i] == "" {
+			return fmt.Errorf("db.upsert: invalid conflict key '%s'", k)
+		}
+	}
+
+	n := len(payload)
+	keys := make([]string, 0, n)
+	for k := range payload {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+
+	// Fingerprint must include the composite key columns.
+	var fpBuf strings.Builder
+	fpBuf.Grow(len(table) + len(strings.Join(safeKeys, ",")) + n*10)
+	fpBuf.WriteString(table)
+	fpBuf.WriteByte('|')
+	fpBuf.WriteString(strings.Join(safeKeys, ","))
+	fpBuf.WriteByte('|')
+	sanitizedKeys := make([]string, n)
+	for i, k := range keys {
+		safe := b.sanitizeIdentCached(k)
+		sanitizedKeys[i] = safe
+		if i > 0 {
+			fpBuf.WriteByte(',')
+		}
+		fpBuf.WriteString(safe)
+	}
+	fingerprint := fpBuf.String()
+
+	// SQL template cache: same shape as dbUpsert's (fingerprint includes the
+	// composite key columns), so repeat bookings build the SQL once.
+	var tmpl *sqlTemplate
+	if cached, ok := b.upsertSQLCache.Load(fingerprint); ok {
+		tmpl = cached.(*sqlTemplate)
+	}
+
+	if tmpl == nil {
+		fieldTypes := b.GetRegistry().GetFieldTypes(eventName)
+		colDefs := make([]string, n)
+		for i, safe := range sanitizedKeys {
+			sqlType := "TEXT"
+			if fieldTypes != nil {
+				if ft, ok := fieldTypes[keys[i]]; ok {
+					sqlType = sqliteType(ft)
+				}
+			}
+			colDefs[i] = `"` + safe + `" ` + sqlType
+		}
+
+		if err := b.ensureTable(table, colDefs); err != nil {
+			return err
+		}
+		// Multi-column unique index: "a,b" form handled inside ensureUniqueIndex.
+		b.ensureUniqueIndex(table, strings.Join(safeKeys, ","))
+
+		// Build: INSERT INTO "t" ("a","b",...) VALUES ($1,...) ON CONFLICT("a","b") DO NOTHING
+		var sb strings.Builder
+		sb.Grow(128 + len(table) + n*24)
+		sb.WriteString(`INSERT INTO "`)
+		sb.WriteString(table)
+		sb.WriteString(`" (`)
+		for i, safe := range sanitizedKeys {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteByte('"')
+			sb.WriteString(safe)
+			sb.WriteByte('"')
+		}
+		sb.WriteString(") VALUES (")
+		for i := 0; i < n; i++ {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteString(b.ph(i + 1))
+		}
+		sb.WriteString(`) ON CONFLICT(`)
+		for i, safe := range safeKeys {
+			if i > 0 {
+				sb.WriteString(", ")
+			}
+			sb.WriteByte('"')
+			sb.WriteString(safe)
+			sb.WriteByte('"')
+		}
+		sb.WriteString(`) DO NOTHING`)
+
+		tmpl = &sqlTemplate{
+			sql:      sb.String(),
+			colOrder: sanitizedKeys,
+			colDefs:  colDefs,
+		}
+		b.upsertSQLCache.Store(fingerprint, tmpl)
+	}
+
+	values := make([]interface{}, n)
+	for i, k := range keys {
+		values[i] = normalizeParam(payload[k], eventName, payload)
+	}
+
+	// Synchronous by design — see doc comment above.
+	res, err := execWithRetryResult(b.db, tmpl.sql, values...)
+	if err != nil {
+		return fmt.Errorf("upsert failed: %w", err)
+	}
+	if inserted, rerr := res.RowsAffected(); rerr == nil && inserted == 0 {
+		return fmt.Errorf("db.upsert rejected: row with key (%s) already exists in '%s'",
+			strings.Join(safeKeys, ", "), table)
+	}
 	return nil
 }

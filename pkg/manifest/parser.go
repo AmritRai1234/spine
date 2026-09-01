@@ -180,9 +180,15 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 	var curRoute *Route
 	var curStep *RouteStep
 	var curAccess *AccessRule
+	// eff := indent - nodeShift normalizes NODES-section depth checks. List-
+	// form nodes ("- name: X") occupy the SAME indentation levels as map-form
+	// bodies (node at level 1, emits:/listens: at level 2, entries at level 3,
+	// payload fields at level 5), so nodeShift stays 0; only node creation
+	// differs (dash-list vs bare key).
+	nodeShift := 0
 
 	// Duplicate tracking
-	seenNodes := make(map[string]int)  // node name → first line number
+	seenNodes := make(map[string]int)   // node name → first line number
 	seenTables := make(map[string]bool) // table name deduplication
 	seenRoles := make(map[string]int)   // role name → first line number
 
@@ -411,6 +417,23 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 
 		// ===== NODES =====
 		if state >= sNodes && state <= sNodeListenPayload {
+			if v, ok := listKvValue(trimmed, "name"); ok && indent == 1 {
+				// List-form node: "- name: X" — same node semantics as the
+				// map form, with the body indented 2 levels deeper. Accepted
+				// explicitly so payload contracts and route validation are
+				// NEVER silently skipped (see nodeShift below).
+				nodeName := unquote(v)
+				if firstLine, exists := seenNodes[nodeName]; exists {
+					return nil, parseError(manifestPath, lineno, "duplicate node name '%s' (first declared at line %d)", nodeName, firstLine)
+				}
+				seenNodes[nodeName] = lineno
+				schema.Nodes = append(schema.Nodes, Node{Name: nodeName})
+				curNode = &schema.Nodes[len(schema.Nodes)-1]
+				curEmit = nil
+				curListen = nil
+				state = sNodeBody
+				continue
+			}
 			if indent == 1 && strings.HasSuffix(trimmed, ":") && !isListItem(trimmed) {
 				nodeName := trimmed[:len(trimmed)-1]
 
@@ -425,11 +448,13 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				curNode = &schema.Nodes[len(schema.Nodes)-1]
 				curEmit = nil
 				curListen = nil
+				nodeShift = 0
 				state = sNodeBody
 				continue
 			}
 
-			if indent == 2 && curNode != nil {
+			eff := indent - nodeShift
+			if eff == 2 && curNode != nil {
 				switch trimmed {
 				case "owns_files:":
 					state = sNodeOwnFiles
@@ -443,12 +468,12 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				}
 			}
 
-			if state == sNodeOwnFiles && indent == 3 && isListItem(trimmed) && curNode != nil {
+			if state == sNodeOwnFiles && eff == 3 && isListItem(trimmed) && curNode != nil {
 				curNode.OwnsFiles = append(curNode.OwnsFiles, unquote(trimmed[2:]))
 				continue
 			}
 
-			if state == sNodeEmits && indent == 3 {
+			if state == sNodeEmits && eff == 3 {
 				if v, ok := listKvValue(trimmed, "event"); ok && curNode != nil {
 					curNode.Emits = append(curNode.Emits, Emit{Event: unquote(v)})
 					curEmit = &curNode.Emits[len(curNode.Emits)-1]
@@ -457,14 +482,14 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				}
 			}
 
-			if (state == sNodeEmitEntry || state == sNodeEmitPayload) && indent == 4 {
+			if (state == sNodeEmitEntry || state == sNodeEmitPayload) && eff == 4 {
 				if trimmed == "payload:" {
 					state = sNodeEmitPayload
 					continue
 				}
 			}
 
-			if state == sNodeEmitPayload && indent == 5 && curEmit != nil {
+			if state == sNodeEmitPayload && eff == 5 && curEmit != nil {
 				if idx := strings.Index(trimmed, ":"); idx > 0 {
 					curEmit.Fields = append(curEmit.Fields, PayloadField{
 						Name:      strings.TrimSpace(trimmed[:idx]),
@@ -474,7 +499,7 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				}
 			}
 
-			if state == sNodeListens && indent == 3 {
+			if state == sNodeListens && eff == 3 {
 				if v, ok := listKvValue(trimmed, "state"); ok && curNode != nil {
 					curNode.Listens = append(curNode.Listens, Listen{State: unquote(v)})
 					curListen = &curNode.Listens[len(curNode.Listens)-1]
@@ -483,14 +508,14 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				}
 			}
 
-			if (state == sNodeListenEntry || state == sNodeListenPayload) && indent == 4 {
+			if (state == sNodeListenEntry || state == sNodeListenPayload) && eff == 4 {
 				if trimmed == "payload:" {
 					state = sNodeListenPayload
 					continue
 				}
 			}
 
-			if state == sNodeListenPayload && indent == 5 && curListen != nil {
+			if state == sNodeListenPayload && eff == 5 && curListen != nil {
 				if idx := strings.Index(trimmed, ":"); idx > 0 {
 					curListen.Fields = append(curListen.Fields, PayloadField{
 						Name:      strings.TrimSpace(trimmed[:idx]),
@@ -501,7 +526,7 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 			}
 
 			// Transitions
-			if indent == 3 && (state == sNodeEmitEntry || state == sNodeEmitPayload) {
+			if eff == 3 && (state == sNodeEmitEntry || state == sNodeEmitPayload) {
 				if v, ok := listKvValue(trimmed, "event"); ok && curNode != nil {
 					curNode.Emits = append(curNode.Emits, Emit{Event: unquote(v)})
 					curEmit = &curNode.Emits[len(curNode.Emits)-1]
@@ -515,7 +540,7 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 					continue
 				}
 			}
-			if indent == 3 && (state == sNodeListenEntry || state == sNodeListenPayload) {
+			if eff == 3 && (state == sNodeListenEntry || state == sNodeListenPayload) {
 				if v, ok := listKvValue(trimmed, "state"); ok && curNode != nil {
 					curNode.Listens = append(curNode.Listens, Listen{State: unquote(v)})
 					curListen = &curNode.Listens[len(curNode.Listens)-1]
@@ -524,7 +549,7 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				}
 			}
 
-			if indent == 2 && curNode != nil && state >= sNodeOwnFiles && state <= sNodeListenPayload {
+			if eff == 2 && curNode != nil && state >= sNodeOwnFiles && state <= sNodeListenPayload {
 				state = sNodeBody
 				curEmit = nil
 				curListen = nil
@@ -616,6 +641,19 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				}
 			}
 
+			if state == sRouteStepBody && indent == 5 && isListItem(trimmed) && curStep != nil {
+				// List item under `key:` — comma-join into a single Config
+				// value so the engine sees one string: "slot_id,customer_email".
+				if curStep.Config == nil {
+					curStep.Config = make(map[string]string)
+				}
+				if prev := curStep.Config["key"]; prev != "" {
+					curStep.Config["key"] = prev + "," + unquote(trimmed[2:])
+				} else {
+					curStep.Config["key"] = unquote(trimmed[2:])
+				}
+				continue
+			}
 			if state == sRouteStepBody && indent == 4 && curStep != nil {
 				if v, ok := kvValue(trimmed, "if"); ok {
 					curStep.IfCondition = unquote(v)
@@ -663,6 +701,18 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				}
 				if v, ok := kvValue(trimmed, "on_error"); ok {
 					curStep.OnFailure = unquote(v)
+					continue
+				}
+				if v, ok := kvValue(trimmed, "key"); ok {
+					// Composite keys: `key:` with an empty value opens a list of
+					// column names at indent 5 (list items captured below).
+					// A bare string stays scalar for backward compatibility.
+					if strings.TrimSpace(v) != "" {
+						if curStep.Config == nil {
+							curStep.Config = make(map[string]string)
+						}
+						curStep.Config["key"] = unquote(v)
+					}
 					continue
 				}
 				// Capture unknown key:value pairs into Config map for custom actions
@@ -859,7 +909,8 @@ func equalEventShape(a, b map[string]string) bool {
 	return true
 }
 
-func suggestSimilarKey(input string, validKeys []string) string {	bestMatch := ""
+func suggestSimilarKey(input string, validKeys []string) string {
+	bestMatch := ""
 	minDist := 3
 
 	for _, k := range validKeys {

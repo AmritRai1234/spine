@@ -58,6 +58,15 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 			if key == "" {
 				key = "id"
 			}
+			// Multi-column key (comma-joined by the parser from list syntax,
+			// or written literally as "a,b") → composite constraint semantics.
+			if strings.Contains(key, ",") {
+				cols := strings.Split(key, ",")
+				for i := range cols {
+					cols[i] = strings.TrimSpace(cols[i])
+				}
+				return b.dbUpsertComposite(step.Table, cols, eventName, payload)
+			}
 			return b.dbUpsert(step.Table, key, eventName, payload)
 		}
 	case "db.delete":
