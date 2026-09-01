@@ -1,0 +1,14 @@
+# Go 1.25 baseline — captured 2026-09-01 before Go 1.27 upgrade branch
+# go version go1.25.0 linux/amd64
+# compare with: go test ./pkg/engine/ -bench=. -benchtime=200x -count=3 -run XXX | benchstat
+goos: linux
+goarch: amd64
+pkg: github.com/AmritRai1234/spine/pkg/engine
+cpu: AMD Ryzen 7 5825U with Radeon Graphics         
+BenchmarkBatchedDurableWrites-16    	     200	     53632 ns/op	     19532 durable_writes/s	     51199 ns/durable_write
+BenchmarkBatchedDurableWrites-16    	     200	     61381 ns/op	     16950 durable_writes/s	     58998 ns/durable_write
+BenchmarkBatchedDurableWrites-16    	     200	     47105 ns/op	     22485 durable_writes/s	     44475 ns/durable_write
+PASS
+ok  	github.com/AmritRai1234/spine/pkg/engine	0.141s
+PASS
+ok  	github.com/AmritRai1234/spine/pkg/engine	0.053s
