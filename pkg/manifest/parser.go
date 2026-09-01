@@ -49,12 +49,13 @@ func parseError(file string, lineno int, format string, args ...interface{}) err
 func getIndent(line string) int {
 	count := 0
 	for _, c := range line {
-		if c == ' ' {
+		switch c {
+		case ' ':
 			count++
-		} else if c == '\t' {
+		case '	':
 			count += 2
-		} else {
-			break
+		default:
+			return count / 2
 		}
 	}
 	return count / 2
@@ -65,12 +66,13 @@ func hasMixedWhitespace(line string) bool {
 	hasTabs := false
 	hasSpaces := false
 	for _, c := range line {
-		if c == '\t' {
+		switch c {
+		case '	':
 			hasTabs = true
-		} else if c == ' ' {
+		case ' ':
 			hasSpaces = true
-		} else {
-			break
+		default:
+			return hasTabs && hasSpaces
 		}
 	}
 	return hasTabs && hasSpaces
