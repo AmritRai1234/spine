@@ -860,6 +860,20 @@ func ValidateSchema(file string, schema *SpineSchema) error {
 			if step.Action == "" {
 				return parseError(file, 0, "route %d, step %d has an empty 'action' field", i+1, j+1)
 			}
+			// Unknown action: a typo'd action name previously dispatched to
+			// the engine's default case and returned nil SILENTLY — the step
+			// did nothing, the route "succeeded". Fail at validation with a
+			// did-you-mean suggestion instead.
+			if err := validateActionName(route.OnEvent, j, step.Action); err != nil {
+				return parseError(file, 0, "%s", err.Error())
+			}
+			// Unknown per-action option: a typo'd config key (keyy: under
+			// db.upsert) was previously accepted into Config and silently
+			// ignored, leaving the real option unset. Only built-in actions
+			// are checked — plugin actions have free-form config.
+			if err := validateStepConfig(route.OnEvent, j, step); err != nil {
+				return parseError(file, 0, "%s", err.Error())
+			}
 		}
 
 		// Route with no steps

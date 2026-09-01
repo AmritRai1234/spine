@@ -253,8 +253,7 @@ routes:
     steps:
       - action: db.lookup
         table: inventory
-        config:
-          key_column: "sku"
+        key_column: "sku"
     emit: STOCK_RESERVED
 `
 	if err := os.WriteFile(manifestPath, []byte(manifest), 0644); err != nil {

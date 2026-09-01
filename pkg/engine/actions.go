@@ -129,6 +129,12 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 				return fn(step, eventName, payload)
 			}
 		}
+		// Not a built-in and nothing registered under this name. Returning
+		// nil here made typo'd action names SILENTLY no-op — the route
+		// "succeeded" while the step did nothing (found 2026-09-01: a
+		// manifest with `db.upsertt` + `keyy:` passed spine test clean).
+		// Fail loudly instead; plugin authors get an actionable message.
+		return fmt.Errorf("unknown action '%s' — not a built-in and no plugin action registered under this name (check the spelling, or register it via Bus.RegisterAction before emitting)", step.Action)
 	}
 	return nil
 }
