@@ -1,0 +1,125 @@
+spine_version: 3
+
+database:
+  tables:
+    - slots
+    - bookings
+
+# Deliberate mixed node forms: "Booking" is LIST-FORM — live proof of the
+# 2026-09-01 parser fix (list-form nodes were silently ignored, zeroing
+# schema.Nodes and disabling ALL contract validation). With the fix, its
+# payload types (capacity: integer) attach correctly AND route→emits
+# validation is active. "Reminders" stays map-form; both parse identically.
+nodes:
+  - name: Booking
+    emits:
+      - event: BOOK_SLOT
+        payload:
+          slot_id: string
+          customer_email: string
+      - event: CANCEL_BOOKING
+        payload:
+          booking_id: string
+          slot_id: string
+      - event: SEED_SLOT
+        payload:
+          id: string
+          capacity: integer
+    listens:
+      - state: BOOKING_CONFIRMED
+        payload:
+          slot_id: string
+          customer_email: string
+      - state: SLOT_UNAVAILABLE
+        payload:
+          slot_id: string
+          reason: string
+
+  Reminders:
+    emits:
+      - event: REMINDER_TICK
+    listens:
+      - state: BOOKING_DUE
+        payload:
+          customer_email: string
+          slot_id: string
+
+routes:
+  # Seed a bookable slot (prototype convenience — later replaced by
+  # slots.generate).
+  - on: SEED_SLOT
+    steps:
+      - action: db.insert
+        table: slots
+
+  # Claim: atomic seat claim (db.adjust floor guard, synchronous), then the
+  # composite upsert enforces one booking per customer per slot.
+  #
+  # on_failure lane discipline:
+  #   - adjust floor-rejects  → route-level SLOT_UNAVAILABLE (seat never
+  #     taken; NO compensation — compensating here hands out seats nobody
+  #     held; this exact bug was caught by the race tests)
+  #   - upsert conflicts      → step-level RELEASE_SEAT (seat WAS taken;
+  #     capacity restored synchronously, then customer-facing failure state)
+  - on: BOOK_SLOT
+    on_failure: SLOT_UNAVAILABLE
+    steps:
+      - action: db.adjust
+        table: slots
+        where: "id = $event.payload.slot_id"
+        column: capacity
+        by: -1
+        floor: 0
+      - action: set
+        id: $uuid
+        created_at: $now
+        status: confirmed
+        reminder_due: $event.payload.slot_id
+      - action: db.upsert
+        table: bookings
+        on_failure: RELEASE_SEAT
+        key:
+          - slot_id
+          - customer_email
+    emit: BOOKING_CONFIRMED
+
+  # Compensation: upsert conflicted AFTER the seat was claimed → give it back.
+  # db.adjust runs synchronously on the DB pool, so the freed seat is visible
+  # to the next booker immediately after this chain completes.
+  - on: RELEASE_SEAT
+    steps:
+      - action: db.adjust
+        table: slots
+        where: "id = $event.payload.slot_id"
+        column: capacity
+        by: 1
+    emit: SLOT_UNAVAILABLE
+
+  # Cancel: db.update payload IS the new row state (no `set:` key exists —
+  # every payload field becomes a SET column, including the where field).
+  # Status write goes through the async batched writer — "capacity is the
+  # guarantee, status is cosmetic and may lag."
+  - on: CANCEL_BOOKING
+    steps:
+      - action: db.update
+        table: bookings
+        where: "id = $event.payload.booking_id"
+      - action: db.adjust
+        table: slots
+        where: "id = $event.payload.slot_id"
+        column: capacity
+        by: 1
+    emit: BOOKING_CANCELLED
+
+  # Reminder sweep — rides the existing db.fanout primitive. Prototype
+  # stand-in: reminder_due is set to the slot_id on booking; a real build
+  # computes a timestamp from the slot's start time.
+  - on: REMINDER_TICK
+    cron: 3600s
+    steps:
+      - action: db.fanout
+        table: bookings
+        where: "status = confirmed"
+        emit_event: BOOKING_DUE
+        due_column: reminder_due
+        interval_column: created_at
