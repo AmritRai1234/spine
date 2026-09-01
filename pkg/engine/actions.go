@@ -60,7 +60,11 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 			}
 			// Multi-column key (comma-joined by the parser from list syntax,
 			// or written literally as "a,b") → composite constraint semantics.
-			if strings.Contains(key, ",") {
+			// A LIST-form key (even a single element) is ALSO constraint
+			// semantics: list syntax is the author's explicit claim marker;
+			// scalar key: stays identity/merge. key_list is set by the parser.
+			isConstraint := strings.Contains(key, ",") || step.Config["key_list"] == "true"
+			if isConstraint {
 				cols := strings.Split(key, ",")
 				for i := range cols {
 					cols[i] = strings.TrimSpace(cols[i])

@@ -644,6 +644,10 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 			if state == sRouteStepBody && indent == 5 && isListItem(trimmed) && curStep != nil {
 				// List item under `key:` — comma-join into a single Config
 				// value so the engine sees one string: "slot_id,customer_email".
+				// List syntax (even a single element) marks the step as an
+				// explicit CONSTRAINT claim (reject on conflict), distinct
+				// from scalar `key: x` identity semantics (merge). The
+				// engine dispatches on this marker.
 				if curStep.Config == nil {
 					curStep.Config = make(map[string]string)
 				}
@@ -652,6 +656,7 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 				} else {
 					curStep.Config["key"] = unquote(trimmed[2:])
 				}
+				curStep.Config["key_list"] = "true"
 				continue
 			}
 			if state == sRouteStepBody && indent == 4 && curStep != nil {
@@ -712,6 +717,9 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 							curStep.Config = make(map[string]string)
 						}
 						curStep.Config["key"] = unquote(v)
+						// Scalar form → identity semantics (merge on conflict);
+						// the engine dispatches constraint handling on key_list.
+						curStep.Config["key_list"] = ""
 					}
 					continue
 				}

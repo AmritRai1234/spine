@@ -4,6 +4,7 @@ database:
   tables:
     - slots
     - bookings
+    - cancellations
 
 # Deliberate mixed node forms: "Booking" is LIST-FORM — live proof of the
 # 2026-09-01 parser fix (list-form nodes were silently ignored, zeroing
@@ -95,12 +96,36 @@ routes:
         by: 1
     emit: SLOT_UNAVAILABLE
 
-  # Cancel: db.update payload IS the new row state (no `set:` key exists —
-  # every payload field becomes a SET column, including the where field).
-  # Status write goes through the async batched writer — "capacity is the
-  # guarantee, status is cosmetic and may lag."
+  # Cancel: verify-then-reverse. The compensating adjust must only fire for
+  # a booking transitioning confirmed -> cancelled — never for one that is
+  # already cancelled (a blind adjust mints phantom seats: double-cancel
+  # restored capacity twice in the 2026-09-01 stress test).
+  #
+  # The race-safe guard is the SAME composite-claim pattern as BOOK_SLOT:
+  # the cancellations table's composite key (booking_id) makes "cancel this
+  # booking" itself an atomic claim. The db.upsert runs synchronously and
+  # rejects on conflict BEFORE the capacity adjust runs, so 20 simultaneous
+  # cancels yield exactly one capacity restore. db.lookup + assert keep the
+  # loud failure lane (reject into ALREADY_CANCELLED, never a silent no-op)
+  # and give a precise error message; the composite upsert is what makes it
+  # race-proof. The db.update status flip stays cosmetic/batched — capacity
+  # is the guarantee, status may lag.
   - on: CANCEL_BOOKING
+    on_failure: ALREADY_CANCELLED
     steps:
+      - action: db.lookup
+        table: bookings
+        key_column: id
+        value_expr: $event.payload.booking_id
+        as: booking_
+      - action: assert
+        condition: "$event.payload.booking_status == 'confirmed'"
+        message: "booking is not cancellable (current status: $event.payload.booking_status)"
+      - action: db.upsert
+        table: cancellations
+        on_failure: ALREADY_CANCELLED
+        key:
+          - booking_id
       - action: db.update
         table: bookings
         where: "id = $event.payload.booking_id"
