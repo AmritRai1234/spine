@@ -358,6 +358,8 @@ ws.onmessage = (event) => {
 | `- action: stripe.checkout` | Creates a Stripe Checkout Session from the verified order total |
 | `- cron: 5m` on a route | Fires the pipeline on schedule — digests, abandoned carts, cleanups |
 | `- action: db.fanout` | On a cron tick, scans a table and independently fires an event for every due row — recurring billing, renewals, reminders |
+| `- action: slots.generate` | On a cron tick, turns business hours into bookable slot rows — idempotent regeneration, schedule changes never delete |
+| `- action: db.upsert` with list `key:` | Constraint claim: atomically rejects a second row with the same key combination — bookings, one-per-customer, seat claims |
 
 ### `db.fanout` — Timer-Driven Scan-and-Emit
 
@@ -404,6 +406,158 @@ The step injects `fanned_out` (count of events fired this tick) into the route p
 4. **Batching.** Keyset pagination (`_spine_id > cursor ORDER BY _spine_id LIMIT n`) — stable under concurrent writes, O(1) memory from 500 rows to 500,000+. Overlapping scans are serialized by the cron worker's running-guard, and even a racing scan just hits idempotency claims instead of double-firing.
 
 `db.fanout` requires `spine_version: 3`. It generalizes the built-in `subscriptions.sweep` action, which remains as the zero-config special case for the ecommerce template's hardcoded subscription shape.
+
+### `slots.generate` — Schedule-to-Slot Generation (Booking)
+
+The producing sibling of `db.fanout`: where fanout *consumes* rows (scan-and-emit), `slots.generate` *produces* them (compute-and-upsert). Point it at business hours on a cron and it fills your slot table with bookable rows — no manual seeding, no duplicated slots.
+
+```yaml
+routes:
+  - on: SLOTS_TICK
+    cron: 86400s            # nightly regeneration
+    steps:
+      - action: slots.generate
+        table: slots
+        days_ahead: 30        # how far out to maintain bookable slots
+        weekdays: "mon-sat"   # or "mon,wed,fri"; omit for all days
+        open: "09:00"
+        close: "17:00"
+        duration_minutes: 60
+        capacity: 4           # seats per slot
+```
+
+**Step config:**
+
+| Key | Meaning |
+|---|---|
+| `table` | Table to fill (required). Columns `id`, `start_time`, `end_time`, `capacity` are ensured automatically |
+| `days_ahead` | Days of bookable slots to maintain (optional, default 30, max 365) |
+| `weekdays` | Day filter: `"mon-fri"` range or comma list (optional, default all days) |
+| `open` / `close` | Business hours, `HH:MM` (required). `close` must be after `open` |
+| `duration_minutes` | Slot length in minutes (required, > 0) |
+| `capacity` | Seats per slot (optional, default 1) |
+
+**Safety properties (all tested in `tests/features/slots_generate_test.go`):**
+
+1. **Idempotent regeneration.** Slot ids are deterministic — `sgen-` + sha256(`table | start_time`) — so re-running the cron against an unchanged schedule produces the same ids and the upsert merges instead of duplicating. Nightly double-fire, crash mid-run, restart: zero duplicates.
+2. **Capacity is never reset.** The upsert's SET clause deliberately *excludes* `capacity`: regeneration refreshes timestamps but a slot with a live booking keeps its decremented value. Generation running concurrently with booking traffic cannot oversell or perturb claims — proven by a test that races 20 regenerations against 20 booking attempts on a fully-claimed slot.
+3. **Schedule changes never delete.** If hours change, slots from the old schedule stay bookable with their capacity intact — a slot with confirmed bookings is never silently vanished by a cron. Cleaning up stale generated slots is an explicit business decision (a route using `db.delete` filtered on `sgen-` ids with no bookings), not an implicit side effect.
+4. **Loud config errors.** A misconfigured schedule (`close` before `open`, bad `HH:MM`, invalid weekday) fails the route at emit time with a named fix — a cron action must fail visibly, not the startup.
+
+`slots.generate` requires `spine_version: 3` and only touches rows in its own `sgen-` id namespace — manually seeded slots are never modified or removed.
+
+### Booking with Spine — A Complete Example (`examples/booking/`)
+
+`examples/booking/app.spine` is a working booking system built from three primitives: `slots.generate` (supply), `db.adjust` (atomic claim), and composite-key `db.upsert` (constraint). Run it:
+
+```bash
+spine dev examples/booking/app.spine --port 8091 --api-key bk-dev-key
+```
+
+```yaml
+routes:
+  # 1. SUPPLY — nightly slot generation (see slots.generate above).
+  - on: SLOTS_TICK
+    cron: 86400s
+    steps:
+      - action: slots.generate
+        table: slots
+        days_ahead: 30
+        open: "09:00"
+        close: "17:00"
+        duration_minutes: 60
+        capacity: 4
+
+  # 2. CLAIM — two atomic guards, each in its own failure lane:
+  #    - db.adjust floor-reject = slot full (seat never taken; no compensation)
+  #    - composite upsert conflict = this customer already booked (seat taken;
+  #      RELEASE_SEAT restores capacity synchronously)
+  - on: BOOK_SLOT
+    on_failure: SLOT_UNAVAILABLE
+    steps:
+      - action: db.adjust
+        table: slots
+        where: "id = $event.payload.slot_id"
+        column: capacity
+        by: -1
+        floor: 0
+      - action: set
+        id: $uuid
+        created_at: $now
+        status: confirmed
+        reminder_due: $event.payload.slot_start_time
+      - action: db.lookup
+        table: slots
+        key_column: id
+        value_expr: $event.payload.slot_id
+        as: slot_
+      - action: db.upsert
+        table: bookings
+        on_failure: RELEASE_SEAT
+        key:
+          - slot_id
+          - customer_email
+    emit: BOOKING_CONFIRMED
+
+  # 3. CANCEL — the reverse-operation rule: any route that gives something
+  #    back must first verify the thing it reverses was in the state being
+  #    reversed from. lookup+assert gives the loud failure lane (reject a
+  #    double-cancel as ALREADY_CANCELLED, never a silent no-op); the
+  #    cancellations claim makes it race-proof (20 simultaneous cancels of
+  #    one booking yield exactly one capacity restore).
+  - on: CANCEL_BOOKING
+    on_failure: ALREADY_CANCELLED
+    steps:
+      - action: db.lookup
+        table: bookings
+        key_column: id
+        value_expr: $event.payload.booking_id
+        as: booking_
+      - action: assert
+        condition: "$event.payload.booking_status == 'confirmed'"
+      - action: db.upsert
+        table: cancellations
+        on_failure: ALREADY_CANCELLED
+        key:
+          - booking_id
+      - action: db.update
+        table: bookings
+        where: "id = $event.payload.booking_id"
+      - action: db.adjust
+        table: slots
+        where: "id = $event.payload.slot_id"
+        column: capacity
+        by: 1
+    emit: BOOKING_CANCELLED
+
+  # 4. REMIND — fanout over bookings whose slot is due (hourly cron).
+  - on: REMINDER_TICK
+    cron: 3600s
+    steps:
+      - action: db.fanout
+        table: bookings
+        where: "reminder_due <= $now"
+        emit_event: BOOKING_DUE
+        due_column: reminder_due
+        interval_column: created_at
+```
+
+Booking it from the browser/CLI:
+
+```bash
+curl -X POST http://localhost:8091/emit \
+  -H "Content-Type: application/json" -H "X-API-Key: bk-dev-key" \
+  -d '{"event":"BOOK_SLOT","payload":{"slot_id":"sgen-3b6144e65d9602e7","customer_email":"ana@example.com"}}'
+```
+
+**Why the guards are shaped this way** (each was found by a real failure, not designed in a vacuum):
+
+- **Composite-key claim on `(slot_id, customer_email)`** — "one booking per customer per slot" must be enforced by the database, not application logic. Under a 100-racer race on a 1-seat slot, exactly one customer wins; every loser is atomically rejected.
+- **Two failure lanes, not one** — a floor-reject (slot full) must *not* restore capacity (the seat was never taken) while an upsert-conflict (duplicate customer) *must* (the seat was taken). Routing both through one failure state handed out seats nobody held — caught by a race test, not by review.
+- **The cancellations claim** — a double-cancel must restore capacity once, not twice. A blind `db.adjust +1` on every cancel minted phantom seats under a stress test; the atomic claim row closes it even when 20 cancels of one booking race simultaneously.
+- **`db.lookup` before reversing** — the payload only knows what the caller *asks for*; the row's current status must be read from the database before giving anything back.
+
+The general rule these encode: **any route that gives something back (capacity, refund, credit) must verify the thing it reverses was actually in the state being reversed from.**
 
 ### Frontend with Vite + shadcn/ui (native template)
 
@@ -537,7 +691,7 @@ routes:
 |---|---|---|
 | `db.insert` | Insert a row into a table | `table` (required) |
 | `db.update` | Update rows matching `where:` (parameterized `column op value`), or the payload's `id` when omitted | `table` (required), `where` (optional) |
-| `db.upsert` | Insert or update on conflict | `table` (required), `key` (conflict column, default: `id`). Fails explicitly if `key` is missing from payload. |
+| `db.upsert` | Insert or update on conflict. **Key arity decides semantics:** scalar `key: email` (or a single-element list) = *identity* — conflict merges into the existing row; list `key: [a, b]` (or literal `"a,b"`) = *constraint* — conflict **rejects the route** into `on_failure` (runs synchronously so the failure surfaces). Composite keys make `db.upsert` an atomic claim primitive: bookings, one-per-customer, seat claims. Fails explicitly if `key` is missing from payload. | `table` (required), `key` (scalar = merge, list = reject-on-conflict; default `id`) |
 | `db.delete` | Delete rows matching `where:` (parameterized), or by payload `id` | `table`, `where` (optional) |
 | `db.sum` | Sum a numeric column into the payload (`0` on empty tables) | `table`, `column` (required); `where`, `as` (optional, default `sum_result`) |
 | `db.lookup` | Merge one row's columns into the payload (optionally prefixed via `as:`) | `table`, `key_column`, `value_expr` (required); `as`, `optional: true` (tolerate missing row) |
@@ -555,6 +709,7 @@ routes:
 | `email.send` | Transactional email over SMTP (silent no-op when `SMTP_HOST` unset) — tier 2 | `to`, `subject`, `body` (required); `from`, `html: true`, `unsubscribe_url` (optional) |
 | `email.broadcast` | Marketing send to every row of a recipients table; `{{email}}` templating, count lands in payload as `email_sent` — tier 2 | `table` (required); `where`, `subject`, `body`, `from`, `html`, `unsubscribe_url`, `email_column` (optional) |
 | `stripe.checkout` | Create a Stripe Checkout Session; payload gains `checkout_url` + `checkout_session_id`. Amounts are DOLLARS, converted to cents server-side. Silent no-op when `STRIPE_SECRET_KEY` unset. Tier 3 | `order_id`, `amount`, `success_url`, `cancel_url` (required); `currency` (default `usd`), `description`, `customer_email` (optional) |
+| `slots.generate` | Turn business hours into bookable slot rows on a cron — deterministic ids make re-runs idempotent, capacity on existing rows is never reset, schedule changes never delete. See the dedicated section above. Tier 3 | `table`, `open`, `close`, `duration_minutes` (required); `days_ahead` (default 30), `weekdays`, `capacity` (default 1) (optional) |
 
 #### Email Marketing
 
@@ -1156,7 +1311,7 @@ The `.spine` manifest parser includes production-grade hardening:
 |---|---|
 | `1` | Classic tier: all `db.*`, `set`/`unset`, `assert`, `math.calc`, `http.post`, `notify.webhook`, `log.write`, `fts.search`, `emit_to`, `queue.publish`, cron routes |
 | `2` | v1 + email marketing: `email.send`, `email.broadcast` |
-| `3` | v2 + money movement: `stripe.checkout` (Stripe Checkout Session creation) + `db.fanout` (timer-driven scan-and-emit) |
+| `3` | v2 + money movement & scheduling: `stripe.checkout` (Stripe Checkout Session creation) + `db.fanout` (timer-driven scan-and-emit) + `slots.generate` (schedule-to-slot generation) + `domain.connect`, `stripe.connect` |
 
 ```
 route 'SEND_MAIL', step 1: action 'email.send' requires 'spine_version: 2'
