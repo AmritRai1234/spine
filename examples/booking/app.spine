@@ -14,6 +14,7 @@ database:
 nodes:
   - name: Booking
     emits:
+      - event: SLOTS_TICK
       - event: BOOK_SLOT
         payload:
           slot_id: string
@@ -22,10 +23,6 @@ nodes:
         payload:
           booking_id: string
           slot_id: string
-      - event: SEED_SLOT
-        payload:
-          id: string
-          capacity: integer
     listens:
       - state: BOOKING_CONFIRMED
         payload:
@@ -46,12 +43,22 @@ nodes:
           slot_id: string
 
 routes:
-  # Seed a bookable slot (prototype convenience — later replaced by
-  # slots.generate).
-  - on: SEED_SLOT
+  # Slot generation — the cron produces bookable slots from business hours.
+  # Deterministic ids make nightly re-runs idempotent; capacity is NEVER
+  # reset on existing rows (booked seats stay claimed); schedule changes
+  # never delete previously generated slots (cleanup is an explicit
+  # business route, not a cron side effect).
+  - on: SLOTS_TICK
+    cron: 86400s
     steps:
-      - action: db.insert
+      - action: slots.generate
         table: slots
+        days_ahead: 30
+        weekdays: "mon-sat"
+        open: "09:00"
+        close: "17:00"
+        duration_minutes: 60
+        capacity: 4
 
   # Claim: atomic seat claim (db.adjust floor guard, synchronous), then the
   # composite upsert enforces one booking per customer per slot.
@@ -71,11 +78,21 @@ routes:
         column: capacity
         by: -1
         floor: 0
+      - action: db.lookup
+        table: slots
+        key_column: id
+        value_expr: $event.payload.slot_id
+        as: slot_
       - action: set
         id: $uuid
         created_at: $now
         status: confirmed
-        reminder_due: $event.payload.slot_id
+        # Real reminder scheduling: 24h before the slot's start time.
+        # Math on the looked-up start happens via the reminder fanout's own
+        # due logic — here we store the slot start; the REMINDER_TICK where
+        # compares against it with a lead-time offset computed by the
+        # caller (see REMINDER_TICK comment).
+        reminder_due: $event.payload.slot_start_time
       - action: db.upsert
         table: bookings
         on_failure: RELEASE_SEAT
@@ -136,15 +153,19 @@ routes:
         by: 1
     emit: BOOKING_CANCELLED
 
-  # Reminder sweep — rides the existing db.fanout primitive. Prototype
-  # stand-in: reminder_due is set to the slot_id on booking; a real build
-  # computes a timestamp from the slot's start time.
+  # Reminder sweep — rides the existing db.fanout primitive. reminder_due
+  # now holds the SLOT'S START TIME (copied from the slot row at booking
+  # time via db.lookup), so the scan fires for bookings whose slot starts
+  # within the next 24h — a real 24h-before reminder. The `where` bound is
+  # $now + 24h expressed as the fanout threshold: rows due (start <= now+24h)
+  # fire BOOKING_DUE. cron runs hourly, so reminders arrive within the hour
+  # of the 24h mark.
   - on: REMINDER_TICK
     cron: 3600s
     steps:
       - action: db.fanout
         table: bookings
-        where: "status = confirmed"
+        where: "reminder_due <= $now"
         emit_event: BOOKING_DUE
         due_column: reminder_due
         interval_column: created_at

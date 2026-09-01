@@ -41,6 +41,10 @@ var actionMinVersion = map[string]int{
 	// and fires unbounded events per tick, so it joins the tier-3 adult table.
 	"db.fanout": 3,
 
+	// Tier 3 — schedule-to-slot generation (booking). Upserts an unbounded
+	// number of rows per tick from a cron; joins fanout's tier.
+	"slots.generate": 3,
+
 	// Tier 3 — infrastructure: alters the live TLS allowlist and performs DNS
 	// verification. Admin-gated at the route level like stripe.connect.
 	"domain.connect": 3,
