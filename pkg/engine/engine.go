@@ -609,6 +609,55 @@ func (e *Engine) buildMux() *http.ServeMux {
 		})
 	}))
 
+	mux.HandleFunc("/oauth/", func(w http.ResponseWriter, r *http.Request) {
+		// OAuth callback from a social provider. The browser arrives here
+		// with no API key — it must stay auth-exempt. State (minted at
+		// connect start, single-use, 15-min TTL) is the CSRF guard, the same
+		// anti-replay role the HMAC webhook secret plays for /webhook/*.
+		w.Header().Set("Content-Type", "application/json")
+		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/oauth/"), "/")
+		if len(parts) != 2 || parts[1] != "callback" {
+			w.WriteHeader(404)
+			w.Write([]byte(`{"status":"error","error":"not_found"}`))
+			return
+		}
+		platform := parts[0]
+		q := r.URL.Query()
+		if errMsg := q.Get("error"); errMsg != "" {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": "error", "platform": platform, "error": errMsg,
+				"description": q.Get("error_description"),
+			})
+			return
+		}
+		code := q.Get("code")
+		state := q.Get("state")
+		if code == "" || state == "" {
+			w.WriteHeader(400)
+			w.Write([]byte(`{"status":"error","error":"missing_code_or_state"}`))
+			return
+		}
+		returnTo, err := e.Bus.SocialOAuthCallback(platform, code, state)
+		if err != nil {
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "platform": platform, "error": err.Error()})
+			return
+		}
+		if returnTo != "" {
+			// Open-redirect guard: return_to must be http(s) — set at connect
+			// time by the admin route, not by the provider.
+			if strings.HasPrefix(returnTo, "https://") || strings.HasPrefix(returnTo, "http://") {
+				http.Redirect(w, r, returnTo, http.StatusFound)
+				return
+			}
+			w.WriteHeader(400)
+			json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": "return_url must be an absolute http(s) URL"})
+			return
+		}
+		json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "platform": platform, "connected": true})
+	})
+
 	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 		opt := e.Bus.GetOptimizer()

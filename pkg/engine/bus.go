@@ -214,6 +214,13 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 	}
 	bus.startIdempotencyEvictor()
 
+	// Social token vault: restore encrypted OAuth accounts from the previous
+	// session (no-op unless SPINE_SOCIAL_VAULT_KEY is set).
+	if err := bus.ensureSocialVaultTable(); err != nil {
+		return nil, err
+	}
+	bus.socialVaultLoadAll()
+
 	return bus, nil
 }
 

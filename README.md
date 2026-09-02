@@ -710,6 +710,12 @@ routes:
 | `email.broadcast` | Marketing send to every row of a recipients table; `{{email}}` templating, count lands in payload as `email_sent` — tier 2 | `table` (required); `where`, `subject`, `body`, `from`, `html`, `unsubscribe_url`, `email_column` (optional) |
 | `stripe.checkout` | Create a Stripe Checkout Session; payload gains `checkout_url` + `checkout_session_id`. Amounts are DOLLARS, converted to cents server-side. Silent no-op when `STRIPE_SECRET_KEY` unset. Tier 3 | `order_id`, `amount`, `success_url`, `cancel_url` (required); `currency` (default `usd`), `description`, `customer_email` (optional) |
 | `slots.generate` | Turn business hours into bookable slot rows on a cron — deterministic ids make re-runs idempotent, capacity on existing rows is never reset, schedule changes never delete. See the dedicated section above. Tier 3 | `table`, `open`, `close`, `duration_minutes` (required); `days_ahead` (default 30), `weekdays`, `capacity` (default 1) (optional) |
+| `domain.connect` | One-click custom domain connect from the admin panel — verifies DNS points at this server, then adds the host to the live Let's Encrypt allowlist (no restart). Tier 3 | `mode` (`disconnect` optional; payload `domain`) |
+| `stripe.connect` | Install runtime Stripe credentials from an admin event (env keeps precedence). Tier 3 | `mode` (`disconnect` optional; payload `stripe_secret`, `webhook_secret`) |
+| `social.connect` | OAuth connect a social account (Facebook Pages, X, LinkedIn, Instagram). `start` mints `social_auth_url` + single-use `social_state`; `manual` installs a pre-acquired token; `disconnect` drops the account. Tokens persist AES-256-GCM encrypted in `_spine_social_tokens` when `SPINE_SOCIAL_VAULT_KEY` is set (session-only otherwise). Callback route: `/oauth/<platform>/callback`. Tier 3 | `mode` (default `start`); payload `platform` (required), `return_url`, `account_key`, `access_token`, `refresh_token`, `account_label` (mode-dependent) |
+| `social.post` | Publish to a connected social account; payload gains `social_post_id` + `social_platform` | `platform`, `text` (required); `account_key` (optional, multi-account) — tier 3 |
+| `notify.push` | Push notification to mobile/web via FCM, APNs, Web Push, or a generic relay (auto-detected per token shape; silent no-op when no provider is configured). Stale tokens (404/410) land in `_push_stale_tokens` for route cleanup, delivery continues. Payload gains `push_delivered` + `push_total`. `data_`-prefixed payload fields become the provider data payload (deep links) | `title`, `body` (required); payload `token` or `tokens` — tier 3 |
+| `notify.push.register` | Register/upsert a device push token into a manifest-declared table (identity merge on the token — re-registrations update metadata) | `table` (required); `token_column`, `user_column`, `platform_column` (optional); payload `token` (required) — tier 3 |
 
 #### Email Marketing
 
@@ -1312,6 +1318,8 @@ The `.spine` manifest parser includes production-grade hardening:
 | `1` | Classic tier: all `db.*`, `set`/`unset`, `assert`, `math.calc`, `http.post`, `notify.webhook`, `log.write`, `fts.search`, `emit_to`, `queue.publish`, cron routes |
 | `2` | v1 + email marketing: `email.send`, `email.broadcast` |
 | `3` | v2 + money movement & scheduling: `stripe.checkout` (Stripe Checkout Session creation) + `db.fanout` (timer-driven scan-and-emit) + `slots.generate` (schedule-to-slot generation) + `domain.connect`, `stripe.connect` |
+| `3` (same tier) | Social publishing: `social.connect` (OAuth connect for Facebook Pages, X, LinkedIn, Instagram) + `social.post` (publish to a connected account) |
+| `3` (same tier) | Mobile push: `notify.push` (FCM / APNs / Web Push / generic relay) + `notify.push.register` (device token registration into a manifest table) |
 
 ```
 route 'SEND_MAIL', step 1: action 'email.send' requires 'spine_version: 2'

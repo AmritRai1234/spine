@@ -24,35 +24,39 @@ import (
 // in actionSchemas skip config-key validation entirely (their Config remains
 // free-form by design).
 var actionSchemas = map[string]map[string]bool{
-	"db.insert":           keys("sync"),
-	"db.update":           keys(),
-	"db.upsert":           keys("conflict_key", "key"),
-	"db.delete":           keys(),
-	"db.sum":              keys("as", "column"),
-	"db.lookup":           keys("as", "key_column", "optional", "value_expr"),
-	"db.adjust":           keys("by", "column", "floor"),
-	"set":                 keys(), // free-form: every pair is a payload field
-	"unset":               keys("fields"),
-	"assert":              keys("condition", "message"),
-	"log.write":           keys(), // uses step.Message
-	"http.post":           keys(), // uses step.URL / step.Input
-	"notify.webhook":      keys(), // uses step.URL
-	"fts.search":          keys("query"),
-	"emit_to":             keys("stream"),
-	"queue.publish":       keys(),
-	"emit":                keys(),
-	"math.calc":           keys("expr", "set"),
-	"email.send":          keys("body", "from", "html", "subject", "to", "unsubscribe_url"),
-	"email.broadcast":     keys("body", "email_column", "from", "html", "subject", "unsubscribe_url"),
-	"subscriptions.sweep": keys(),
-	"db.fanout":           keys("batch_size", "due_column", "emit_event", "interval_column"),
-	"slots.generate":      keys("capacity", "close", "days_ahead", "duration_minutes", "open", "weekdays"),
-	"stripe.checkout":     keys("amount", "cancel_url", "currency", "customer_email", "description", "order_id", "success_url"),
-	"stripe.connect":      keys("mode"),
-	"domain.connect":      keys("mode"),
-	"auth.hash":           keys("password", "set"),
-	"auth.verify":         keys("hash", "password", "set"),
-	"tracking.register":   keys("as", "body", "from", "headers", "numbers", "optional", "url"),
+	"db.insert":            keys("sync"),
+	"db.update":            keys(),
+	"db.upsert":            keys("conflict_key", "key"),
+	"db.delete":            keys(),
+	"db.sum":               keys("as", "column"),
+	"db.lookup":            keys("as", "key_column", "optional", "value_expr"),
+	"db.adjust":            keys("by", "column", "floor"),
+	"set":                  keys(), // free-form: every pair is a payload field
+	"unset":                keys("fields"),
+	"assert":               keys("condition", "message"),
+	"log.write":            keys(), // uses step.Message
+	"http.post":            keys(), // uses step.URL / step.Input
+	"notify.webhook":       keys(), // uses step.URL
+	"fts.search":           keys("query"),
+	"emit_to":              keys("stream"),
+	"queue.publish":        keys(),
+	"emit":                 keys(),
+	"math.calc":            keys("expr", "set"),
+	"email.send":           keys("body", "from", "html", "subject", "to", "unsubscribe_url"),
+	"email.broadcast":      keys("body", "email_column", "from", "html", "subject", "unsubscribe_url"),
+	"subscriptions.sweep":  keys(),
+	"db.fanout":            keys("batch_size", "due_column", "emit_event", "interval_column"),
+	"slots.generate":       keys("capacity", "close", "days_ahead", "duration_minutes", "open", "weekdays"),
+	"stripe.checkout":      keys("amount", "cancel_url", "currency", "customer_email", "description", "order_id", "success_url"),
+	"stripe.connect":       keys("mode"),
+	"domain.connect":       keys("mode"),
+	"social.connect":       keys("mode"),
+	"social.post":          keys("account_key", "platform", "text"),
+	"notify.push":          keys("body", "title"),
+	"notify.push.register": keys("platform_column", "table", "token_column", "user_column"),
+	"auth.hash":            keys("password", "set"),
+	"auth.verify":          keys("hash", "password", "set"),
+	"tracking.register":    keys("as", "body", "from", "headers", "numbers", "optional", "url"),
 }
 
 // builtinActions is the sorted list of every action the engine dispatches

@@ -45,6 +45,16 @@ var actionMinVersion = map[string]int{
 	// number of rows per tick from a cron; joins fanout's tier.
 	"slots.generate": 3,
 
+	// Tier 3 — third-party OAuth: outbound network publishing under live
+	// app credentials. Admin-gated at the route level like stripe.connect.
+	"social.connect": 3,
+	"social.post":    3,
+
+	// Tier 3 — push notifications: outbound calls to FCM/APNs/Web-Push with
+	// live provider credentials, unbounded fanout over device tokens.
+	"notify.push":          3,
+	"notify.push.register": 3,
+
 	// Tier 3 — infrastructure: alters the live TLS allowlist and performs DNS
 	// verification. Admin-gated at the route level like stripe.connect.
 	"domain.connect": 3,

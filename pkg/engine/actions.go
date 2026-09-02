@@ -117,6 +117,14 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		return b.stripeConnect(step, eventName, payload)
 	case "domain.connect":
 		return b.domainConnect(step, eventName, payload)
+	case "social.connect":
+		return b.socialConnect(step, eventName, payload)
+	case "social.post":
+		return b.socialPost(step, eventName, payload)
+	case "notify.push":
+		return b.notifyPush(step, eventName, payload)
+	case "notify.push.register":
+		return b.notifyPushRegister(step, eventName, payload)
 	case "auth.hash":
 		return b.authHash(step, eventName, payload)
 	case "auth.verify":
