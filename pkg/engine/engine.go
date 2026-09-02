@@ -10,6 +10,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -483,6 +484,59 @@ func (e *Engine) wrapWebhookMiddleware(handler http.HandlerFunc) http.HandlerFun
 	return h
 }
 
+// wrapPublicBrowserMiddleware applies the standard chain to browser-facing
+// auth-exempt endpoints (OAuth callback). Same layers as the webhook chain,
+// minus webhook signature verification (the single-use state token plays the
+// HMAC role here) — this is what gives the endpoint rate limiting, security
+// headers, logging, and panic recovery instead of running raw on the mux.
+func (e *Engine) wrapPublicBrowserMiddleware(handler http.HandlerFunc) http.HandlerFunc {
+	h := handler
+
+	if e.rateLimiter != nil {
+		h = e.rateLimiter.Middleware(h)
+	}
+
+	h = middleware.BodyLimitMiddleware(maxRequestBodySize, h)
+	h = middleware.DepthLimitMiddleware(32, h)
+	h = middleware.SecurityHeadersMiddleware(h)
+	h = middleware.CORSMiddleware(middleware.DefaultCORSOptions(), h)
+
+	if e.customContext != nil {
+		h = e.customContext.Middleware(h)
+	}
+
+	h = middleware.LoggingMiddleware(h)
+	h = middleware.RecoveryMiddleware(h)
+
+	return h
+}
+
+// SafeRedirectURL validates a post-OAuth redirect target set at connect time.
+// Exported so embedders reuse the exact guard the engine applies.
+// Returns "" when the URL is not a safe absolute http(s) address:
+//   - scheme must be exactly http or https (no javascript:, data:, etc.)
+//   - host must be present and non-empty (rejects scheme-relative "//evil.com")
+//   - userinfo credentials (user@host) are rejected — a redirect to
+//     https://evil.com@shop.example.com renders as evil.com's host in some
+//     tooling and is never what an operator asked for
+func SafeRedirectURL(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return ""
+	}
+	if u.Host == "" || u.User != nil {
+		return ""
+	}
+	return raw
+}
+
 // wsClientIP returns the client IP for the /ws per-IP cap, honoring trusted
 // proxy headers when the rate limiter is configured (which validates them),
 // and falling back to the raw remote address otherwise.
@@ -617,7 +671,7 @@ func (e *Engine) buildMux() *http.ServeMux {
 		})
 	}))
 
-	mux.HandleFunc("/oauth/", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/oauth/", e.wrapPublicBrowserMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// OAuth callback from a social provider. The browser arrives here
 		// with no API key — it must stay auth-exempt. State (minted at
 		// connect start, single-use, 15-min TTL) is the CSRF guard, the same
@@ -653,10 +707,12 @@ func (e *Engine) buildMux() *http.ServeMux {
 			return
 		}
 		if returnTo != "" {
-			// Open-redirect guard: return_to must be http(s) — set at connect
-			// time by the admin route, not by the provider.
-			if strings.HasPrefix(returnTo, "https://") || strings.HasPrefix(returnTo, "http://") {
-				http.Redirect(w, r, returnTo, http.StatusFound)
+			// Open-redirect guard: return_to must be a safe absolute
+			// http(s) URL — set at connect time by the admin route, not
+			// by the provider. SafeRedirectURL also rejects schemeless,
+			// credential-bearing, and non-http schemes.
+			if safe := SafeRedirectURL(returnTo); safe != "" {
+				http.Redirect(w, r, safe, http.StatusFound)
 				return
 			}
 			w.WriteHeader(400)
@@ -664,7 +720,7 @@ func (e *Engine) buildMux() *http.ServeMux {
 			return
 		}
 		json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "platform": platform, "connected": true})
-	})
+	}))
 
 	// Metrics: authenticated and rate-limited by default. Scraping RPS,
 	// batch sizes, and durability counters is recon gold — the endpoint
