@@ -193,9 +193,10 @@ func TestWebSocketConnCap(t *testing.T) {
 	}
 }
 
-// TestMetricsDurabilityCounters verifies the new write-path counters are
-// exposed on /metrics.
+// TestMetricsDurabilityCounters verifies the write-path durability counters
+// are exposed on /metrics when the endpoint is publicly opted in.
 func TestMetricsDurabilityCounters(t *testing.T) {
+	t.Setenv("SPINE_METRICS_PUBLIC", "1")
 	eng := newHardeningEngine(t)
 	server := httptest.NewServer(eng.HTTPHandler())
 	defer server.Close()

@@ -167,6 +167,14 @@ func (e *Engine) RegisterCustomExtractor(fn middleware.CustomExtractorFunc) {
 	e.customContext.AddExtractor(fn)
 }
 
+// accessResolverHasRules reports whether multi-key access rules are loaded.
+func (e *Engine) accessResolverHasRules() bool {
+	if resolver := e.accessPtr.Load(); resolver != nil {
+		return resolver.HasRules()
+	}
+	return false
+}
+
 // SetStaticContext registers a static key-value attribute into request context (e.g. region="us-west-2", environment="production").
 func (e *Engine) SetStaticContext(key string, value interface{}) {
 	e.customContext.SetStaticAttribute(key, value)
@@ -658,8 +666,27 @@ func (e *Engine) buildMux() *http.ServeMux {
 		json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "platform": platform, "connected": true})
 	})
 
-	mux.HandleFunc("/metrics", func(w http.ResponseWriter, r *http.Request) {
+	// Metrics: authenticated and rate-limited by default. Scraping RPS,
+	// batch sizes, and durability counters is recon gold — the endpoint
+	// must never be a free open port. SPINE_METRICS_PUBLIC=1 opts out for
+	// operators whose Prometheus scrape lives behind its own network
+	// controls (re-read per request so tests and reconfiguration apply
+	// without a restart).
+	mux.HandleFunc("/metrics", e.wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
+		if os.Getenv("SPINE_METRICS_PUBLIC") != "1" && e.APIKey == "" && !e.accessResolverHasRules() {
+			// No auth configured at all: the wrapMiddleware chain had
+			// nothing to enforce, so enforce the public-opt-in ourselves —
+			// an unauthenticated deployment serves metrics only when the
+			// operator has explicitly declared them public.
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusUnauthorized)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status": "error",
+				"error":  "unauthorized: metrics require an API key (or SPINE_METRICS_PUBLIC=1)",
+			})
+			return
+		}
 		opt := e.Bus.GetOptimizer()
 		rps := 0.0
 		batchSize := 500
@@ -709,7 +736,7 @@ spine_dropped_broadcasts %d
 			e.Bus.CommitFailures(), e.Bus.SpillWrites(), e.Bus.LostWrites(), e.Bus.DroppedAudit(), e.Bus.StmtFailures(), e.Hub.DroppedBroadcasts())
 
 		w.Write([]byte(metrics))
-	})
+	}))
 
 	mux.HandleFunc("/admin/usage", e.wrapMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
