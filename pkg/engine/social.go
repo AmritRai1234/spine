@@ -134,6 +134,7 @@ func SocialReset() {
 	socialStates = map[string]socialFlowState{}
 	socialMu.Unlock()
 }
+
 // SocialConnections returns a sorted, secret-free snapshot of connected
 // platforms for dashboard display.
 func (b *Bus) SocialConnections() map[string]map[string]string {
@@ -451,12 +452,12 @@ func exchangeSocialToken(platform string, p socialPlatform, form url.Values) (*s
 	}
 
 	var parsed struct {
-		AccessToken      string `json:"access_token"`
-		RefreshToken     string `json:"refresh_token"`
-		ExpiresIn        int64  `json:"expires_in"`
-		AccountLabel     string `json:"name"`
-		ExternalID       string `json:"id"`
-		Err              struct{ Message string } `json:"error"`
+		AccessToken  string                   `json:"access_token"`
+		RefreshToken string                   `json:"refresh_token"`
+		ExpiresIn    int64                    `json:"expires_in"`
+		AccountLabel string                   `json:"name"`
+		ExternalID   string                   `json:"id"`
+		Err          struct{ Message string } `json:"error"`
 	}
 	if jerr := json.Unmarshal(body, &parsed); jerr != nil {
 		return nil, fmt.Errorf("social token response unparseable (HTTP %d): %.200s", resp.StatusCode, string(body))
@@ -657,7 +658,7 @@ func parseSocialPostResponse(resp *http.Response, err error, label string) (stri
 		return "", fmt.Errorf("%s response read failed: %w", label, err)
 	}
 	var parsed struct {
-		ID  string `json:"id"`
+		ID   string `json:"id"`
 		Data struct {
 			ID string `json:"id"`
 		} `json:"data"`

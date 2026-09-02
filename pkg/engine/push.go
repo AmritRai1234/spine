@@ -2,6 +2,7 @@ package engine
 
 import (
 	"bytes"
+	"crypto/ecdsa"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -9,6 +10,7 @@ import (
 	"net/http"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/AmritRai1234/spine/pkg/manifest"
 )
@@ -41,6 +43,44 @@ import (
 func PushProviderForToken(token string) string {
 	return pushProviderForToken(token)
 }
+
+// ParseWebPushTokenForTest exposes subscription parsing for tests.
+func ParseWebPushTokenForTest(token string) (endpoint, p256dh, auth string, err error) {
+	return parseWebPushToken(token)
+}
+
+// ParseEndpointOriginForTest exposes VAPID audience extraction for tests.
+func ParseEndpointOriginForTest(endpoint string) (string, error) {
+	return parseEndpointOrigin(endpoint)
+}
+
+// ParseVAPIDPrivateKeyForTest exposes VAPID private-key parsing for tests.
+func ParseVAPIDPrivateKeyForTest(privateB64 string) (*ecdsa.PrivateKey, error) {
+	return parseVAPIDPrivateKey(privateB64)
+}
+
+// B64URLDecodeForTest exposes the Web Push base64url decoder for tests.
+func B64URLDecodeForTest(s string) ([]byte, error) {
+	return b64urlDecode(s)
+}
+
+// VapidJWTForTest exposes RFC 8292 JWT minting for tests.
+func VapidJWTForTest(audience, subject string, priv *ecdsa.PrivateKey) (string, error) {
+	return vapidJWT(audience, subject, priv)
+}
+
+// PushEncryptWebPushForTest exposes RFC 8291 sealing for tests.
+func PushEncryptWebPushForTest(payload, clientPubRaw, authSecret []byte) (ciphertext, serverPubRaw []byte, err error) {
+	return pushEncryptWebPush(payload, clientPubRaw, authSecret)
+}
+
+// HkdfSHA256ForTest exposes HKDF-SHA256 for tests.
+func HkdfSHA256ForTest(salt, ikm, info []byte, length int) []byte {
+	return hkdfSHA256(salt, ikm, info, length)
+}
+
+// NowUnixForTest exposes time.Now().Unix() for test assertions.
+func NowUnixForTest() int64 { return time.Now().Unix() }
 
 type pushTarget struct {
 	Provider string // fcm | apns | webpush | generic
@@ -251,17 +291,7 @@ func pushSendAPNs(token, title, body string, data map[string]interface{}) error 
 	return pushPostJSON(endpoint, msg, pushAuthHeaders("apns"))
 }
 
-// pushSendWebPush posts a minimal Web Push message (VAPID auth delegated to
-// the endpoint override for now; a full VAPID JWT implementation lands with
-// real browser support — the shape and plumbing are ready).
-func pushSendWebPush(token, title, body string, data map[string]interface{}) error {
-	endpoint := token // Web Push target IS the subscription endpoint URL
-	msg := map[string]interface{}{"title": title, "body": body}
-	if len(data) > 0 {
-		msg["data"] = data
-	}
-	return pushPostJSON(endpoint, msg, pushAuthHeaders("webpush"))
-}
+// pushSendWebPush is implemented in push_webpush.go (RFC 8291 + RFC 8292).
 
 // pushSendGeneric posts the spine-generic shape: {token,title,body,data} to
 // SPINE_PUSH_API_BASE. Self-hosted relays and the test fake use this.
