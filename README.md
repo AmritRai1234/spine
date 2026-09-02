@@ -11,7 +11,7 @@
   <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/throughput-274K%20emit%2Fs-brightgreen?style=flat-square" alt="Throughput"></a>
   <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/latency-3.6μs-blue?style=flat-square" alt="Latency"></a>
   <a href="#performance--benchmarks"><img src="https://img.shields.io/badge/allocs-28%20per%20emit-purple?style=flat-square" alt="Allocs"></a>
-  <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-v1.25-00ADD8?style=flat-square&logo=go" alt="Go"></a>
+  <a href="https://pkg.go.dev/github.com/AmritRai1234/spine"><img src="https://img.shields.io/badge/Go-v1.27-00ADD8?style=flat-square&logo=go" alt="Go"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-LGPLv3-blue?style=flat-square" alt="License"></a>
   <a href="#tests"><img src="https://img.shields.io/badge/tests-100%25%20pass-brightgreen?style=flat-square" alt="Tests"></a>
 </p>
