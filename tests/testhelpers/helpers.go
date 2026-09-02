@@ -123,9 +123,16 @@ func (s *FakeSMTPServer) serve(conn net.Conn) {
 }
 
 // WaitCount waits until at least n messages are captured.
+//
+// The deadline is generous by design: this helper asserts mail DELIVERY
+// semantics, not SMTP latency. Under a loaded -race CI runner the engine's
+// email goroutines (with their retry backoff) can lag several seconds behind
+// the emitting test; a tight deadline turns that lag into a false failure of
+// the whole suite. 30s is still far below the go test default timeout, so a
+// genuinely broken mail path still fails fast.
 func (s *FakeSMTPServer) WaitCount(t *testing.T, n int) []CapturedMail {
 	t.Helper()
-	deadline := time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(30 * time.Second)
 	for time.Now().Before(deadline) {
 		s.Mu.Lock()
 		got := len(s.Messages)
