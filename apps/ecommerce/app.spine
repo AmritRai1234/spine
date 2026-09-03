@@ -436,6 +436,11 @@ routes:
   # plaintext — auth.hash overwrites the password field in-payload).
   - on: REGISTER_ACCOUNT
     steps:
+      # Account emails drive password reset + order tracking — format-guard
+      # them at the door, same pattern as PLACE_ORDER / SUBSCRIBE_EMAIL.
+      - action: assert
+        condition: "$event.payload.email matches '^[A-Za-z0-9._%+-]+@[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9](\.[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9])+$'"
+        message: "enter a valid email address to register"
       - action: db.lookup
         table: users
         key_column: email
@@ -1002,6 +1007,11 @@ routes:
   - on: PLACE_ORDER
     on_failure: CHECKOUT_FAILED
     steps:
+      # Server-side email format guard — the UI checks too, but a direct
+      # POST /emit bypasses the form. Anchored RE2; every domain label ≥2.
+      - action: assert
+        condition: "$event.payload.email matches '^[A-Za-z0-9._%+-]+@[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9](\.[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9])+$'"
+        message: "enter a valid email address to place an order"
       - action: set
         id: $event.payload.order_id
         status: pending
@@ -1209,6 +1219,11 @@ routes:
       - action: assert
         condition: "$event.payload.email exists"
         message: "email is required to subscribe"
+      # Same format guard as PLACE_ORDER — keeps junk out of the recipients
+      # table even when the event arrives over the API, not the footer form.
+      - action: assert
+        condition: "$event.payload.email matches '^[A-Za-z0-9._%+-]+@[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9](\.[A-Za-z0-9][A-Za-z0-9-]*[A-Za-z0-9])+$'"
+        message: "enter a valid email address to subscribe"
       - action: set
         id: $uuid
         created_at: $now
@@ -1541,7 +1556,7 @@ routes:
         to: $event.payload.sub_email
         subject: "Your subscription has been cancelled"
         body: "Your subscription ($event.payload.plan_name) will not renew again."
-        optional: true
+        if: "$event.payload.sub_email exists"
         on_failure: EMAIL_FAILED
         max_attempts: 3
         backoff_ms: 250

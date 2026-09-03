@@ -16,6 +16,7 @@ import { spine } from "@/lib/spine"
 import { CA_PROVINCES } from "@/lib/canada"
 import { cityKeyFor, matchCity } from "@/lib/canada-cities"
 import { getCartId } from "@/lib/cart"
+import { isValidEmail } from "@/lib/validate"
 import { money } from "@/lib/format"
 import type { CartItemRow, OrderRow } from "@/types"
 
@@ -49,6 +50,7 @@ export default function Checkout({ onTrackOrders }: CheckoutProps) {
   const [phase, setPhase] = useState<Phase>("form")
   const [order, setOrder] = useState<OrderRow | null>(null)
   const [error, setError] = useState<string | null>(null)
+  const [emailError, setEmailError] = useState("")
   const cartId = getCartId()
 
   // Coupon state — only engine-validated values are ever trusted here
@@ -190,7 +192,11 @@ export default function Checkout({ onTrackOrders }: CheckoutProps) {
 
   async function placeOrder(e: FormEvent) {
     e.preventDefault()
-    if (!email.trim()) return
+    if (!isValidEmail(email)) {
+      setEmailError("Enter a valid email — e.g. you@example.com")
+      return
+    }
+    setEmailError("")
     setError(null)
     setPhase("placing")
     localStorage.setItem(EMAIL_KEY, email.trim())
@@ -335,14 +341,18 @@ export default function Checkout({ onTrackOrders }: CheckoutProps) {
         </CardDescription>
       </CardHeader>
       <CardContent>
-        <form onSubmit={placeOrder} className="space-y-3">
-          <Input
-            type="email"
-            placeholder="Email — you@example.com"
-            value={email}
-            onChange={(e) => setEmail(e.target.value)}
-            required
-          />
+        <form onSubmit={placeOrder} className="space-y-3" noValidate>
+          <div className="space-y-1">
+            <Input
+              type="email"
+              placeholder="Email — you@example.com"
+              value={email}
+              aria-invalid={!!emailError}
+              onChange={(e) => { setEmail(e.target.value); setEmailError("") }}
+              required
+            />
+            {emailError && <p className="text-xs text-destructive">{emailError}</p>}
+          </div>
           <Input
             placeholder="Full name"
             value={shipName}

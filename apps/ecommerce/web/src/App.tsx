@@ -15,6 +15,7 @@ import {
 import CartDrawer from "@/components/CartDrawer"
 import { useSpineStateTick } from "@/hooks/use-spine"
 import { spine } from "@/lib/spine"
+import { isValidEmail } from "@/lib/validate"
 import { getCartId } from "@/lib/cart"
 import { useStoreSettings } from "@/lib/store"
 import Catalog from "@/pages/Catalog"
@@ -48,6 +49,7 @@ export default function App() {
   const [dark, toggleDark] = useDarkMode()
   const settings = useStoreSettings()
   const [newsletterEmail, setNewsletterEmail] = useState("")
+  const [newsletterError, setNewsletterError] = useState("")
   const [cartOpen, setCartOpen] = useState(false)
   const [mobileMenuOpen, setMobileMenuOpen] = useState(false)
 
@@ -77,7 +79,11 @@ export default function App() {
   async function joinNewsletter(e: FormEvent) {
     e.preventDefault()
     const email = newsletterEmail.trim()
-    if (!email) return
+    if (!isValidEmail(email)) {
+      setNewsletterError("Enter a valid email — e.g. you@example.com")
+      return
+    }
+    setNewsletterError("")
     try {
       await spine.emit("SUBSCRIBE_EMAIL", { email })
       toast.success("You're on the list — first drops land soon.")
@@ -287,16 +293,20 @@ export default function App() {
           <div>
             <p className="text-sm font-semibold uppercase tracking-wider text-muted-foreground">Newsletter</p>
             <p className="mt-3 text-sm text-muted-foreground">New drops, straight to your inbox.</p>
-            <form onSubmit={joinNewsletter} className="mt-3 flex gap-2">
-              <Input
-                type="email"
-                required
-                placeholder="you@example.com"
-                className="bg-background"
-                value={newsletterEmail}
-                onChange={(e) => setNewsletterEmail(e.target.value)}
-              />
-              <Button type="submit" variant="outline">Join</Button>
+            <form onSubmit={joinNewsletter} className="mt-3 space-y-1" noValidate>
+              <div className="flex gap-2">
+                <Input
+                  type="email"
+                  required
+                  placeholder="you@example.com"
+                  className="bg-background"
+                  value={newsletterEmail}
+                  aria-invalid={!!newsletterError}
+                  onChange={(e) => { setNewsletterEmail(e.target.value); setNewsletterError("") }}
+                />
+                <Button type="submit" variant="outline">Join</Button>
+              </div>
+              {newsletterError && <p className="text-xs text-destructive">{newsletterError}</p>}
             </form>
           </div>
         </div>

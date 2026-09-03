@@ -2,6 +2,7 @@ package engine
 
 import (
 	"log"
+	"regexp"
 	"strconv"
 	"strings"
 )
@@ -169,8 +170,9 @@ func evalClause(cond string, eventName string, payload map[string]interface{}) b
 
 	// Operators to check in order of specificity. Single "=" is the natural
 	// alias for "==" (the where: syntax uses it); it must come after "==",
-	// "!=", ">=", "<=" so multi-char operators win.
-	ops := []string{"==", "!=", ">=", "<=", "=", ">", "<", "contains", "exists"}
+	// "!=", ">=", "<=" so multi-char operators win. "matches" (regex, RE2)
+	// comes last so it never shadows equality on values containing the word.
+	ops := []string{"==", "!=", ">=", "<=", "=", ">", "<", "contains", "exists", "matches"}
 
 	for _, op := range ops {
 		if op == "exists" {
@@ -194,6 +196,18 @@ func evalClause(cond string, eventName string, payload map[string]interface{}) b
 				return !equalsValue(leftStr, rightStr)
 			case "contains":
 				return strings.Contains(leftStr, rightStr)
+			case "matches":
+				// RE2 regex match against the resolved left operand. Patterns are
+				// NOT implicitly anchored — author ^...$ in the manifest for a
+				// full-string check (email format guards rely on this).
+				re, err := regexp.Compile(rightStr)
+				if err != nil {
+					// A broken pattern is a manifest bug: fail the clause loudly
+					// rather than silently passing the guard.
+					log.Printf("[cond] invalid matches pattern %q: %v", rightStr, err)
+					return false
+				}
+				return re.MatchString(leftStr)
 			case ">", ">=", "<", "<=":
 				leftNum, err1 := strconv.ParseFloat(strings.TrimSpace(leftStr), 64)
 				rightNum, err2 := strconv.ParseFloat(strings.TrimSpace(rightStr), 64)

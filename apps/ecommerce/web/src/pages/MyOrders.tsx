@@ -14,6 +14,7 @@ import {
 import { Input } from "@/components/ui/input"
 import { useSpineStateTick } from "@/hooks/use-spine"
 import { spine } from "@/lib/spine"
+import { isValidEmail } from "@/lib/validate"
 import { money, timeAgo } from "@/lib/format"
 import { statusColor, type OrderItemRow, type OrderRow } from "@/types"
 
@@ -29,6 +30,7 @@ export default function MyOrders() {
   const [email, setEmail] = useState(() => localStorage.getItem(EMAIL_KEY) ?? "")
   const [orders, setOrders] = useState<OrderRow[] | null>(null)
   const [expanded, setExpanded] = useState<string | null>(null)
+  const [emailError, setEmailError] = useState("")
 
   const statusTick = useSpineStateTick("ORDER_STATUS_CHANGED")
   const createdTick = useSpineStateTick("ORDER_CREATED")
@@ -56,6 +58,11 @@ export default function MyOrders() {
   function submit(e: FormEvent) {
     e.preventDefault()
     const normalized = emailInput.trim().toLowerCase()
+    if (!isValidEmail(normalized)) {
+      setEmailError("Enter a valid email — e.g. you@example.com")
+      return
+    }
+    setEmailError("")
     setEmail(normalized)
     setOrders(null)
     if (normalized) localStorage.setItem(EMAIL_KEY, normalized)
@@ -79,16 +86,18 @@ export default function MyOrders() {
           </CardDescription>
         </CardHeader>
         <CardContent>
-          <form onSubmit={submit} className="flex gap-2">
+          <form onSubmit={submit} className="space-y-1" noValidate>
             <Input
               type="email"
               placeholder="you@example.com"
               value={emailInput}
-              onChange={(e) => setEmailInput(e.target.value)}
+              aria-invalid={!!emailError}
+              onChange={(e) => { setEmailInput(e.target.value); setEmailError("") }}
               required
               autoFocus
             />
-            <Button type="submit">Find orders</Button>
+            {emailError && <p className="text-xs text-destructive">{emailError}</p>}
+            <Button type="submit" className="w-full">Find orders</Button>
           </form>
         </CardContent>
       </Card>
