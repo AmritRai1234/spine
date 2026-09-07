@@ -5,6 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 )
 
 // CORSOptions configures Cross-Origin Resource Sharing behavior.
@@ -45,6 +46,29 @@ func DefaultCORSOptions() CORSOptions {
 		opts.AllowCredentials = true
 	}
 	return opts
+}
+
+// DynamicCORSMiddleware wraps CORSMiddleware so SPINE_CORS_ORIGINS is
+// re-read per request (L6): hot-reloaded env changes take effect without a
+// restart, matching WS origins semantics. The handler is rebuilt only when
+// the allowlist actually changes, so the per-request cost is one env read
+// + string compare.
+func DynamicCORSMiddleware(next http.HandlerFunc) http.HandlerFunc {
+	var mu sync.Mutex
+	lastEnv := "\x00" // sentinel ≠ "" so the first request builds
+	wrapped := CORSMiddleware(DefaultCORSOptions(), next)
+	return func(w http.ResponseWriter, r *http.Request) {
+		env := os.Getenv("SPINE_CORS_ORIGINS")
+		if env != lastEnv {
+			mu.Lock()
+			if env != lastEnv { // double-check under lock
+				wrapped = CORSMiddleware(DefaultCORSOptions(), next)
+				lastEnv = env
+			}
+			mu.Unlock()
+		}
+		wrapped(w, r)
+	}
 }
 
 // CORSMiddleware wraps an HTTP handler with CORS headers and preflight (OPTIONS) resolution.

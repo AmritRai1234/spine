@@ -453,14 +453,30 @@ func (b *Bus) initEventTable() error {
 // caller can stamp the state broadcasts with the audit id — the reconnect
 // replay cursor. Without clients the write stays batched (throughput).
 func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitted []string) int64 {
-	// Secret hygiene: credential-bearing fields are masked before the payload
-	// hits the durable audit log. stripe.connect is an admin event whose
-	// payload would otherwise persist a live Stripe key in _spine_events.
-	if s, ok := payload["stripe_secret"].(string); ok {
-		payload["stripe_secret"] = maskStripeKey(s)
-	}
-	if s, ok := payload["webhook_secret"].(string); ok && s != "" {
-		payload["webhook_secret"] = "••••" + s[max(0, len(s)-4):]
+	// Secret hygiene: credential-bearing fields are masked before the
+	// payload hits the durable audit log (L7). Masking is suffix-based
+	// (*secret / *key / *token — case-insensitive) rather than a hardcoded
+	// allowlist, so any future credential-bearing action is covered by
+	// default. Short values mask entirely; longer ones keep a 4-char tail
+	// for operator identification.
+	for k, v := range payload {
+		// System fields are load-bearing — `_idempotency_key` drives the
+		// durable claim protocol and must never be rewritten in place.
+		if strings.HasPrefix(k, "_") {
+			continue
+		}
+		s, ok := v.(string)
+		if !ok || s == "" {
+			continue
+		}
+		lk := strings.ToLower(k)
+		if strings.HasSuffix(lk, "secret") || strings.HasSuffix(lk, "key") || strings.HasSuffix(lk, "token") {
+			if len(s) <= 4 {
+				payload[k] = "••••"
+			} else {
+				payload[k] = "••••" + s[len(s)-4:]
+			}
+		}
 	}
 
 	buf := auditBufPool.Get().(*bytes.Buffer)

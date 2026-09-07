@@ -148,6 +148,18 @@ type Engine struct {
 	// wsIPCounts tracks live WebSocket connections per client IP for the
 	// per-IP connection cap on the /ws upgrade path.
 	wsIPCounts sync.Map // ip -> *atomic.Int64
+
+	// wsTickets holds outstanding one-time WebSocket connection tickets
+	// (M5): issued by GET /ws-ticket to an authenticated caller, consumed
+	// by a single /ws upgrade within a short TTL. Lets browsers connect
+	// without the API key ever appearing in the query string.
+	wsTickets sync.Map // ticket -> *wsTicket
+}
+
+// wsTicket is a single-use short-TTL credential for the /ws upgrade path.
+type wsTicket struct {
+	expires time.Time
+	access  *AccessContext // resolved role at issue time (nil = legacy single-key mode)
 }
 
 // SetRateLimit enables IP-based token bucket rate limiting on public endpoints.
@@ -432,7 +444,7 @@ func (e *Engine) wrapMiddleware(handler http.HandlerFunc) http.HandlerFunc {
 
 	// Security headers & CORS
 	h = middleware.SecurityHeadersMiddleware(h)
-	h = middleware.CORSMiddleware(middleware.DefaultCORSOptions(), h)
+	h = middleware.DynamicCORSMiddleware(h)
 
 	// Custom Context Extractor (Location, Temperature, Custom Metadata)
 	if e.customContext != nil {
@@ -465,7 +477,7 @@ func (e *Engine) wrapWebhookMiddleware(handler http.HandlerFunc) http.HandlerFun
 
 	// Security headers & CORS
 	h = middleware.SecurityHeadersMiddleware(h)
-	h = middleware.CORSMiddleware(middleware.DefaultCORSOptions(), h)
+	h = middleware.DynamicCORSMiddleware(h)
 
 	// Custom Context Extractor (Location, Temperature, Custom Metadata)
 	if e.customContext != nil {
@@ -499,7 +511,7 @@ func (e *Engine) wrapPublicBrowserMiddleware(handler http.HandlerFunc) http.Hand
 	h = middleware.BodyLimitMiddleware(maxRequestBodySize, h)
 	h = middleware.DepthLimitMiddleware(32, h)
 	h = middleware.SecurityHeadersMiddleware(h)
-	h = middleware.CORSMiddleware(middleware.DefaultCORSOptions(), h)
+	h = middleware.DynamicCORSMiddleware(h)
 
 	if e.customContext != nil {
 		h = e.customContext.Middleware(h)
@@ -561,7 +573,34 @@ func getAccessContext(r *http.Request) *AccessContext {
 // wsAuthCheck validates the API key for WebSocket connections.
 // Accepts key via query param ?token= or X-API-Key header.
 // Returns (authenticated, accessContext). accessContext may be nil in legacy mode.
+//
+// Precedence (M5):
+//  1. one-time ticket (?ticket=) — issued by GET /ws-ticket to an
+//     authenticated caller; single-use, 30s TTL, consumed on first upgrade
+//  2. legacy ?token= query param — DEPRECATED: kept for backward compat
+//     (browsers cannot set WS headers) but logs a warning; tickets are the
+//     browser path since query strings leak into proxy logs and history
+//  3. API key via headers (X-API-Key / Authorization) — non-browser clients
 func (e *Engine) wsAuthCheck(r *http.Request) (bool, *AccessContext) {
+	// 1) One-time ticket: single-use and short-lived by design.
+	if t := r.URL.Query().Get("ticket"); t != "" {
+		if v, ok := e.wsTickets.LoadAndDelete(t); ok {
+			tk := v.(*wsTicket)
+			if time.Now().Before(tk.expires) {
+				return true, tk.access
+			}
+		}
+		// Invalid or expired ticket: do NOT fall through to other methods —
+		// a caller presenting a ticket is doing the browser flow and a
+		// silent fallback would mask the failure.
+		return false, nil
+	}
+
+	// 2) Legacy query-param key — warn so operators migrate to tickets.
+	if r.URL.Query().Get("token") != "" {
+		log.Printf("[ws] DEPRECATED: API key passed as ?token= query parameter — leaks into proxy logs; use GET /ws-ticket instead")
+	}
+
 	// Multi-key access mode
 	if resolver := e.accessPtr.Load(); resolver != nil && resolver.HasRules() {
 		var key string
@@ -604,7 +643,12 @@ func (e *Engine) buildMux() *http.ServeMux {
 		w.Write([]byte(`{"status":"healthy"}`))
 	})
 
-	mux.HandleFunc("/readyz", func(w http.ResponseWriter, r *http.Request) {
+	// L5: /readyz pings the DB, so it is the one health endpoint worth
+	// flood-protecting — a per-IP token bucket absorbs hammering without
+	// breaking orchestrator polling (a few rps per IP is far above any
+	// legitimate probe cadence). /health and /healthz stay unlimited:
+	// they are constant-work responses used by load balancers.
+	readyzHandler := func(w http.ResponseWriter, r *http.Request) {
 		// Truthful readiness: ping the database so orchestrators don't get a
 		// healthy signal while the engine's write path is down.
 		ctx, cancel := context.WithTimeout(r.Context(), 2*time.Second)
@@ -617,7 +661,13 @@ func (e *Engine) buildMux() *http.ServeMux {
 		}
 		w.Header().Set("Content-Type", "application/json")
 		w.Write([]byte(`{"status":"ready"}`))
-	})
+	}
+	if e.rateLimiter != nil {
+		// Reuse the shared limiter so trusted-proxy handling matches /emit.
+		mux.HandleFunc("/readyz", e.rateLimiter.Middleware(readyzHandler))
+	} else {
+		mux.HandleFunc("/readyz", readyzHandler)
+	}
 
 	mux.HandleFunc("/webhook/", e.wrapWebhookMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1034,6 +1084,11 @@ spine_dropped_broadcasts %d
 		})
 	}))
 
+	// WS one-time ticket issuance (M5): authenticated callers exchange a
+	// header-carried API key for a single-use 30s ticket so browser WS
+	// connects never carry the key in the query string (proxy-log leak).
+	mux.HandleFunc("/ws-ticket", e.wrapMiddleware(e.handleWSTicket))
+
 	mux.HandleFunc("/ws", wrapWSHandler(func(w http.ResponseWriter, r *http.Request) {
 		// /ws bypasses the HTTP middleware chain (it is registered directly
 		// on the mux), so apply rate limiting and the per-IP connection cap
@@ -1318,13 +1373,15 @@ spine_dropped_broadcasts %d
 		}()
 	}))
 
-	// Serve static web dashboard
+	// Serve the static web dashboard — hardened (M4): ONLY the built
+	// web/dist tree is served, never the source web/ directory (which can
+	// carry un-minified code, source maps, or dev artifacts). The handler
+	// runs through the public-browser middleware chain (security headers,
+	// rate limit, logging, panic recovery) instead of raw on the mux, and
+	// adds explicit cache-control: hashed assets cache for a year, HTML
+	// and everything else is no-cache so deploys land immediately.
 	if fi, err := os.Stat("web/dist"); err == nil && fi.IsDir() {
-		fs := http.FileServer(http.Dir("web/dist"))
-		mux.Handle("/", fs)
-	} else if fi, err := os.Stat("web"); err == nil && fi.IsDir() {
-		fs := http.FileServer(http.Dir("web"))
-		mux.Handle("/", fs)
+		mux.Handle("/", e.wrapPublicBrowserMiddleware(e.spaHandler("web/dist")))
 	}
 
 	return mux
