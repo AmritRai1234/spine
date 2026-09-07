@@ -10,6 +10,20 @@
 
 Remaining open: L1, L2, L3, L4, L8 (documented trade-offs / minor; see below).
 
+**Tracked deprecations & known gaps (do not let these become folklore):**
+- **`?token=` WS auth removal → v4.0.** Tickets (v3.0.7) are the supported
+  browser path; the legacy query-param path logs a deprecation warning per
+  use and must be hard-removed in the v4 major (it cannot disappear in a
+  minor without breaking deployed storefronts). Owner: whoever cuts v4.
+- **Nested secrets are not redacted.** The L7 suffix masker only walks
+  top-level string fields (deliberately — see the ⚠ comment in
+  `logEventAudit`, query.go: in-place mutation of this shared map
+  corrupted idempotency once already). A `map[string]interface{}` value
+  fails the string assertion and is skipped wholesale, so secrets nested
+  inside object fields land in `_spine_events` plaintext. Non-corrupting
+  by construction; a redaction feature would need a deep-copied masker.
+  Revisit if any manifest payload starts carrying nested credentials.
+
 ---
 
 ## Overall posture
