@@ -459,6 +459,17 @@ func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitte
 	// allowlist, so any future credential-bearing action is covered by
 	// default. Short values mask entirely; longer ones keep a 4-char tail
 	// for operator identification.
+	//
+	// ⚠ DO NOT remove the `_`-prefix guard below without reading this:
+	// payload here is the CALLER'S LIVE MAP, not a copy — Emit re-uses it
+	// after this function for state caching, WS broadcasts, and event
+	// chaining, and `_idempotency_key` in particular is re-read by the
+	// durable claim protocol on every retried emit. Masking it in place
+	// corrupted idempotency end-to-end (the claim key became "••••9999",
+	// retries re-executed the route and double-inserted). The first
+	// suffix-masking version shipped exactly this bug; TestIdempotencyKeys
+	// caught it. If you need to redact system fields, deep-copy the map
+	// BEFORE mutating — never redact this one in place.
 	for k, v := range payload {
 		// System fields are load-bearing — `_idempotency_key` drives the
 		// durable claim protocol and must never be rewritten in place.
