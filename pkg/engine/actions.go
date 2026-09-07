@@ -97,6 +97,8 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		return b.logWrite(step, eventName, payload)
 	case "fts.search":
 		return b.ftsSearch(step, eventName, payload)
+	case "geo.check_address":
+		return b.geoCheckAddress(step, eventName, payload)
 	case "emit_to":
 		return b.emitToBridge(step, eventName, payload)
 	case "queue.publish":
