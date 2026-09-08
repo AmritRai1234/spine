@@ -20,6 +20,7 @@ const (
 	sAccess
 	sAccessEntry
 	sAccessEvents
+	sAccessTables
 	sNodes
 	sNodeBody
 	sNodeOwnFiles
@@ -331,7 +332,7 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 		}
 
 		// ===== ACCESS =====
-		if state >= sAccess && state <= sAccessEvents {
+		if state >= sAccess && state <= sAccessTables {
 			// New access entry: "- role: <name>"
 			if indent == 1 {
 				if v, ok := listKvValue(trimmed, "role"); ok {
@@ -392,6 +393,13 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 						state = sAccessEntry
 						continue
 					}
+					if trimmed == "tables:" {
+						if curAccess.Tables == nil {
+							curAccess.Tables = map[string]string{}
+						}
+						state = sAccessTables
+						continue
+					}
 					if trimmed == "events:" {
 						state = sAccessEvents
 						continue
@@ -403,6 +411,33 @@ func parseManifestWithStack(manifestPath string, includeStack []string) (*SpineS
 			if state == sAccessEvents {
 				if indent == 3 && isListItem(trimmed) && curAccess != nil {
 					curAccess.Events = append(curAccess.Events, unquote(trimmed[2:]))
+					continue
+				}
+				if indent <= 2 {
+					state = sAccessEntry
+					// Fall through to re-evaluate
+				}
+			}
+
+			// Access per-table read scopes (indent=3): "tables:" then
+			// "- <table>: <filter>" list entries. Omission-means-deny: a non-nil
+			// Tables map restricts the role to exactly the listed tables.
+			if state == sAccessTables {
+				if indent == 3 && isListItem(trimmed) && curAccess != nil {
+					entry := strings.TrimSpace(strings.TrimPrefix(trimmed[2:], "-"))
+					colon := strings.Index(entry, ":")
+					if colon <= 0 {
+						return nil, parseError(manifestPath, lineno, "access role '%s': tables entries must be '<table>: <filter>' (got %q)", curAccess.Role, trimmed)
+					}
+					tblName := unquote(strings.TrimSpace(entry[:colon]))
+					tblFilter := strings.TrimSpace(entry[colon+1:])
+					if tblName == "" {
+						return nil, parseError(manifestPath, lineno, "access role '%s': tables entry has an empty table name", curAccess.Role)
+					}
+					if _, dup := curAccess.Tables[tblName]; dup {
+						return nil, parseError(manifestPath, lineno, "access role '%s': duplicate tables entry for '%s'", curAccess.Role, tblName)
+					}
+					curAccess.Tables[tblName] = unquote(tblFilter)
 					continue
 				}
 				if indent <= 2 {
@@ -817,6 +852,31 @@ func ValidateSchema(file string, schema *SpineSchema) error {
 				return parseError(file, 0,
 					"route '%s', step %d: action '%s' requires 'spine_version: %d' (manifest declares %d) — raise spine_version to unlock it",
 					route.OnEvent, j+1, step.Action, minV, schema.SpineVersion)
+			}
+		}
+	}
+
+	// Per-table read scopes (access.roles[].tables): fail loud at startup on
+	// unknown table names (typo = permanent 403 that no test would catch) and
+	// on malformed filters (a scope that cannot parse would 500 at request
+	// time instead of enforcing).
+	declaredTables := make(map[string]bool, len(schema.DbTables))
+	for _, tbl := range schema.DbTables {
+		declaredTables[tbl] = true
+	}
+	for _, rule := range schema.Access {
+		for tbl, filter := range rule.Tables {
+			if !declaredTables[tbl] {
+				return parseError(file, 0,
+					"access role '%s': tables scope references unknown table '%s' (declared tables: %v)",
+					rule.Role, tbl, schema.DbTables)
+			}
+			if filter != "" {
+				if err := ValidateTableFilter(filter); err != nil {
+					return parseError(file, 0,
+						"access role '%s': tables scope for '%s' has an invalid filter: %v",
+						rule.Role, tbl, err)
+				}
 			}
 		}
 	}

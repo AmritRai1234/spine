@@ -968,6 +968,17 @@ spine_dropped_broadcasts %d
 			json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": err.Error()})
 			return
 		}
+		// RLAC per-table scoping: a role with a tables: scope sees ONLY its
+		// allowed tables in the listing (unlisted = nonexistent, no probing).
+		if ac := getAccessContext(r); ac != nil && ac.Tables != nil {
+			filtered := tables[:0]
+			for _, tbl := range tables {
+				if _, ok := ac.Tables[tbl.Name]; ok {
+					filtered = append(filtered, tbl)
+				}
+			}
+			tables = filtered
+		}
 		json.NewEncoder(w).Encode(map[string]interface{}{
 			"status": "ok",
 			"tables": tables,
@@ -984,7 +995,36 @@ spine_dropped_broadcasts %d
 				json.NewEncoder(w).Encode(map[string]interface{}{"status": "error", "error": err.Error()})
 				return
 			}
+			// RLAC per-table scoping (same filter as the /tables listing).
+			if ac := getAccessContext(r); ac != nil && ac.Tables != nil {
+				filtered := tables[:0]
+				for _, tbl := range tables {
+					if _, ok := ac.Tables[tbl.Name]; ok {
+						filtered = append(filtered, tbl)
+					}
+				}
+				tables = filtered
+			}
 			json.NewEncoder(w).Encode(map[string]interface{}{"status": "ok", "tables": tables})
+			return
+		}
+
+		// RLAC per-table scoping: a role with a tables: scope can only read
+		// listed tables. 403 (not 404) so a legitimate client gets an
+		// authorization signal; the /tables listing hides unlisted tables
+		// either way, so this reveals nothing beyond the role's own scope.
+		tableFilter, tableAllowed := "", true
+		callerRole := ""
+		if ac := getAccessContext(r); ac != nil {
+			tableFilter, tableAllowed = ac.TableReadScope(tableName)
+			callerRole = ac.Role
+		}
+		if !tableAllowed {
+			w.WriteHeader(http.StatusForbidden)
+			json.NewEncoder(w).Encode(map[string]interface{}{
+				"status": "error",
+				"error":  "forbidden: role '" + callerRole + "' cannot read table '" + tableName + "'",
+			})
 			return
 		}
 
@@ -1001,10 +1041,17 @@ spine_dropped_broadcasts %d
 			}
 		}
 
-		// Resolve access filter for this role
-		var accessFilter string
-		if ac := getAccessContext(r); ac != nil {
-			accessFilter = ac.Filter
+		// Resolve access filter for this role: the per-table scope (when the
+		// role declares one) ANDed with the role-wide legacy filter. Both are
+		// single column-comparisons; the query layer parameterizes whichever
+		// is present. Precedence when both exist: table scope wins — it is
+		// the more specific declaration, and ANDing two single-comparison
+		// filters would require grammar changes in the query layer.
+		accessFilter := tableFilter
+		if accessFilter == "" {
+			if ac := getAccessContext(r); ac != nil {
+				accessFilter = ac.Filter
+			}
 		}
 
 		cursorStr := r.URL.Query().Get("cursor")

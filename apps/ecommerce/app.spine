@@ -18,7 +18,7 @@ access:
       - RESTOCK_ORDER_ITEM
 
   - role: shopper
-    key: "sk_shopper_key"
+    key: "***"
     events:
       - ADD_TO_CART
       - UPDATE_CART_ITEM
@@ -36,6 +36,21 @@ access:
       - RESET_PASSWORD
       - REGISTER_TRACKING
       - SEARCH_PRODUCTS
+    # Per-table read scoping: the shopper key (a static demo key) may ONLY
+    # read the cart/order tables its own UI needs, and only rows matching
+    # the shopper's own cart/email. products is listed without a filter
+    # (public catalog). Everything else — users, sessions, payments,
+    # password_resets, coupons, shipping_zones, tax_rules, subscription
+    # internals — is 403 for this key and hidden from the /tables listing.
+    # NOTE: static per-role scoping. The demo key is shared, so "email ="
+    # below is the storefront's anonymous-tracking email, not a per-user
+    # identity — real per-customer isolation needs per-user key issuance.
+    tables:
+      - products:
+      - orders: "email = 'pending-shopper'"
+      - order_items: "email = 'pending-shopper'"
+      - cart_items: "email = 'pending-shopper'"
+      - subscribers: "email = 'pending-shopper'"
 
 # ── Tables (auto-created with schema evolution) ───────────────────
 database:

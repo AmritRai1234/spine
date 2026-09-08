@@ -13,6 +13,22 @@ type AccessContext struct {
 	ReadOnly bool
 	Filter   string   // WHERE clause to inject on table queries
 	Events   []string // nil = all events allowed
+	// Tables is the per-table read scope (nil = all tables readable). When
+	// non-nil, GET /tables/{name} is restricted to the listed tables (each
+	// ANDed with its filter) and unlisted tables return 403. Static per-role
+	// scoping — see manifest.AccessRule for the isolation caveats.
+	Tables map[string]string
+}
+
+// TableReadScope returns (filter, allowed) for reading the named table.
+// nil Tables map = everything allowed, no extra filter. A missing entry in
+// a non-nil map = denied.
+func (ac *AccessContext) TableReadScope(table string) (string, bool) {
+	if ac.Tables == nil {
+		return ac.Filter, true
+	}
+	filter, ok := ac.Tables[table]
+	return filter, ok
 }
 
 // CanEmit returns true if this access context permits emitting the given event.
@@ -91,6 +107,7 @@ func (ar *AccessResolver) Resolve(apiKey string) *AccessContext {
 		ReadOnly: matched.ReadOnly,
 		Filter:   matched.Filter,
 		Events:   matched.Events,
+		Tables:   matched.Tables,
 	}
 }
 

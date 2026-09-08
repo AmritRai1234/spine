@@ -17,12 +17,21 @@ type SpineSchema struct {
 // NOTE: single-tenant engine — there is deliberately no Tenant field here; row
 // scoping is done via the Filter WHERE clause, and isolation between customers
 // is achieved by running separate deployments.
+//
+// Tables declares per-table read scoping for GET /tables/{name}. A non-nil
+// map means deny-by-default: the role can ONLY read the listed tables, each
+// through its filter (single column-comparison, same grammar as `filter:`,
+// ANDed with the client's ?where=). Unlisted tables return 403 and are hidden
+// from the /tables listing. Nil map = full read (admin / back-compat).
+// This is STATIC per-role scoping — one scope for every holder of the role's
+// key; per-caller isolation requires per-user key issuance.
 type AccessRule struct {
-	Role     string   `json:"role"`
-	Key      string   `json:"-"`          // Never serialized — resolved from manifest or env var
-	ReadOnly bool     `json:"read_only,omitempty"`
-	Filter   string   `json:"filter,omitempty"` // WHERE clause injected on table queries
-	Events   []string `json:"events,omitempty"` // Whitelist of emittable events (nil = all)
+	Role     string            `json:"role"`
+	Key      string            `json:"-"` // Never serialized — resolved from manifest or env var
+	ReadOnly bool              `json:"read_only,omitempty"`
+	Filter   string            `json:"filter,omitempty"` // WHERE clause injected on table queries
+	Events   []string          `json:"events,omitempty"` // Whitelist of emittable events (nil = all)
+	Tables   map[string]string `json:"tables,omitempty"` // Per-table read scopes; non-nil = deny-by-default (see above)
 }
 
 // OutboxConfig holds configuration for durable outbox worker pool retries.
