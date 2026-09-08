@@ -630,6 +630,22 @@ func (e *Engine) wsAuthCheck(r *http.Request) (bool, *AccessContext) {
 	return subtle.ConstantTimeCompare([]byte(clientKey), []byte(e.APIKey)) == 1, nil
 }
 
+// wsHasCredentials reports whether the upgrade request carries ANY
+// authentication material (ticket, query token, or header key). It decides
+// the L8 upgrade-time rejection path: credentials present but invalid are
+// refused before the 101 (the caller is attempting the authenticated flow),
+// while a credential-less request is allowed to upgrade and must complete
+// in-frame auth within wsAuthTimeout as before. Ticket presence deliberately
+// counts as a credential: wsAuthCheck never falls through from an invalid
+// ticket to other methods, so a bad ticket is always a rejection, and this
+// keeps that caller from occupying a free socket either.
+func (e *Engine) wsHasCredentials(r *http.Request) bool {
+	if r.URL.Query().Get("ticket") != "" || r.URL.Query().Get("token") != "" {
+		return true
+	}
+	return extractAPIKey(r.Header.Get("X-API-Key"), r.Header.Get("Authorization")) != ""
+}
+
 func (e *Engine) buildMux() *http.ServeMux {
 	mux := http.NewServeMux()
 
@@ -1120,8 +1136,30 @@ spine_dropped_broadcasts %d
 			return
 		}
 
-		// WebSocket auth check — upfront header/query param check
+		// WebSocket auth check — L8: authenticate DURING the upgrade when
+		// credentials are present (ticket, header key, or legacy ?token=) so
+		// an unauthenticated socket never enters the connection accounting.
+		// Previously auth happened in-frame after the upgrade, so an
+		// attacker holding wsAuthCheck-passing-less credentials could occupy
+		// up to wsMaxConnsPerIP × wsAuthTimeout upgrade slots doing nothing.
+		// When NO credentials are presented the connection still upgrades
+		// and must auth in-frame within wsAuthTimeout (browser fallback for
+		// clients that can't use tickets — that contract is unchanged).
 		authenticated, wsAccess := e.wsAuthCheck(r)
+		if !authenticated && e.wsHasCredentials(r) {
+			// Credentials present but WRONG → reject before upgrading: a
+			// caller that presents a key is doing the authenticated flow,
+			// and upgrading it anyway would let it hold a free socket.
+			// (No credentials at all falls through to the upgrade below and
+			// must complete in-frame auth within wsAuthTimeout.)
+			http.Error(w, "unauthorized: invalid WebSocket credentials", http.StatusUnauthorized)
+			if ip != "" {
+				if v, _ := e.wsIPCounts.Load(ip); v != nil {
+					v.(*atomic.Int64).Add(-1)
+				}
+			}
+			return
+		}
 
 		conn, err := upgrader.Upgrade(w, r, nil)
 		if err != nil {
