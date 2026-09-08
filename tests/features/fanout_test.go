@@ -218,3 +218,50 @@ func TestFanoutTierGating(t *testing.T) {
 func countFired2(t *testing.T, eng *spine.Engine) int {
 	return countFired(t, eng)
 }
+
+// 6. Corrupted interval value: the row must be SKIPPED loudly (log + no
+// fire + cursor advances past it) instead of silently advancing its due
+// date by a wrong interval. Clean rows in the same batch still fire.
+func TestFanoutSkipsCorruptedIntervalRowLoudly(t *testing.T) {
+	eng := newFanoutEngine(t, t.TempDir(), "")
+	defer eng.Close()
+
+	due := time.Now().UTC().Add(-time.Hour).Format(time.RFC3339)
+	seedSub(t, eng, "clean-1", due, 1)
+	seedSub(t, eng, "clean-2", due, 1)
+
+	// Inject a corrupted row directly through SQL: SQLite's INTEGER affinity
+	// stores non-numeric text as-is, which is exactly the corruption shape
+	// the old `_, _ = strconv.Atoi` silently coerced to 0.
+	if _, err := eng.Bus.DB().Exec(
+		`INSERT INTO "subscriptions" ("id", "email", "next_charge_date", "interval_months") VALUES ('corrupt', 'corrupt@example.com', ?, 'garbage')`,
+		due); err != nil {
+		t.Fatalf("corrupt seed failed: %v", err)
+	}
+	flush()
+
+	runScan(t, eng)
+	flush()
+
+	if got := countFired(t, eng); got != 2 {
+		t.Errorf("clean rows must fire despite corrupted sibling, got %d fires, want 2", got)
+	}
+
+	// The corrupted row's due date must be untouched (no wrong advance).
+	var iv interface{}
+	if err := eng.Bus.DB().QueryRow(
+		`SELECT "interval_months" FROM "subscriptions" WHERE "id" = 'corrupt'`).Scan(&iv); err != nil {
+		t.Fatalf("corrupt row lookup failed: %v", err)
+	}
+	if s, ok := iv.(string); !ok || s != "garbage" {
+		t.Errorf("corrupted row was modified: interval_months = %T(%v), want untouched string", iv, iv)
+	}
+
+	// And a re-scan must re-report (skip) it rather than lose the cursor:
+	// fire count stays 2 because idempotency blocks the clean rows.
+	runScan(t, eng)
+	flush()
+	if got := countFired(t, eng); got != 2 {
+		t.Errorf("re-scan duplicated fires: got %d, want 2", got)
+	}
+}

@@ -14,10 +14,10 @@ import (
 // subscriptionsSweep implements the `subscriptions.sweep` action: the recurring
 // heart of the subscription commerce tier. It runs on a cron route
 //
-//	- on: SUBSCRIPTIONS_DUE
-//	  cron: 3600s
-//	  steps:
-//	    - action: subscriptions.sweep
+//   - on: SUBSCRIPTIONS_DUE
+//     cron: 3600s
+//     steps:
+//   - action: subscriptions.sweep
 //
 // and for every active subscription past its next_run_at it:
 //  1. rolls next_run_at forward by the plan interval (30-day months, server clock)
@@ -82,9 +82,32 @@ func (b *Bus) subscriptionsSweep(step *manifest.RouteStep, eventName string, pay
 			continue
 		}
 		s.variantID = variant.String
-		s.unitPrice, _ = strconv.ParseFloat(fmt.Sprintf("%v", unitPrice), 64)
-		s.qty, _ = strconv.Atoi(fmt.Sprintf("%v", qtyVal))
-		s.intervalMonths, _ = strconv.Atoi(fmt.Sprintf("%v", intervalVal))
+
+		// Numeric columns are scanned as interface{} (SQLite is dynamically
+		// typed: an INTEGER-affinity column still stores non-numeric text
+		// as-is). Previously parse errors were discarded (`_, _ =`), so a
+		// corrupted row silently became price=0 / qty=0 / interval=1 — a $0
+		// renewal that no dashboard would ever flag. Fail the row loudly
+		// instead and skip it (sweep semantics: one bad row must not block
+		// the rest of the batch).
+		price, perr := sweepNumeric("unit_price", s.id, unitPrice)
+		if perr != nil {
+			log.Printf("[subs] sweep: row %s: %v — skipping (no renewal fired)", s.id, perr)
+			continue
+		}
+		qty, qerr := sweepNumeric("qty", s.id, qtyVal)
+		if qerr != nil {
+			log.Printf("[subs] sweep: row %s: %v — skipping (no renewal fired)", s.id, qerr)
+			continue
+		}
+		interval, ierr := sweepNumeric("interval_months", s.id, intervalVal)
+		if ierr != nil {
+			log.Printf("[subs] sweep: row %s: %v — skipping (no renewal fired)", s.id, ierr)
+			continue
+		}
+		s.unitPrice = price
+		s.qty = int(qty)
+		s.intervalMonths = int(interval)
 		if s.intervalMonths < 1 {
 			s.intervalMonths = 1
 		}
@@ -153,4 +176,40 @@ func (b *Bus) subscriptionsSweep(step *manifest.RouteStep, eventName string, pay
 // next_run_at math in the manifest ($now + months * 2592000).
 func rollMonthly(t time.Time, months int) time.Time {
 	return t.AddDate(0, months, 0)
+}
+
+// sweepNumeric coerces a dynamically-typed stored value (SQLite scan into
+// interface{}) into a number, rejecting anything that is not cleanly
+// numeric instead of silently coercing to zero. A garbage row that quietly
+// became a $0 subscription / 0-month interval would produce revenue that
+// "matches expected revenue" in dashboards while charging nothing — the
+// worst kind of silent failure. Sweep semantics: log-and-skip the row (the
+// rest of the batch must still fire).
+func sweepNumeric(fieldName string, rowID string, v interface{}) (float64, error) {
+	switch val := v.(type) {
+	case float64:
+		return val, nil
+	case float32:
+		return float64(val), nil
+	case int64:
+		return float64(val), nil
+	case int:
+		return float64(val), nil
+	case []byte:
+		return sweepNumeric(fieldName, rowID, string(val))
+	case string:
+		s := strings.TrimSpace(val)
+		if s == "" {
+			return 0, fmt.Errorf("%s is empty/null", fieldName)
+		}
+		f, err := strconv.ParseFloat(s, 64)
+		if err != nil {
+			return 0, fmt.Errorf("%s is not numeric (got %q)", fieldName, s)
+		}
+		return f, nil
+	case nil:
+		return 0, fmt.Errorf("%s is NULL", fieldName)
+	default:
+		return 0, fmt.Errorf("%s has unsupported type %T", fieldName, v)
+	}
 }

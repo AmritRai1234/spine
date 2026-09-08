@@ -16,16 +16,16 @@ import (
 // db.fanout — generalizes subscriptions.sweep into a config-driven scan-and-
 // emit action. On a cron route:
 //
-//	- on: BILLING_TICK
-//	  cron: 86400s
-//	  steps:
-//	    - action: db.fanout
-//	      table: subscriptions
-//	      where: "next_charge_date <= $now"
-//	      emit_event: SUBSCRIPTION_DUE
-//	      due_column: next_charge_date
-//	      interval_column: interval_months
-//	      batch_size: 1000        # optional, default 1000
+//   - on: BILLING_TICK
+//     cron: 86400s
+//     steps:
+//   - action: db.fanout
+//     table: subscriptions
+//     where: "next_charge_date <= $now"
+//     emit_event: SUBSCRIPTION_DUE
+//     due_column: next_charge_date
+//     interval_column: interval_months
+//     batch_size: 1000        # optional, default 1000
 //
 // it scans `table` for rows matching `where` (a parameterized single-column
 // comparison, same grammar as db.sum/db.adjust), and for EACH matching row:
@@ -106,7 +106,19 @@ func (b *Bus) dbFanout(step *manifest.RouteStep, eventName string, payload map[s
 				log.Printf("[fanout] %s: skipping malformed row: %v", table, err)
 				continue
 			}
-			r.interval, _ = strconv.Atoi(fmt.Sprintf("%v", intervalVal))
+			// SQLite is dynamically typed: an INTEGER-affinity column still
+			// stores non-numeric text as-is. Previously parse errors were
+			// discarded, silently defaulting the interval to 0 (clamped to 1
+			// downstream) — advancing the due date by the WRONG amount with
+			// no trace. Fail the row loudly instead; the rest of the batch
+			// must still fire.
+			iv, ierr := sweepNumeric("interval_column "+intervalCol, fmt.Sprintf("%d", r.spineID), intervalVal)
+			if ierr != nil {
+				log.Printf("[fanout] %s row %d: %v — skipping", table, r.spineID, ierr)
+				cursor = r.spineID // keyset cursor must still advance past it
+				continue
+			}
+			r.interval = int(iv)
 			batch = append(batch, r)
 			cursor = r.spineID // keyset cursor always advances
 		}
