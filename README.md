@@ -711,6 +711,8 @@ routes:
 | `email.broadcast` | Marketing send to every row of a recipients table; `{{email}}` templating, count lands in payload as `email_sent` — tier 2 | `table` (required); `where`, `subject`, `body`, `from`, `html`, `unsubscribe_url`, `email_column` (optional) |
 | `stripe.checkout` | Create a Stripe Checkout Session; payload gains `checkout_url` + `checkout_session_id`. Amounts are DOLLARS, converted to cents server-side. Silent no-op when `STRIPE_SECRET_KEY` unset. Tier 3 | `order_id`, `amount`, `success_url`, `cancel_url` (required); `currency` (default `usd`), `description`, `customer_email` (optional) |
 | `slots.generate` | Turn business hours into bookable slot rows on a cron — deterministic ids make re-runs idempotent, capacity on existing rows is never reset, schedule changes never delete. See the dedicated section above. Tier 3 | `table`, `open`, `close`, `duration_minutes` (required); `days_ahead` (default 30), `weekdays`, `capacity` (default 1) (optional) |
+| `geo.check_address` | Offline Canadian address validation: postal format (Canada Post A1A 1A1 spec) + FSA deliverability (embedded dataset of every FSA Canada Post serves) + optional postal↔city cross-check with suggestions. No network, no key | `postal` (required); `city`, `province` (optional, enable cross-check) |
+| `geo.address_complete` | Door-level Canadian address lookup via Canada Post AddressComplete — `find` returns typed-query suggestions (`address_suggestions`, `{id, text, next?}`), `retrieve` expands an id into a structured address. Silent no-op when `ADDRESSCOMPLETE_KEY` unset | `search` (find) or `id` (retrieve, required); `mode` (default find), `country` (default CAN), `max_results` (default 7), `result_key` (optional) |
 | `domain.connect` | One-click custom domain connect from the admin panel — verifies DNS points at this server, then adds the host to the live Let's Encrypt allowlist (no restart). Tier 3 | `mode` (`disconnect` optional; payload `domain`) |
 | `stripe.connect` | Install runtime Stripe credentials from an admin event (env keeps precedence). Tier 3 | `mode` (`disconnect` optional; payload `stripe_secret`, `webhook_secret`) |
 | `social.connect` | OAuth connect a social account (Facebook Pages, X, LinkedIn, Instagram). `start` mints `social_auth_url` + single-use `social_state`; `manual` installs a pre-acquired token; `disconnect` drops the account. Tokens persist AES-256-GCM encrypted in `_spine_social_tokens` when `SPINE_SOCIAL_VAULT_KEY` is set (session-only otherwise). Callback route: `/oauth/<platform>/callback`. Tier 3 | `mode` (default `start`); payload `platform` (required), `return_url`, `account_key`, `access_token`, `refresh_token`, `account_label` (mode-dependent) |
@@ -1048,6 +1050,7 @@ spine/
 │   │   ├── actions.go   # Built-in action dispatcher (db.*, set, assert, …)
 │   │   ├── email.go     # email.send / email.broadcast — SMTP marketing & transactional mail
 │   │   ├── stripe.go    # stripe.checkout — Stripe Checkout Session creation (tier 3)
+│   │   ├── geo.go       # geo.check_address — offline Canadian address validation
 │   │   ├── hub.go       # Async WebSocket broadcasting hub
 │   │   ├── outbox.go    # Notification-driven outbox retry queue
 │   │   ├── pubsub.go    # Pluggable PubSub backplane interface (in-process adapter; Redis/NATS planned)
@@ -1121,6 +1124,8 @@ spine version
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | SMTP relay for `email.send` / `email.broadcast` — host unset = email disabled (silent no-op) |
 | `STRIPE_SECRET_KEY` | Secret key (`sk_test_…`) for `stripe.checkout` — unset = Stripe actions disabled (silent no-op) |
 | `STRIPE_API_BASE` | Override the Stripe API origin (default `https://api.stripe.com`; useful for tests/proxies) |
+| `ADDRESSCOMPLETE_KEY` / `CANADA_POST_AC_KEY` | Canada Post AddressComplete API key (`AA11-AA11-AA11-AA11`) for `geo.address_complete` — unset = lookup disabled (silent no-op); stores fall back to offline `geo.check_address` |
+| `ADDRESSCOMPLETE_API_BASE` | Override the AddressComplete API origin (default `https://ws1.postescanada-canadapost.ca`; useful for tests/proxies) |
 | `STORE_PUBLIC_URL` | Absolute store origin used by the e-commerce template to build Stripe `success_url`/`cancel_url` |
 
 ### Free Automatic HTTPS (Let's Encrypt)
