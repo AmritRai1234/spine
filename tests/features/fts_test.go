@@ -17,8 +17,11 @@ import (
 // Now search results must actually be returned, in sync with the data.
 //
 // NOTE: requires the sqlite_fts5 build tag (Makefile/CI build with
-// -tags sqlite_fts5).
+// -tags sqlite_fts5). Without it the driver lacks FTS5 and the test
+// SKIPS (with that reason) instead of failing — a bare `go test ./...`
+// must stay a trustworthy green signal for everything else.
 func TestFullTextSearch(t *testing.T) {
+	requireFTS5(t)
 	dir := t.TempDir()
 	manifestPath := filepath.Join(dir, "app.spine")
 	dbPath := filepath.Join(dir, "spine.db")

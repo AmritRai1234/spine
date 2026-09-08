@@ -1,6 +1,7 @@
 package engine
 
 import (
+	"database/sql"
 	"os"
 	"path/filepath"
 	"strings"
@@ -20,6 +21,7 @@ import (
 // -tags sqlite_fts5); without it the driver lacks FTS5 and CREATE VIRTUAL
 // TABLE fails with "no such module: fts5".
 func TestFTSProvisionAndSearch(t *testing.T) {
+	requireFTS5(t)
 	dir := t.TempDir()
 	spineFile := filepath.Join(dir, "app.spine")
 	dbPath := filepath.Join(dir, "app.db")
@@ -119,6 +121,7 @@ routes:
 }
 
 func TestFTSProvisionAndSearch_ServerRestart(t *testing.T) {
+	requireFTS5(t)
 	dir := t.TempDir()
 	spineFile := filepath.Join(dir, "app.spine")
 	dbPath := filepath.Join(dir, "app.db")
@@ -183,3 +186,17 @@ routes:
 	}
 }
 
+// requireFTS5 skips the test when the linked go-sqlite3 driver was built
+// without the sqlite_fts5 tag (default `go test ./...`). A bare test run
+// must stay a trustworthy green signal: skip with the reason, don't fail.
+func requireFTS5(t *testing.T) {
+	t.Helper()
+	db, err := sql.Open("sqlite3", ":memory:")
+	if err != nil {
+		t.Skipf("cannot open in-memory sqlite: %v", err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE VIRTUAL TABLE fts5_probe USING fts5(x)`); err != nil {
+		t.Skip("FTS5 not available: rebuild tests with -tags sqlite_fts5 (see Makefile)")
+	}
+}

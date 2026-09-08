@@ -20,6 +20,7 @@ import (
 // tenant parsing, TypeScript codegen, HTTP emit with access control, FTS
 // execution, audit logging, and outbox enqueue/processing in one manifest.
 func TestEndToEndFeatureParity(t *testing.T) {
+	requireFTS5(t) // route contains fts.search — needs the sqlite_fts5 build tag
 	dir := t.TempDir()
 	manifestPath := filepath.Join(dir, "app.spine")
 	dbPath := filepath.Join(dir, "spine_roadmap.db")
