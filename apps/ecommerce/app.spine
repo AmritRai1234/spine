@@ -37,19 +37,34 @@ access:
       - REGISTER_TRACKING
       - SEARCH_PRODUCTS
     # Per-table read scoping: the shopper key (a static demo key) may ONLY
-    # read the cart/order tables its own UI needs, and only rows matching
-    # the shopper's own cart/email. products is listed without a filter
-    # (public catalog). Everything else — users, sessions, payments,
-    # password_resets, coupons, shipping_zones, tax_rules, subscription
-    # internals — is 403 for this key and hidden from the /tables listing.
+    # read the tables its own UI needs. products, product_variants,
+    # subscription_plans, shipping_zones, tax_rules and store_settings are
+    # listed without filters (public catalog / checkout pricing data).
+    # orders is scoped to the storefront's tracking email (carries address +
+    # totals). order_items is listed UNFILTERED deliberately: its rows carry
+    # only product name/qty (its email column holds the 'pending' insert
+    # placeholder — the real address lives on the orders row), and the UI's
+    # order_id drill-down cannot be expressed as a single column-comparison
+    # scope. cart_items likewise: rows carry cart_id/product/qty only (no
+    # email is set on ADD_TO_CART — cart identity is the browser's random
+    # cart_id, which a static role scope cannot enumerate). subscribers is
+    # filtered to the tracking email (the one identifier a newsletter row
+    # genuinely carries). Everything else — users, sessions, payments,
+    # password_resets, coupons, subscriptions internals — is 403 for this
+    # key and hidden from the /tables listing.
     # NOTE: static per-role scoping. The demo key is shared, so "email ="
-    # below is the storefront's anonymous-tracking email, not a per-user
-    # identity — real per-customer isolation needs per-user key issuance.
+    # below matches the anonymous-tracking email, not a per-user identity —
+    # real per-customer isolation needs per-user key issuance.
     tables:
       - products:
+      - product_variants:
+      - subscription_plans:
+      - shipping_zones:
+      - tax_rules:
+      - store_settings:
       - orders: "email = 'pending-shopper'"
-      - order_items: "email = 'pending-shopper'"
-      - cart_items: "email = 'pending-shopper'"
+      - order_items:
+      - cart_items:
       - subscribers: "email = 'pending-shopper'"
 
 # ── Tables (auto-created with schema evolution) ───────────────────
@@ -305,6 +320,9 @@ nodes:
           percent_off: number
           fixed_off: number
           active: string
+          expires_at: string
+          max_uses: integer
+          used_count: integer
       - event: SAVE_SETTING
         payload:
           key: string
@@ -431,6 +449,8 @@ nodes:
         payload:
           email: string
           token: string
+      # Engine-internal: fired by the hourly session-hygiene cron.
+      - event: SESSIONS_SWEEP
     listens:
       - state: ACCOUNT_CREATED
         payload:
@@ -497,12 +517,17 @@ routes:
         condition: "$event.payload.auth_ok == true"
         message: "invalid email or password"
       # Session row gets only clean columns: scrub the plaintext, the user_*
-      # lookup fields, and the verify flag before insert.
+      # lookup fields, and the verify flag before insert. Sessions carry a
+      # 7-day TTL (SESSION_TTL_DAYS semantics): expires_at as epoch seconds
+      # so the client can compare without parsing; the expiry itself is
+      # enforced by the sweep (cron) plus the read guard on every session
+      # lookup in RESET_PASSWORD.
       - action: unset
         fields: "password user_id user_email user_name user_password user_password_hash user_created_at auth_ok existing_"
       - action: set
         token: $uuid
         created_at: $now
+        expires_at: "$now_epoch + 604800"
       - action: db.insert
         table: sessions
     emit: ACCOUNT_LOGIN_OK
@@ -514,6 +539,21 @@ routes:
         table: sessions
         where: "token = '$event.payload.token'"
     emit: ACCOUNT_LOGGED_OUT
+
+  # Session hygiene sweep — hourly alongside the subscription cron. Deletes
+  # expired sessions (7-day TTL) and consumed/stale password-reset tokens.
+  # The reset-token path already rejects expired tokens on use; this bounds
+  # the table growth and clears the dead rows the rejection leaves behind.
+  - on: SESSIONS_SWEEP
+    cron: 3600s
+    steps:
+      - action: db.delete
+        table: sessions
+        where: "expires_at <= $now_epoch"
+      - action: db.delete
+        table: password_resets
+        where: "expires_at <= $now_epoch"
+    emit: SESSIONS_SWEPT
 
   # ── Password reset ──────────────────────────────────────────────
   # Request: always succeed silently from the caller's perspective (no
@@ -1144,6 +1184,20 @@ routes:
         fields: "coupon_active coupon_percent_off coupon_fixed_off coupon_created_at tax_rate"
       - action: db.insert
         table: orders
+      # Coupon redemption counter — incremented only after the order row is
+      # durable, and gated on coupon_code so non-coupon orders skip it. The
+      # used_count column is schema-evolved on the coupons table; db.adjust
+      # is synchronous so the cap check in VALIDATE_COUPON sees it on the
+      # next validation. Idempotency note: a /emit retry with the same
+      # idempotency key re-runs this whole route, but the durable
+      # _spine_idem claim absorbs it before the route re-executes, so the
+      # counter cannot double-increment through client retries.
+      - action: db.adjust
+        table: coupons
+        column: used_count
+        by: 1
+        where: "code = '$event.payload.coupon_code'"
+        if: "$event.payload.coupon_code exists"
       # New-order notification (durable outbox retries cover downtime).
       # No-ops silently when ALERT_WEBHOOK_URL is unset.
       - action: notify.webhook
@@ -1199,6 +1253,10 @@ routes:
 
   # Shopper applies a coupon at checkout — validated server-side, result
   # broadcast back so the cart math uses engine-sourced numbers only.
+  # Guard rails (server-side, never client-claimed): active flag, optional
+  # expiry (expires_at, RFC3339), optional max redemptions (max_uses, with
+  # used_count incremented on PLACE_ORDER — the redemption point, NOT
+  # validation, so an abandoned cart never burns a use).
   - on: VALIDATE_COUPON
     on_failure: COUPON_REJECTED
     steps:
@@ -1210,15 +1268,31 @@ routes:
       - action: assert
         condition: "$event.payload.coupon_active == true"
         message: "'$event.payload.code' is not active"
+      # Expired codes fail closed: an unset expires_at (empty string) skips
+      # the guard; a set one must still be in the future.
+      - action: assert
+        condition: "$event.payload.coupon_expires_at == '' || $event.payload.coupon_expires_at >= $now"
+        message: "'$event.payload.code' has expired"
+        if: "$event.payload.coupon_expires_at exists"
+      # Max redemptions: unset (empty) = unlimited; otherwise used_count
+      # must be below the cap.
+      - action: assert
+        condition: "$event.payload.coupon_max_uses == '' || $event.payload.coupon_max_uses == '0' || $event.payload.coupon_used_count < $event.payload.coupon_max_uses"
+        message: "'$event.payload.code' has reached its redemption limit"
+        if: "$event.payload.coupon_max_uses exists"
       - action: set
         coupon_code: $event.payload.code
     emit: COUPON_VALIDATED
 
-  # Admin creates/updates a discount code (upsert by code)
+  # Admin creates/updates a discount code (upsert by code). New guards are
+  # optional: expires_at (RFC3339, empty = never) and max_uses (empty =
+  # unlimited). used_count is engine-owned — incremented on redemption —
+  # so CREATE_COUPON only resets it when explicitly re-seeding a code.
   - on: CREATE_COUPON
     steps:
       - action: set
         created_at: $now
+        used_count: $event.payload.used_count
       - action: db.upsert
         table: coupons
         key: code

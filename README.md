@@ -1228,6 +1228,8 @@ Emit() → Contract Validation → Route Steps → Sharded Writer → Batch Flus
 
 10. **WebSocket Hardening**: Connections are capped (`SPINE_WS_MAX_CONNS`), unauthenticated sockets are closed with `4001` after a 5s auth deadline, event-log replay is auth-gated, and ping/pong keepalive reaps dead peers (45s pong wait). Upgrade requests that **carry credentials** (ticket, header key, legacy `?token=`) are validated **before** the 101 handshake — a wrong key is refused with 401 and never occupies a connection slot; only credential-less upgrades may complete the in-frame auth handshake.
 
+11. **Coupon Guard Rails (e-commerce template)**: coupon codes support optional `expires_at` (RFC3339) and `max_uses` caps, enforced server-side in `VALIDATE_COUPON`; `used_count` increments on `PLACE_ORDER` only (abandoned carts never burn a use). `max_uses: 0` or empty = unlimited.
+
 ---
 
 ## Performance & Benchmarks

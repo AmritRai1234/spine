@@ -38,6 +38,9 @@ database:
     - tax_rules
     - subscribers
     - payments
+    - users
+    - sessions
+    - password_resets
 
 access:
   - role: admin
@@ -144,6 +147,9 @@ nodes:
           percent_off: number
           fixed_off: number
           active: string
+          expires_at: string
+          max_uses: integer
+          used_count: integer
       - event: SAVE_SHIPPING_ZONE
         payload:
           country: string
@@ -392,6 +398,13 @@ routes:
         fields: "coupon_active coupon_percent_off coupon_fixed_off coupon_created_at tax_rate"
       - action: db.insert
         table: orders
+      # Coupon redemption counter (mirrors apps/ecommerce/app.spine).
+      - action: db.adjust
+        table: coupons
+        column: used_count
+        by: 1
+        where: "code = '$event.payload.coupon_code'"
+        if: "$event.payload.coupon_code exists"
       - action: email.send
         max_attempts: 3
         backoff_ms: 250
@@ -410,6 +423,15 @@ routes:
         as: coupon_
       - action: assert
         condition: "$event.payload.coupon_active == true"
+      # Expiry + redemption-cap guards (mirrors apps/ecommerce/app.spine).
+      - action: assert
+        condition: "$event.payload.coupon_expires_at == '' || $event.payload.coupon_expires_at >= $now"
+        message: "'$event.payload.code' has expired"
+        if: "$event.payload.coupon_expires_at exists"
+      - action: assert
+        condition: "$event.payload.coupon_max_uses == '' || $event.payload.coupon_max_uses == '0' || $event.payload.coupon_used_count < $event.payload.coupon_max_uses"
+        message: "'$event.payload.code' has reached its redemption limit"
+        if: "$event.payload.coupon_max_uses exists"
     emit: COUPON_VALIDATED
 
   - on: CREATE_COUPON
@@ -810,9 +832,10 @@ func TestEcommerceCouponFlow(t *testing.T) {
 		t.Fatalf("expected COUPON_REJECTED, got %v", states)
 	}
 
-	// Admin creates an active 20% code
+	// Admin creates an active 20% code — uncapped (max_uses omitted → unlimited).
 	if _, err := bus.Emit("CREATE_COUPON", map[string]interface{}{
 		"code": "SAVE20", "percent_off": 20.0, "fixed_off": 0.0, "active": "true",
+		"expires_at": "", "max_uses": 0, "used_count": 0,
 	}); err != nil {
 		t.Fatalf("create_coupon failed: %v", err)
 	}
