@@ -60,7 +60,7 @@ routes:
 
 	// Direct enqueue test
 	bus.DB().Exec(`DELETE FROM "_spine_outbox"`) // Clear previous outbox items
-	
+
 	// Enqueue outbox item with past next_retry_at to trigger immediately
 	pastRetry := time.Now().UTC().Add(-1 * time.Minute).Format(time.RFC3339)
 	nowStr := time.Now().UTC().Format(time.RFC3339)

@@ -196,13 +196,34 @@ func (b *Bus) processOutboxQueue() {
 				}
 
 				var payload map[string]interface{}
-				_ = json.Unmarshal([]byte(t.payload), &payload)
+				if uerr := json.Unmarshal([]byte(t.payload), &payload); uerr != nil {
+					// A corrupted payload will never become valid on retry —
+					// executing it would run the step with empty fields and
+					// "succeed" silently. Mark the row failed immediately
+					// (like a terminal retry failure) so the operator sees
+					// it instead of a missing webhook weeks later.
+					log.Printf("[outbox] row %d (%s): stored payload is not valid JSON, marking failed: %v", t.id, t.action, uerr)
+					if _, ferr := b.db.Exec(`UPDATE "_spine_outbox" SET status = 'failed' WHERE id = `+b.ph(1), t.id); ferr != nil {
+						log.Printf("[outbox] mark row %d failed: %v", t.id, ferr)
+					}
+					return
+				}
 
 				step := &manifest.RouteStep{
 					Action: t.action,
 				}
 				if t.stepData != "" {
-					_ = json.Unmarshal([]byte(t.stepData), step)
+					if uerr := json.Unmarshal([]byte(t.stepData), step); uerr != nil {
+						// Same terminal treatment: step metadata is written
+						// by the engine itself, so corruption here is a
+						// storage problem, not a transient failure — retry
+						// churn would never fix it.
+						log.Printf("[outbox] row %d (%s): stored step data is not valid JSON, marking failed: %v", t.id, t.action, uerr)
+						if _, ferr := b.db.Exec(`UPDATE "_spine_outbox" SET status = 'failed' WHERE id = `+b.ph(1), t.id); ferr != nil {
+							log.Printf("[outbox] mark row %d failed: %v", t.id, ferr)
+						}
+						return
+					}
 				}
 
 				// execStepNoEnqueue: a failed retry must NEVER enqueue a fresh

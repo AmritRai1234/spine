@@ -3,6 +3,7 @@ package engine
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"time"
 )
 
@@ -81,7 +82,21 @@ func (b *Bus) ReplayEvents(filter ReplayFilter) ([]ReplayResult, error) {
 		}
 
 		payload := make(map[string]interface{})
-		_ = json.Unmarshal([]byte(rawPayload), &payload)
+		if uerr := json.Unmarshal([]byte(rawPayload), &payload); uerr != nil {
+			// A corrupted stored payload must NOT be replayed as a hollow
+			// empty-payload event (routes would run with nil fields and the
+			// operator would see "success" with no trace of the problem).
+			// Surface it explicitly in the result set and skip the emit.
+			log.Printf("[replay] event %d (%s): stored payload is not valid JSON, skipping emit: %v", id, evtName, uerr)
+			results = append(results, ReplayResult{
+				EventID:   id,
+				EventName: evtName,
+				Payload:   payload,
+				Status:    "error",
+				Error:     "corrupted stored payload: " + uerr.Error(),
+			})
+			continue
+		}
 
 		res := ReplayResult{
 			EventID:   id,
