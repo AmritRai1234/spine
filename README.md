@@ -404,8 +404,9 @@ The step injects `fanned_out` (count of events fired this tick) into the route p
 2. **Advance-first ordering.** The due date is pushed forward by the row's interval BEFORE emission. The tempting alternative (advance only on downstream success) permanently blocks retry: a failed charge would leave the old due date, so the identical idempotency key would be claimed again next tick and never re-fire. Declined-card semantics belong to the downstream route's `on_failure`/`compensate` — the layer that knows what "declined" means. If the date-update itself fails, the row stays due and the next scan retries it.
 3. **Outage catch-up.** On resume after downtime, each overdue row's date rolls forward in monthly hops until strictly past now — so one missed month fires once, not once-per-missed-tick. No backlog stampede.
 4. **Batching.** Keyset pagination (`_spine_id > cursor ORDER BY _spine_id LIMIT n`) — stable under concurrent writes, O(1) memory from 500 rows to 500,000+. Overlapping scans are serialized by the cron worker's running-guard, and even a racing scan just hits idempotency claims instead of double-firing.
+5. **Strict row parsing (v3.0.8).** The interval column is parsed strictly: a non-numeric stored value (SQLite's dynamic typing allows text in an INTEGER-affinity column) is **logged and skipped** — the row's due date is left untouched and no event fires for it. Previously the parse error was discarded and the row silently advanced by a wrong interval. Clean rows in the same batch still fire.
 
-`db.fanout` requires `spine_version: 3`. It generalizes the built-in `subscriptions.sweep` action, which remains as the zero-config special case for the ecommerce template's hardcoded subscription shape.
+`db.fanout` requires `spine_version: 3`. It generalizes the built-in `subscriptions.sweep` action, which remains as the zero-config special case for the ecommerce template's hardcoded subscription shape. The sweep shares the same strict row parsing (v3.0.8): a subscription row with a non-numeric `unit_price`, `qty` or `interval_months` is logged and skipped — never silently renewed at $0 / 0 qty / a wrong interval. If your manifest was relying on garbage values defaulting to zero, those rows will now be *visible* in the logs as skipped instead of invisible as free renewals.
 
 ### `slots.generate` — Schedule-to-Slot Generation (Booking)
 
@@ -1225,7 +1226,7 @@ Emit() → Contract Validation → Route Steps → Sharded Writer → Batch Flus
 
 9. **CORS Safe Defaults**: Credentials are off by default (wildcard origin). Setting `SPINE_CORS_ORIGINS` enables credentialed cross-origin against an explicit allowlist only — reflecting arbitrary origins with credentials is refused.
 
-10. **WebSocket Hardening**: Connections are capped (`SPINE_WS_MAX_CONNS`), unauthenticated sockets are closed with `4001` after a 5s auth deadline, event-log replay is auth-gated, and ping/pong keepalive reaps dead peers (45s pong wait).
+10. **WebSocket Hardening**: Connections are capped (`SPINE_WS_MAX_CONNS`), unauthenticated sockets are closed with `4001` after a 5s auth deadline, event-log replay is auth-gated, and ping/pong keepalive reaps dead peers (45s pong wait). Upgrade requests that **carry credentials** (ticket, header key, legacy `?token=`) are validated **before** the 101 handshake — a wrong key is refused with 401 and never occupies a connection slot; only credential-less upgrades may complete the in-frame auth handshake.
 
 ---
 
