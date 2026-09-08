@@ -931,7 +931,17 @@ spine_dropped_broadcasts %d
 		// Merge custom context attributes (e.g. location, temperature, device, custom fields)
 		body.Payload = middleware.MergeCustomContextIntoPayload(r.Context(), body.Payload)
 
-		result, emitErr := e.Bus.Emit(body.Event, body.Payload)
+		// Idempotency caller namespace: resolved from the authenticated access
+		// context (role), never from client payload text. Claims made through
+		// /emit are therefore scoped per role — a shopper's `_idempotency_key`
+		// can neither collide with nor replay another role's/caller's result.
+		// No access rules configured → shared "anonymous" namespace (single-key
+		// mode is one trust domain by definition).
+		emitCaller := CallerAnonymous
+		if ac := getAccessContext(r); ac != nil && ac.Role != "" {
+			emitCaller = "role:" + ac.Role
+		}
+		result, emitErr := e.Bus.EmitAs(emitCaller, body.Event, body.Payload)
 
 		// Pool the response buffer
 		buf := bufPool.Get().(*bytes.Buffer)

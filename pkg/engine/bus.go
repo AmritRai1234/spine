@@ -173,8 +173,8 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 		d.placeholder(1) + `, ` + d.placeholder(2) + `, ` + d.placeholder(3) + `, ` + d.placeholder(4) + `)`
 	bus.spillSQL = `INSERT INTO "_spine_write_spill" (query, params_json, status, created_at) VALUES (` +
 		d.placeholder(1) + `, ` + d.placeholder(2) + `, 'pending', ` + d.placeholder(3) + `)`
-	bus.idemInsertSQL = d.idemInsertPrefix + ` "_spine_idem" (key, status, result_json, created_at) VALUES (` +
-		d.placeholder(1) + `, 'running', NULL, ` + d.placeholder(2) + `)` + d.idemConflictSuffix
+	bus.idemInsertSQL = d.idemInsertPrefix + ` "_spine_idem" (caller, key, status, result_json, created_at) VALUES (` +
+		d.placeholder(1) + `, ` + d.placeholder(2) + `, 'running', NULL, ` + d.placeholder(3) + `)` + d.idemConflictSuffix
 	bus.registry.Store(reg)
 	bus.startBatchWriter()
 	if err := bus.initEventTable(); err != nil {
@@ -325,15 +325,66 @@ func (b *Bus) startScheduledCronWorker() {
 
 // initIdempotencyTable creates the _spine_idem table for durable idempotency.
 // Created during startup so a missing/unwritable DB aborts startup.
+//
+// Schema history: the table originally keyed on (key) alone, which allowed
+// any caller to claim or read another caller's idempotency entry — a
+// cross-caller data disclosure (a replayed key returned the cached result
+// of someone else's successful emit). Claims are now namespaced by caller:
+// PRIMARY KEY (caller, key). Existing databases migrate via the versioned
+// migration below; in-flight claims at upgrade time are attributed to the
+// internal namespace (engine-generated keys dominate the table, and the
+// 5-minute evictor bounds any impact).
 func (b *Bus) initIdempotencyTable() error {
 	_, err := b.db.Exec(`CREATE TABLE IF NOT EXISTS "_spine_idem" (
-		key TEXT PRIMARY KEY,
+		caller TEXT NOT NULL DEFAULT 'internal',
+		key TEXT NOT NULL,
 		status TEXT NOT NULL,
 		result_json TEXT,
-		created_at TEXT NOT NULL
+		created_at TEXT NOT NULL,
+		PRIMARY KEY (caller, key)
 	)`)
 	if err != nil {
 		return fmt.Errorf("cannot create _spine_idem table: %w", err)
+	}
+
+	// Legacy upgrade: pre-namespace tables lack the caller column and key on
+	// (key) alone. CREATE IF NOT EXISTS above is a no-op for them. Detect and
+	// rebuild through the versioned migration tracker so it runs exactly once.
+	var pkCols []string
+	rows, err := b.db.Query(`SELECT "name" FROM "pragma_table_info"("_spine_idem") WHERE "pk" > 0 ORDER BY "pk"`)
+	if err == nil {
+		for rows.Next() {
+			var c string
+			if rows.Scan(&c) == nil {
+				pkCols = append(pkCols, c)
+			}
+		}
+		rows.Close()
+	}
+	if err != nil || len(pkCols) != 2 {
+		m := Migration{
+			Version: 1,
+			Name:    "idem_caller_namespace",
+			SQL: `ALTER TABLE "_spine_idem" RENAME TO "_spine_idem_legacy";
+CREATE TABLE "_spine_idem" (
+	caller TEXT NOT NULL DEFAULT 'internal',
+	key TEXT NOT NULL,
+	status TEXT NOT NULL,
+	result_json TEXT,
+	created_at TEXT NOT NULL,
+	PRIMARY KEY (caller, key)
+);
+INSERT INTO "_spine_idem" (caller, key, status, result_json, created_at)
+	SELECT 'internal', key, status, result_json, created_at FROM "_spine_idem_legacy";
+DROP TABLE "_spine_idem_legacy";`,
+		}
+		applied, merr := b.ApplyMigration(m)
+		if merr != nil {
+			return fmt.Errorf("idempotency table migration failed: %w", merr)
+		}
+		if applied {
+			log.Printf("[idempotency] migrated _spine_idem to caller-namespaced keys (v1)")
+		}
 	}
 	return nil
 }
@@ -597,12 +648,51 @@ func (b *Bus) DB() *sql.DB {
 
 // Emit dispatches an event: validates the payload, runs route steps,
 // persists to SQLite, and broadcasts any emitted states over WS.
+//
+// Internal emitter — idempotency claims are namespaced under the fixed
+// "internal" caller. HTTP-facing emits must use EmitAs so client-supplied
+// keys can never collide with (or read results from) another caller's
+// namespace.
 func (b *Bus) Emit(event string, payload map[string]interface{}) (map[string]interface{}, error) {
-	return b.EmitWithDepth(event, payload, 0)
+	return b.EmitWithDepthAs(CallerInternal, event, payload, 0)
+}
+
+// Caller namespaces for idempotency claims. Client-supplied
+// _idempotency_key values are scoped UNDER the caller's namespace, so two
+// callers using the same key can never collide, and a cached result is
+// only ever replayed to the caller that produced it.
+const (
+	// CallerInternal covers all engine-internal emits: webhook stamps,
+	// cron routes, fanout, subscriptions sweep, replay. Fixed and trusted.
+	CallerInternal = "internal"
+	// CallerAnonymous covers emits with no resolved access context
+	// (legacy single-key / fail-open mode). Shared namespace: in that
+	// mode there IS no per-caller identity — the API key itself is the
+	// only credential, and holders of it are one trust domain.
+	CallerAnonymous = "anonymous"
+)
+
+// EmitAs dispatches an event on behalf of a named caller. The caller
+// string must be an engine-stamped identity (access role, or the fixed
+// CallerAnonymous / CallerInternal constants) — never client-supplied
+// free text. /emit resolves the caller from the authenticated access
+// context, not from the payload.
+func (b *Bus) EmitAs(caller, event string, payload map[string]interface{}) (map[string]interface{}, error) {
+	if caller == "" {
+		caller = CallerAnonymous
+	}
+	return b.EmitWithDepthAs(caller, event, payload, 0)
 }
 
 // EmitWithDepth handles event dispatching with a recursion depth guard for event chaining.
 func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth int) (map[string]interface{}, error) {
+	return b.EmitWithDepthAs(CallerInternal, event, payload, depth)
+}
+
+// EmitWithDepthAs is EmitWithDepth with an explicit idempotency-caller
+// namespace. Chained emissions (depth > 0) inherit the caller so nested
+// claims stay inside the originating caller's namespace.
+func (b *Bus) EmitWithDepthAs(caller, event string, payload map[string]interface{}, depth int) (map[string]interface{}, error) {
 	if depth > 10 {
 		return nil, fmt.Errorf("event chaining max depth (10) exceeded on event '%s'", event)
 	}
@@ -611,6 +701,11 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 
 	// Idempotency: DB-backed claim protocol (depth == 0 only; chained emissions
 	// share the parent key by design and must NOT be deduped).
+	//
+	// SECURITY: claims are namespaced by caller (PRIMARY KEY (caller, key)).
+	// A client-supplied key can therefore never collide with — or replay the
+	// cached result of — another caller's emit. Namespace mismatch on an
+	// existing key returns a generic conflict, never the cached payload.
 	var idempotencyKey string
 	var claimedKey string // non-empty when this call owns the claim
 	if depth == 0 {
@@ -618,7 +713,7 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 			idempotencyKey = ik
 			now := time.Now().UTC().Format(time.RFC3339)
 
-			res, err := b.db.Exec(b.idemInsertSQL, idempotencyKey, now)
+			res, err := b.db.Exec(b.idemInsertSQL, caller, idempotencyKey, now)
 			if err != nil {
 				return nil, fmt.Errorf("idempotency claim failed: %w", err)
 			}
@@ -628,9 +723,12 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 				var status string
 				var resultJSON sql.NullString
 				var createdAt string
-				err = b.db.QueryRow(`SELECT status, result_json, created_at FROM "_spine_idem" WHERE key = `+b.ph(1), idempotencyKey).Scan(&status, &resultJSON, &createdAt)
+				err = b.db.QueryRow(`SELECT status, result_json, created_at FROM "_spine_idem" WHERE caller = `+b.ph(1)+` AND key = `+b.ph(2), caller, idempotencyKey).Scan(&status, &resultJSON, &createdAt)
 				if err != nil {
-					return nil, fmt.Errorf("idempotency check failed: %w", err)
+					// Key exists under a DIFFERENT caller's namespace. Deliberately
+					// the same generic conflict as in-flight: no existence oracle,
+					// no cross-caller result replay.
+					return nil, fmt.Errorf("idempotency conflict: request with key '%s' is already in-flight", idempotencyKey)
 				}
 
 				createdTime, parseErr := time.Parse(time.RFC3339, createdAt)
@@ -654,7 +752,7 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 					// Stale (>=5 min) — guarded steal
 					oldCreated := createdAt
 					now2 := time.Now().UTC().Format(time.RFC3339)
-					updRes, updErr := b.db.Exec(`UPDATE "_spine_idem" SET status = 'running', created_at = `+b.ph(1)+` WHERE key = `+b.ph(2)+` AND created_at = `+b.ph(3), now2, idempotencyKey, oldCreated)
+					updRes, updErr := b.db.Exec(`UPDATE "_spine_idem" SET status = 'running', created_at = `+b.ph(1)+` WHERE caller = `+b.ph(2)+` AND key = `+b.ph(3)+` AND created_at = `+b.ph(4), now2, caller, idempotencyKey, oldCreated)
 					if updErr != nil {
 						return nil, fmt.Errorf("idempotency steal failed: %w", updErr)
 					}
@@ -663,7 +761,7 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 						// Someone else stole it — re-read final state
 						var finalStatus string
 						var finalResult sql.NullString
-						_ = b.db.QueryRow(`SELECT status, result_json FROM "_spine_idem" WHERE key = `+b.ph(1), idempotencyKey).Scan(&finalStatus, &finalResult)
+						_ = b.db.QueryRow(`SELECT status, result_json FROM "_spine_idem" WHERE caller = `+b.ph(1)+` AND key = `+b.ph(2), caller, idempotencyKey).Scan(&finalStatus, &finalResult)
 						if finalStatus == "completed" && finalResult.Valid && finalResult.String != "" {
 							var cachedResult map[string]interface{}
 							if json.Unmarshal([]byte(finalResult.String), &cachedResult) == nil {
@@ -688,13 +786,13 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 	if claimedKey != "" {
 		defer func() {
 			if r := recover(); r != nil {
-				_, _ = b.db.Exec(`DELETE FROM "_spine_idem" WHERE key = `+b.ph(1), claimedKey)
+				_, _ = b.db.Exec(`DELETE FROM "_spine_idem" WHERE caller = `+b.ph(1)+` AND key = `+b.ph(2), caller, claimedKey)
 				panic(r)
 			}
 			if execSuccess {
 				// resultJSON is serialized in the success block below
 			} else {
-				_, _ = b.db.Exec(`DELETE FROM "_spine_idem" WHERE key = `+b.ph(1), claimedKey)
+				_, _ = b.db.Exec(`DELETE FROM "_spine_idem" WHERE caller = `+b.ph(1)+` AND key = `+b.ph(2), caller, claimedKey)
 			}
 		}()
 	}
@@ -884,7 +982,7 @@ func (b *Bus) EmitWithDepth(event string, payload map[string]interface{}, depth 
 				log.Printf("[idempotency] marshal completed result failed for key %s: %v", idempotencyKey, err)
 				resultJSON = []byte("{}")
 			}
-			if _, err := b.db.Exec(`UPDATE "_spine_idem" SET status = 'completed', result_json = `+b.ph(1)+` WHERE key = `+b.ph(2), string(resultJSON), idempotencyKey); err != nil {
+			if _, err := b.db.Exec(`UPDATE "_spine_idem" SET status = 'completed', result_json = `+b.ph(1)+` WHERE caller = `+b.ph(2)+` AND key = `+b.ph(3), string(resultJSON), caller, idempotencyKey); err != nil {
 				// The event itself already succeeded, so we cannot fail now —
 				// but without this row a retried request will re-execute the
 				// route instead of receiving the cached result.

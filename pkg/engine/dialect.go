@@ -48,7 +48,7 @@ var (
 		listTables:         `SELECT table_name AS name FROM information_schema.tables WHERE table_schema = 'public' AND table_type = 'BASE TABLE'`,
 		rowIDCol:           `_spine_id`,
 		idemInsertPrefix:   `INSERT INTO`,
-		idemConflictSuffix: ` ON CONFLICT ("key") DO NOTHING`,
+		idemConflictSuffix: ` ON CONFLICT (caller, key) DO NOTHING`,
 		returningID:        true,
 	}
 )
