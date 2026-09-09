@@ -123,6 +123,7 @@ type Engine struct {
 	APIKey        string                         // Legacy single-key auth (backward compat)
 	accessPtr     atomic.Pointer[AccessResolver] // Multi-key role-based access control (hot-swappable)
 	rateLimiter   *middleware.RateLimitManager
+	trackLimiter  *middleware.RateLimitManager // tighter per-route bucket for /track
 	customContext *middleware.CustomContextManager
 	spineFile     string
 
@@ -738,6 +739,13 @@ func (e *Engine) buildMux() *http.ServeMux {
 			"result":   res,
 		})
 	}))
+
+	// /track — first-party analytics ingest. Auth-exempt (browser shoppers
+	// have no key) but double rate-limited: the global per-IP limiter
+	// OUTSIDE and a tighter per-route analytics bucket INSIDE, plus a
+	// 32 KB body cap (below the global 1 MB) and strict per-field
+	// validation. See pkg/engine/analytics.go for the threat model.
+	mux.HandleFunc("/track", e.wrapTrackMiddleware(e.handleTrack))
 
 	mux.HandleFunc("/oauth/", e.wrapPublicBrowserMiddleware(func(w http.ResponseWriter, r *http.Request) {
 		// OAuth callback from a social provider. The browser arrives here
