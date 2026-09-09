@@ -124,6 +124,10 @@ type Engine struct {
 	accessPtr     atomic.Pointer[AccessResolver] // Multi-key role-based access control (hot-swappable)
 	rateLimiter   *middleware.RateLimitManager
 	trackLimiter  *middleware.RateLimitManager // tighter per-route bucket for /track
+	trackCh       chan []trackEvent            // buffered ingest queue
+	trackStop     chan struct{}                // closes to stop the writer
+	trackWg       sync.WaitGroup
+	trackCounters *analyticsCounters
 	customContext *middleware.CustomContextManager
 	spineFile     string
 
@@ -214,6 +218,9 @@ func New(schema *manifest.SpineSchema, dbPath string) (*Engine, error) {
 		wsMaxConnsPerIP: 100,
 		wsAuthTimeout:   5 * time.Second,
 	}
+
+	// Buffered analytics writer + observability summary loops.
+	eng.startTrackWriter()
 
 	// WebSocket connection cap from env (invalid/negative values fall back to
 	// the default).
@@ -362,6 +369,8 @@ func (e *Engine) Close() error {
 			close(e.reloadStop)
 		}
 	})
+	// Drain in-flight analytics events before the DB goes away.
+	e.stopTrackWriter()
 	if e.rateLimiter != nil {
 		e.rateLimiter.Close()
 	}
@@ -864,8 +873,18 @@ spine_stmt_failures %d
 # HELP spine_dropped_broadcasts State broadcasts dropped because the broadcast channel was saturated
 # TYPE spine_dropped_broadcasts counter
 spine_dropped_broadcasts %d
+
+# HELP spine_analytics_ingested_events First-party analytics events persisted
+# TYPE spine_analytics_ingested_events counter
+spine_analytics_ingested_events %d
+
+# HELP spine_analytics_dropped_events First-party analytics events dropped (validation, overflow, DB failure) — must stay near zero; sustained growth with ingested==0 means the client snippet is broken
+# TYPE spine_analytics_dropped_events counter
+spine_analytics_dropped_events %d
 `, rps, batchSize, mode,
-			e.Bus.CommitFailures(), e.Bus.SpillWrites(), e.Bus.LostWrites(), e.Bus.DroppedAudit(), e.Bus.StmtFailures(), e.Hub.DroppedBroadcasts())
+			e.Bus.CommitFailures(), e.Bus.SpillWrites(), e.Bus.LostWrites(), e.Bus.DroppedAudit(), e.Bus.StmtFailures(), e.Hub.DroppedBroadcasts(),
+			func() uint64 { ing, _ := e.trackCounters.snapshot(); return ing }(),
+			func() uint64 { _, drop := e.trackCounters.snapshot(); return drop }())
 
 		w.Write([]byte(metrics))
 	}))

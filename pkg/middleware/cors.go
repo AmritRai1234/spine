@@ -5,7 +5,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
-	"sync"
+	"sync/atomic"
 )
 
 // CORSOptions configures Cross-Origin Resource Sharing behavior.
@@ -53,21 +53,31 @@ func DefaultCORSOptions() CORSOptions {
 // restart, matching WS origins semantics. The handler is rebuilt only when
 // the allowlist actually changes, so the per-request cost is one env read
 // + string compare.
+//
+// Concurrency: the wrapped handler + lastEnv pair are guarded by an
+// atomic.Pointer swap (not just the mutex) — the double-checked-locking
+// read of `wrapped`/`lastEnv` outside the lock was a data race under
+// concurrent requests (caught by -race in the analytics concurrency test).
 func DynamicCORSMiddleware(next http.HandlerFunc) http.HandlerFunc {
-	var mu sync.Mutex
-	lastEnv := "\x00" // sentinel ≠ "" so the first request builds
-	wrapped := CORSMiddleware(DefaultCORSOptions(), next)
+	type dynCORS struct {
+		lastEnv string
+		wrapped http.HandlerFunc
+	}
+	cur := &dynCORS{lastEnv: "\x00", wrapped: CORSMiddleware(DefaultCORSOptions(), next)}
+	curPtr := atomic.Pointer[dynCORS]{}
+	curPtr.Store(cur)
 	return func(w http.ResponseWriter, r *http.Request) {
 		env := os.Getenv("SPINE_CORS_ORIGINS")
-		if env != lastEnv {
-			mu.Lock()
-			if env != lastEnv { // double-check under lock
-				wrapped = CORSMiddleware(DefaultCORSOptions(), next)
-				lastEnv = env
+		c := curPtr.Load()
+		if env != c.lastEnv {
+			newC := &dynCORS{lastEnv: env, wrapped: CORSMiddleware(DefaultCORSOptions(), next)}
+			if curPtr.CompareAndSwap(c, newC) {
+				c = newC
+			} else {
+				c = curPtr.Load()
 			}
-			mu.Unlock()
 		}
-		wrapped(w, r)
+		c.wrapped(w, r)
 	}
 }
 
