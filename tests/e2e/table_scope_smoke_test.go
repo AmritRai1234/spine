@@ -187,11 +187,26 @@ func TestEcommerceShopperTableScopeSensitiveDenied(t *testing.T) {
 	for _, path := range []string{
 		"/tables/users", "/tables/sessions", "/tables/payments",
 		"/tables/password_resets", "/tables/coupons",
+		// Analytics tables carry visitor-behavior data — MORE sensitive
+		// than payments to a privacy posture. Scoped from the commit that
+		// created them (never a follow-up).
+		"/tables/analytics_events", "/tables/analytics_sessions",
 	} {
 		code, body := tableGet(handler, shopperKey, path)
 		if code != 403 {
 			t.Errorf("sensitive table %s: expected 403, got %d %s", path, code, body)
 		}
+	}
+
+	// Enumeration gate: the analytics tables must be INVISIBLE from the
+	// shopper's /tables listing, not merely 403 on direct read (same
+	// guarantee the scoping commit established for the other tables).
+	listCode, listBody := tableGet(handler, shopperKey, "/tables")
+	if listCode != 200 {
+		t.Fatalf("shopper /tables listing: %d %s", listCode, listBody)
+	}
+	if strings.Contains(listBody, "analytics_events") || strings.Contains(listBody, "analytics_sessions") {
+		t.Fatal("SCOPE LEAK: analytics table visible in shopper /tables listing")
 	}
 
 	code, body := tableGet(handler, adminKey, "/tables/payments")

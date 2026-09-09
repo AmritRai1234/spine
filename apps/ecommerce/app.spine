@@ -89,6 +89,8 @@ database:
     - trackings
     - tracking_events
     - cart_sessions
+    - analytics_events
+    - analytics_sessions
 
 # ── Nodes & Contracts ─────────────────────────────────────────────
 # owns_files = the AI-codability map: every frontend file belongs to
