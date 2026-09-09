@@ -25,6 +25,8 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"os"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -121,6 +123,10 @@ func (c *analyticsCounters) snapshot() (uint64, uint64) {
 }
 
 const trackSummaryEvery = 5 * time.Minute
+
+// Retention sweep cadence. Raw events are the privacy-sensitive tier;
+// the sweep prunes them hourly (cheap DELETE on an indexed column).
+const trackSweepEvery = time.Hour
 
 // wrapTrackMiddleware composes the /track chain: the engine's global rate
 // limiter OUTSIDE (shared request-flood gate — never bypassed by having a
@@ -330,6 +336,58 @@ func (e *Engine) startTrackWriter() {
 			}
 		}
 	}()
+
+	// Retention sweep: raw events are PII-adjacent (ip_hash, UA family) —
+	// they age out on a short leash. Session rollups are aggregates with
+	// no direct identifier and are kept indefinitely. Runs hourly.
+	go func() {
+		defer e.trackWg.Done()
+		ticker := time.NewTicker(trackSweepEvery)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				e.sweepAnalytics()
+			case <-e.trackStop:
+				return
+			}
+		}
+	}()
+}
+
+// analyticsRetentionDays returns the raw-event retention window. Default
+// 180 days; ANALYTICS_RETENTION_DAYS overrides (0/negative/garbage →
+// default, a misconfigured env var must not disable retention entirely —
+// that would grow the table unboundedly).
+func analyticsRetentionDays() int {
+	if v := os.Getenv("ANALYTICS_RETENTION_DAYS"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			return n
+		}
+	}
+	return 180
+}
+
+// sweepAnalytics deletes raw events older than the retention window.
+// Rollups (analytics_sessions) are kept — they're aggregates, not
+// event-level data. Errors are logged; the next tick retries. Returns the
+// number of rows deleted (for tests).
+func (e *Engine) sweepAnalytics() int {
+	if e.Bus == nil {
+		return 0
+	}
+	days := analyticsRetentionDays()
+	cutoff := time.Now().AddDate(0, 0, -days).UnixMilli()
+	res, err := e.Bus.DB().Exec(`DELETE FROM analytics_events WHERE created_at < ?`, cutoff)
+	if err != nil {
+		log.Printf("[analytics] sweep: %v", err)
+		return 0
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		log.Printf("[analytics] sweep: pruned %d events older than %d days", n, days)
+	}
+	return int(n)
 }
 
 func (e *Engine) stopTrackWriter() {
