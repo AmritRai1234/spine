@@ -76,6 +76,11 @@ type trackEvent struct {
 	ViewportH       int     `json:"viewport_h"`
 	ElementSelector string  `json:"element_selector"`
 	ElementText     string  `json:"element_text"`
+	// Server-resolved (Task 4) — never client-supplied.
+	IPHash    string `json:"-"`
+	UserAgent string `json:"-"`
+	Device    string `json:"-"`
+	Country   string `json:"-"`
 }
 
 var trackEventTypes = map[string]bool{
@@ -233,6 +238,10 @@ func (e *Engine) handleTrack(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Server-side context resolution BEFORE enqueueing: ip_hash, UA
+	// family, device. The client never supplies these fields.
+	e.resolveTrackContext(r, valid)
+
 	// Buffered async writer — respond immediately; a slow DB must never
 	// hold a shopper request open. The writer owns the flush.
 	select {
@@ -383,14 +392,13 @@ func (e *Engine) flushTrack(events []trackEvent) {
 	defer sStmt.Close()
 
 	now := nowMillis()
-	sessionDeltas := make(map[string]*trackEvent) // first pageview per session
+	sessionDeltas := make(map[string]*trackEvent) // first event per session
 	for _, ev := range events {
-		// Server-resolved fields stay empty until Task 4 (ip_hash, UA).
 		if _, err := stmt.Exec(generateUUID(), ev.VisitorID, ev.SessionID, ev.EventType,
 			ev.PagePath, ev.PageTitle, ev.Referrer,
 			ev.UTMSource, ev.UTMMedium, ev.UTMCampaign, ev.X, ev.Y, ev.ScrollPct,
 			ev.ViewportW, ev.ViewportH, ev.ElementSelector, ev.ElementText,
-			"", "", "", "", now); err != nil {
+			ev.IPHash, ev.UserAgent, ev.Device, ev.Country, now); err != nil {
 			log.Printf("[analytics] flush: insert: %v", err)
 			e.trackCounters.addDropped(uint64(len(events)))
 			return

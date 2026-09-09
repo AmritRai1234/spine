@@ -450,6 +450,24 @@ func (b *Bus) initEventTable() error {
 
 // logEventAudit enqueues an event emission to the _spine_events audit table.
 // Uses pooled buffer for JSON encoding and pre-built constant SQL.
+// maskSensitiveField masks credential-bearing string payload fields in
+// place (suffix-based: *secret / *key / *token / *salt — case-insensitive).
+// Extracted from logEventAudit so the suffix list is unit-testable without
+// a live Bus/Hub; the *salt suffix covers ANALYTICS_IP_SALT-style config
+// values that could be echoed into payloads. Returns true if masked.
+func maskSensitiveField(payload *map[string]interface{}, k, s string) bool {
+	lk := strings.ToLower(k)
+	if strings.HasSuffix(lk, "secret") || strings.HasSuffix(lk, "key") || strings.HasSuffix(lk, "token") || strings.HasSuffix(lk, "salt") {
+		if len(s) <= 4 {
+			(*payload)[k] = "••••"
+		} else {
+			(*payload)[k] = "••••" + s[len(s)-4:]
+		}
+		return true
+	}
+	return false
+}
+
 // logEventAudit records an event in the audit log. Returns the audit row id,
 // or 0 when the insert went through the batched async path (no id known).
 //
@@ -484,13 +502,8 @@ func (b *Bus) logEventAudit(event string, payload map[string]interface{}, emitte
 		if !ok || s == "" {
 			continue
 		}
-		lk := strings.ToLower(k)
-		if strings.HasSuffix(lk, "secret") || strings.HasSuffix(lk, "key") || strings.HasSuffix(lk, "token") {
-			if len(s) <= 4 {
-				payload[k] = "••••"
-			} else {
-				payload[k] = "••••" + s[len(s)-4:]
-			}
+		if maskSensitiveField(&payload, k, s) {
+			continue
 		}
 	}
 
