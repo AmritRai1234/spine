@@ -45,6 +45,11 @@ type Bus struct {
 	// TOTP enrollment state (auth.totp.* / login 2FA gate) — lazy-initialized.
 	totp *totpStore
 
+	// eventHooks: engine-internal observers on every emit (analytics
+	// conversion join). Set once at Bus construction, read on the emit
+	// hot path — never mutated after startup, so no lock on read.
+	eventHooks []func(event string, payload map[string]interface{})
+
 	// Performance: lock-free known tables + identifier cache + SQL template cache
 	knownTable     sync.Map
 	identCache     sync.Map // sanitizeIdent result cache
@@ -813,6 +818,12 @@ func (b *Bus) EmitWithDepthAs(caller, event string, payload map[string]interface
 	}
 
 	reg := b.GetRegistry()
+
+	// Internal event hooks (analytics conversion join): fire-and-forget
+	// observers on every emit. Must never block or fail the emit.
+	for _, hook := range b.eventHooks {
+		hook(event, payload)
+	}
 
 	// Validate payload only on initial emission (depth 0)
 	if depth == 0 {

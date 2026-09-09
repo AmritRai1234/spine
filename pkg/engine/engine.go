@@ -222,6 +222,14 @@ func New(schema *manifest.SpineSchema, dbPath string) (*Engine, error) {
 	// Buffered analytics writer + observability summary loops.
 	eng.startTrackWriter()
 
+	// Conversion join: ORDER_CREATED hooks into the analytics session
+	// table. Fire-and-forget on the emit path.
+	eng.Bus.eventHooks = append(eng.Bus.eventHooks, func(event string, payload map[string]interface{}) {
+		if event == "ORDER_CREATED" {
+			eng.conversionJoin(payload)
+		}
+	})
+
 	// WebSocket connection cap from env (invalid/negative values fall back to
 	// the default).
 	if v := os.Getenv("SPINE_WS_MAX_CONNS"); v != "" {

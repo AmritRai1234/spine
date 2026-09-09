@@ -513,12 +513,17 @@ func (e *Engine) ensureAnalyticsSchema() error {
 	// requires — a plain ALTER path can't retrofit constraints onto an
 	// existing table, so it's declared in the column definition (fresh
 	// CREATE) and enforced by the UNIQUE index below (existing tables).
+	// Idempotent schema evolution for the conversion join: conversion_key
+	// records WHICH key produced the attribution ('visitor' = exact
+	// visitor_id match, 'ip' = ip_hash + 24h fallback, '' = not
+	// converted), so the dashboard can show the approximate fraction.
 	if err := e.Bus.ensureTable("analytics_sessions", []string{
 		`"session_id" TEXT`,
 		`"visitor_id" TEXT`,
 		`"started_at" INTEGER`, `"ended_at" INTEGER`,
 		`"pageviews" INTEGER`, `"entry_path" TEXT`, `"exit_path" TEXT`,
 		`"converted" INTEGER`, `"device" TEXT`,
+		`"conversion_key" TEXT`,
 	}); err != nil {
 		return err
 	}
@@ -530,6 +535,71 @@ func (e *Engine) ensureAnalyticsSchema() error {
 		return err
 	}
 	return nil
+}
+
+// conversionJoin marks the analytics session that produced an order as
+// converted. Attribution authority, explicitly:
+//
+//  1. PRIMARY: visitor_id. The storefront snippet's first-party localStorage
+//     UUID flows through every analytics event. A session whose visitor_id
+//     matches the ordering visitor is a TRUE match — no approximation.
+//  2. FALLBACK: ip_hash + 24h window, used ONLY when no session carries the
+//     visitor's UUID (first-touch before localStorage was set, or storage
+//     cleared mid-session). Shared IPs (CGNAT, hotel wifi, office networks)
+//     make this ambiguous, so the join records conversion_key='ip' — the
+//     dashboard surfaces what fraction of conversions are approximate.
+//
+// At most ONE session is marked per order (no double-counting). Fires on
+// ORDER_CREATED via the Bus event hook; never blocks or fails the emit.
+func (e *Engine) conversionJoin(payload map[string]interface{}) {
+	if e.Bus == nil {
+		return
+	}
+	visitorID, _ := payload["visitor_id"].(string)
+	ipHash, _ := payload["ip_hash"].(string)
+	if visitorID == "" && ipHash == "" {
+		return // nothing to join on
+	}
+
+	db := e.Bus.DB()
+	if err := e.ensureAnalyticsSchema(); err != nil {
+		log.Printf("[analytics] conversion: schema: %v", err)
+		return
+	}
+
+	// 1) Exact visitor match (most recent session for this visitor).
+	if visitorID != "" {
+		res, err := db.Exec(`UPDATE analytics_sessions SET converted = 1, conversion_key = 'visitor'
+			WHERE visitor_id = ? AND converted = 0
+			AND session_id = (SELECT session_id FROM analytics_sessions WHERE visitor_id = ? ORDER BY started_at DESC LIMIT 1)`,
+			visitorID, visitorID)
+		if err == nil {
+			if n, _ := res.RowsAffected(); n > 0 {
+				return // exact match won — no fallback
+			}
+		} else {
+			log.Printf("[analytics] conversion: visitor join: %v", err)
+		}
+	}
+
+	// 2) Fallback: ip_hash within a 24h lookback. Marks the most recent
+	// unconverted session from that hash — approximate by definition.
+	if ipHash != "" {
+		cutoff := time.Now().Add(-24 * time.Hour).UnixMilli()
+		res, err := db.Exec(`UPDATE analytics_sessions SET converted = 1, conversion_key = 'ip'
+			WHERE session_id = (SELECT session_id FROM analytics_sessions
+				WHERE visitor_id IN (SELECT DISTINCT visitor_id FROM analytics_events WHERE ip_hash = ? AND created_at >= ?)
+				 AND converted = 0
+				ORDER BY started_at DESC LIMIT 1)`,
+			ipHash, cutoff)
+		if err != nil {
+			log.Printf("[analytics] conversion: ip join: %v", err)
+			return
+		}
+		if n, _ := res.RowsAffected(); n > 0 {
+			log.Printf("[analytics] conversion: session marked via ip_hash fallback (approximate)")
+		}
+	}
 }
 
 func nowMillis() int64 {
