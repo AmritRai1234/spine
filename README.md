@@ -36,6 +36,7 @@ Client Event → Load Balancer → Spine Node (RLAC Auth & Rate Limit) → Event
 - [CLI Reference](#cli-reference)
 - [Building a Website with Spine](#building-a-website-with-spine)
 - [E-Commerce Template (Storefront + Admin + Email + Payments)](#e-commerce-template-storefront--admin--email--payments)
+- [First-Party Analytics & Heatmaps](#first-party-analytics--heatmaps)
 - [The `.spine` Manifest Specification](#the-spine-manifest-specification)
 - [HTTP & WebSocket API Reference](#http--websocket-api-reference)
 - [Go SDK / Embedding Guide](#go-sdk--embedding-guide)
@@ -360,6 +361,7 @@ ws.onmessage = (event) => {
 | `- action: db.fanout` | On a cron tick, scans a table and independently fires an event for every due row — recurring billing, renewals, reminders |
 | `- action: slots.generate` | On a cron tick, turns business hours into bookable slot rows — idempotent regeneration, schedule changes never delete |
 | `- action: db.upsert` with list `key:` | Constraint claim: atomically rejects a second row with the same key combination — bookings, one-per-customer, seat claims |
+| storefront posts to `/track` | Validates, rate-limits, sessionizes, and stores first-party analytics — with server-side identity resolution and conversion attribution on `ORDER_CREATED` |
 
 ### `db.fanout` — Timer-Driven Scan-and-Emit
 
@@ -598,7 +600,7 @@ cp .env.example .env   # if present — otherwise set secrets per README below
 | Domain | Highlights |
 |---|---|
 | Storefront | Catalog, variants, live cart drawer, checkout, email-keyed order tracking |
-| Admin panel (`#/admin`) | Dashboard & analytics, products, orders, customers, shipping/tax, settings, event log — role-gated (admin/staff) via RLAC keys |
+| Admin panel (`#/admin`) | Dashboard & analytics, products, orders, customers, shipping/tax, settings, event log — role-gated (admin/staff) via RLAC keys. Visitors analytics + click/scroll heatmap (wireframe overlay + top-clicked-elements table) render from the first-party event store |
 | Email marketing | Footer newsletter signup → `subscribers` table; opt-out-safe campaigns with `{{email}}` templating; order confirmation + shipped notifications |
 | Payments | Stripe Checkout sessions created server-side; append-only payments ledger with duplicate-webhook absorption and over-refund protection |
 
@@ -613,6 +615,133 @@ Required env for payments/email: `STRIPE_SECRET_KEY`, `STORE_PUBLIC_URL`, `SMTP_
 
 ---
 
+## First-Party Analytics & Heatmaps
+
+Spine ships a complete, privacy-first traffic and behavior analytics stack. No
+third-party trackers, no cookies for identity — raw events land in the same
+SQLite database the engine already owns, and the admin panel renders them as
+dashboards and click/scroll heatmaps.
+
+### Architecture
+
+```
+Storefront snippet (batched, sendBeacon) → POST /track → strict validation →
+buffered writer → analytics_events / analytics_sessions (SQLite) →
+Admin Visitors tab + Heatmap overlay
+```
+
+- **Ingest is fail-open for the shopper and fail-closed for data.** A bad or
+  forged payload never produces a 5xx the storefront could surface — it is
+  dropped with a `204`. But every field is validated and length-capped before
+  any DB write, and the engine counts every drop (see Observability below).
+- **No PII.** The visitor identity is a random UUID in the browser's
+  `localStorage` (first-party). The IP address is only stored as a salted,
+  daily-rotating truncated hash (`SHA-256(salt + YYYYMMDD + ip)[0:16]`) —
+  enough for same-day abuse forensics, not for tracking people across days.
+  Bot user-agents (crawlers, headless browsers, curl) are filtered entirely.
+- **Trust boundary.** `ip_hash`, `device`, `user_agent`, and `country` are
+  resolved **server-side only** — a client that sends JSON fields with those
+  names has them ignored. Pinned by a forged-identity test.
+
+### The `/track` endpoint
+
+`POST /track` is public (browsers carry no API key) but double rate-limited:
+the engine's global per-IP token bucket wraps a **tighter per-route analytics
+bucket** (5 req/s, burst 15) — both gates must pass, neither substitutes for
+the other (pinned by dedicated composition tests). Body cap 32 KB; max 50
+events per batch; unknown event types, non-local page paths, absurd
+coordinates, and out-of-range scroll percentages are all dropped.
+
+```jsonc
+POST /track
+{
+  "events": [
+    {"event_type": "pageview",            // pageview | click | scroll | custom
+     "visitor_id": "uuid-from-localStorage",
+     "session_id": "uuid-from-sessionStorage",
+     "page_path": "/products/eco-bottle",
+     "page_title": "Eco Bottle",
+     "referrer": "https://google.com/",
+     "utm_source": "google", "utm_medium": "cpc", "utm_campaign": "summer",
+     "x": 340, "y": 512,                   // click coordinates (viewport px)
+     "scroll_pct": 74,                     // max scroll depth 0-100
+     "viewport_w": 1440, "viewport_h": 900,
+     "element_selector": "#add-to-cart",   // clicked element (css path)
+     "element_text": "Add to cart"}
+  ]
+}
+```
+
+Response: `204 No Content` with an empty body — always, on success and on
+drop alike (the storefront must never see an analytics error).
+
+### Sessionization & conversion attribution
+
+Pageviews roll up into `analytics_sessions` (entry path, exit path, pageview
+count) via an idempotent upsert — one row per session, safe under concurrent
+writers (race-tested).
+
+When `ORDER_CREATED` fires, the conversion join marks the buying visitor's
+session `converted = 1`. Attribution authority, explicitly:
+
+1. **`visitor_id` (authoritative).** The session whose `visitor_id` matches
+   the ordering browser is marked `conversion_key = 'visitor'` — a true
+   match, no approximation.
+2. **`ip_hash` + 24h window (fallback, marked approximate).** Only when no
+   session carries the visitor's UUID (e.g. first touch before localStorage
+   was set). Shared IPs (CGNAT, hotel wifi, office networks) make this
+   inherently ambiguous, so these rows carry `conversion_key = 'ip'`. The
+   admin dashboard surfaces the split, so you always know what fraction of
+   your conversion numbers are approximate.
+
+At most one session is marked per order; repeat orders don't double-count.
+
+### Data model
+
+| Table | Contents | Retention |
+|---|---|---|
+| `analytics_events` | Raw pageview/click/scroll events with server-resolved context | **180 days** (hourly sweep; `ANALYTICS_RETENTION_DAYS` to change) |
+| `analytics_sessions` | Session rollups + conversion flags | Kept indefinitely (aggregates, no event-level data) |
+
+Both tables are **admin-only** by the per-table read scoping primitive
+(`access.roles[].tables`): the shopper role can neither read them nor see
+them in the `/tables` listing — enforced from the commit that created them
+and pinned by scoping tests (direct-read 403 **and** enumeration checks).
+
+### Privacy model
+
+| Signal | Stored as | Why |
+|---|---|---|
+| Visitor identity | Random UUID, browser `localStorage` (first-party) | No server-issued ID, no cookie |
+| IP address | `SHA-256(salt + YYYYMMDD + ip)[0:16]` | Daily rotation means no cross-day tracking of an IP; uniqueness metrics key off `visitor_id`, never `ip_hash` |
+| User agent | Reduced to browser family (`chrome`, `firefox`, …) + device class | Full UA strings are fingerprinting surfaces |
+| Country | CDN geo header if present (`CF-IPCountry`), else empty | Informational |
+| Salt | `ANALYTICS_IP_SALT` env; per-process random fallback if unset | Covered by the audit-log secret masker (`*salt` suffix) like any credential |
+
+**Trade-off to know:** because `ip_hash` rotates daily, the same real IP
+hashes differently each day. "Unique visitors by ip_hash" is not meaningful
+across day boundaries — all unique-visitor metrics use `visitor_id`.
+
+### Observability
+
+The `204`-on-drop design means the client never sees a failure — so the
+operator's window is explicit:
+
+- `/metrics` exposes `spine_analytics_ingested_events` and
+  `spine_analytics_dropped_events` (validation rejects, overflow, DB failures).
+- A periodic `[analytics] summary: ingested=N dropped=M` log line every
+  5 minutes. A broken client snippet shows up as `dropped` climbing while
+  `ingested` stays flat — visible within minutes, not weeks.
+
+### Enabling
+
+The storefront snippet ships in the e-commerce template (`VITE_ANALYTICS_ENABLED=1`
+to turn it on; dev runs stay quiet by default). Server-side, `/track` is
+always available; `ANALYTICS_IP_SALT` (recommended in production) and
+`ANALYTICS_RETENTION_DAYS` (optional) are the only knobs.
+
+---
+
 ## The `.spine` Manifest Specification
 
 ### Structure
@@ -624,6 +753,30 @@ includes:                  # Optional. Import other .spine files.
   - auth.spine
   - billing.spine
 
+access:                    # Optional. Role-Based/Row-Level Access Control (RLAC)
+  - role: admin
+    key: "$ADMIN_SECRET"   # Resolved from env at runtime
+  - role: shopper
+    key: "static-key-or-$ENV"
+    events:                # Events this role may emit (allowlist)
+      - ADD_TO_CART
+    tables:                # OPTIONAL per-table read scoping. When present, it is
+      - orders: "email = $event.payload.email"  # an ALLOWLIST: unlisted tables
+      - products:                                # return 403 AND are hidden from
+      - cart_items:                              # the /tables listing for this
+                                                 # role. Filters are parameterized
+                                                 # column comparisons. Omit the
+                                                 # whole key for full read (admin).
+```
+
+**Per-table read scoping (`access.roles[].tables`)** — deny by default for any
+role that declares the key: unlisted tables are 403 on `GET /tables/{name}` and
+invisible in `GET /tables`. Roles without `tables:` keep full read
+(back-compat). Enforced and pinned in `tests/security/table_scope_test.go`
+(direct read, listing enumeration, and trailing-slash listing) plus storefront
+read-pattern smoke tests in `tests/e2e/table_scope_smoke_test.go`.
+
+```yaml
 database:
   tables:                  # Declare tables (auto-created with schema evolution)
     - users
@@ -848,11 +1001,12 @@ if: "$event.payload.status != 'deleted'"
 | `GET` | `/healthz` | No | Kubernetes liveness probe |
 | `GET` | `/readyz` | No | Kubernetes readiness probe |
 | `POST` | `/emit` | Yes | Emit an event with payload |
+| `POST` | `/track` | No* | First-party analytics ingest (see the analytics section; *public but double rate-limited: global per-IP bucket + tighter per-route analytics bucket, both must pass) |
 | `GET` | `/schema` | Yes | Return parsed manifest schema as JSON |
 | `GET` | `/tables` | Yes | List all database tables |
 | `GET` | `/tables/{name}` | Yes | Query rows (`?limit=50&offset=0&where=col:val`) |
 | `GET` | `/events` | Yes | Query event audit log (`?event=NAME&limit=50`) |
-| `GET` | `/metrics` | No | Optimizer mode and batch metrics |
+| `GET` | `/metrics` | No* | Optimizer mode, batch/write-pipeline counters, and analytics ingest/drop counters (*public only with `SPINE_METRICS_PUBLIC=1`; otherwise requires an API key) |
 | `WS` | `/ws` | Yes | Real-time WebSocket (state broadcasts + emit) |
 
 ### Authentication
@@ -1177,6 +1331,9 @@ spine version
 | `SPINE_WS_ORIGINS` | Comma-separated origins allowed for WebSocket upgrade (`*` = all) |
 | `SPINE_WS_MAX_CONNS` | Max concurrent WebSocket connections (default: 10000; excess upgrades get 503) |
 | `SPINE_ALLOW_UNSIGNED_WEBHOOKS` | `1` = accept unsigned webhooks when no secret is configured (default: fail closed with 503) |
+| `ANALYTICS_IP_SALT` | Salt for the analytics `ip_hash` (recommended in production). Unset = a per-process random fallback is generated (hashes still keyed, but never identical across restarts) |
+| `ANALYTICS_RETENTION_DAYS` | Raw analytics event retention in days (default `180`; 0/negative/garbage fall back to the default — misconfiguration never disables retention) |
+| `VITE_ANALYTICS_ENABLED` | Storefront-side: `1` enables the first-party analytics snippet (dev runs stay quiet by default) |
 | `SPINE_WEBHOOK_SECRET_<PROVIDER>` (or `<PROVIDER>_WEBHOOK_SECRET`) | HMAC-SHA256 secret for a webhook provider |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASS` / `SMTP_FROM` | SMTP relay for `email.send` / `email.broadcast` — host unset = email disabled (silent no-op) |
 | `STRIPE_SECRET_KEY` | Secret key (`sk_test_…`) for `stripe.checkout` — unset = Stripe actions disabled (silent no-op) |
@@ -1292,6 +1449,14 @@ Emit() → Contract Validation → Route Steps → Sharded Writer → Batch Flus
 
 11. **Coupon Guard Rails (e-commerce template)**: coupon codes support optional `expires_at` (RFC3339) and `max_uses` caps, enforced server-side in `VALIDATE_COUPON`; `used_count` increments on `PLACE_ORDER` only (abandoned carts never burn a use). `max_uses: 0` or empty = unlimited.
 
+12. **Per-Table Read Scoping (`access.roles[].tables`)**: roles may declare an explicit table allowlist with optional row filters (e.g. `orders: "email = 'mine@example.com'"`). Unlisted tables return **403** for that role **and are hidden from the `/tables` listing** — a scoped role cannot even enumerate what it can't read. Roles without a `tables:` key keep full read (back-compat); declare `tables: []` semantics via the deny-by-default tests in `tests/security/table_scope_test.go`. Pinned by both unit and storefront read-pattern smoke tests (`tests/e2e/table_scope_smoke_test.go`).
+
+13. **Analytics Ingest Hardening (`/track`)**: the public analytics endpoint composes two independent rate-limit gates (global per-IP + tighter per-route analytics bucket — both must pass, neither replaces the other; pinned by composition tests), a 32 KB body cap below the global 1 MB, strict per-field validation before any DB write, and a trust boundary that forbids client-supplied identity (`ip_hash`/`device`/`user_agent`/`country` are server-resolved only; forged values are ignored, pinned by test).
+
+14. **Analytics Privacy**: no cookies for identity, no third-party trackers; IPs stored only as salted daily-rotating truncated hashes with bot traffic filtered out; raw events age out on a retention sweep (default 180 days) that misconfiguration cannot disable; the salt is covered by the audit-log secret masker (`*salt` suffix). See the analytics section for the full privacy model.
+
+15. **CORS Dynamic Reload Race-Free**: `SPINE_CORS_ORIGINS` hot-reload rebuilds the CORS handler via an atomic pointer swap (immutable snapshot + CAS) — concurrent requests always observe one coherent allowlist, verified by a dedicated race test (8 readers × concurrent env flips under `-race`).
+
 ---
 
 ## Performance & Benchmarks
@@ -1351,6 +1516,13 @@ go test ./tests/ -bench=. -benchmem -count=3
 | `parser_test.go` | Manifest parsing, validation & version-tier gating |
 | `email_test.go` | `email.send`/`email.broadcast`: delivery, templating, injection guards, opt-out filtering |
 | `ecommerce_test.go` | Full store flow: stock math, price guards, coupons, marketing campaigns, payments ledger, Stripe checkout |
+| `analytics_test.go` | `/track` ingest: validation, batch caps, rate-limit composition, buffered writer, sessionization (race-tested), drop counters |
+| `analytics_privacy_test.go` | Daily-rotating salted `ip_hash`, per-process salt fallback, bot filtering, UA families, server-side identity trust boundary, salt masker coverage |
+| `analytics_conversion_test.go` | Conversion join: `visitor_id` authoritative, `ip_hash` fallback marked approximate, 24h window, no double-count |
+| `analytics_sweep_test.go` | Retention sweep: old events pruned, rollups kept, env handling |
+| `cors_dynamic_race_test.go` | `SPINE_CORS_ORIGINS` hot-reload under concurrent readers + env flips (`-race`) |
+| `table_scope_test.go` / `table_scope_smoke_test.go` | Per-table read scoping: 403 + `/tables` listing hiding + storefront read patterns |
+| `geo_*_test.go` | Offline Canadian address validation + AddressComplete lookup (key-gated) |
 | `e2e_test.go` | End-to-end HTTP/WebSocket integration flows |
 
 ```bash
