@@ -4,7 +4,7 @@
     <img src="https://raw.githubusercontent.com/AmritRai1234/spine/main/assets/logo.png?v=3" width="200" alt="Spine Logo">
   </picture><br>
   <strong>SPINE</strong><br>
-  <em>Declarative Event-Driven Backend Engine (v3.2.0)</em>
+  <em>Declarative Event-Driven Backend Engine (v3.1.1)</em>
 </p>
 
 <p align="center">
