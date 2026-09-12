@@ -224,7 +224,9 @@ func New(schema *manifest.SpineSchema, dbPath string) (*Engine, error) {
 
 	// Wire access resolver if manifest defines access rules
 	if len(schema.Access) > 0 {
-		eng.accessPtr.Store(NewAccessResolver(schema.Access))
+		resolver := NewAccessResolver(schema.Access)
+		resolver.SetUserKeyStore(bus.userKeys)
+		eng.accessPtr.Store(resolver)
 	}
 
 	// Auto-populate webhook secrets from environment

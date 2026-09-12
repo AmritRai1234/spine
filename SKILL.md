@@ -214,6 +214,39 @@ Triggers another route within the same engine.
   query: "$event.payload.search_term"
 ```
 
+### `auth.register` — Create a customer account + issue a per-user key
+```yaml
+- action: auth.register
+  email: "$event.payload.email"       # REQUIRED. Must be a valid address (no quotes/whitespace)
+  password: "$event.payload.password" # REQUIRED. 8–72 bytes (bcrypt limit)
+  role: customer                      # Optional. Default: customer
+  set: auth_key                       # Optional. Payload key for the issued key (default: auth_key)
+```
+Stores a bcrypt hash in the engine-managed `_spine_users` table (plaintext is never persisted) and issues a 256-bit per-user API key, stored only as a SHA-256 digest in `_spine_user_keys` with a 14-day TTL. The raw key is placed in the payload under `set` (`auth_key`) and **must be returned to the caller in the route's emitted state — it is shown exactly once**. Also sets `<set>_email` (e.g. `auth_key_email`). Duplicate registration fails with an error; the failed path burns a bcrypt compare so timing doesn't reveal which emails have accounts.
+
+### `auth.login` — Verify password + rotate the per-user key
+```yaml
+- action: auth.login
+  email: "$event.payload.email"       # REQUIRED.
+  password: "$event.payload.password" # REQUIRED.
+  set: auth_key                       # Optional. Default: auth_key
+```
+Verifies the password (timing-equalized: unknown accounts burn a dummy bcrypt compare) and sets `<set>` to a **freshly rotated key on success, or `false` on bad password / unknown account** (soft failure — branch with `if:` or an `assert` step; no route error). Rotation revokes every previously issued key for the account, so a leaked key dies at the next login. Successful logins also set `<set>_email`.
+
+### `auth.logout` — Revoke a per-user key
+```yaml
+- action: auth.logout
+  key: "$event.payload.auth_key"      # REQUIRED. The raw key to revoke
+```
+Idempotent: revoking an already-revoked/unknown key succeeds silently.
+
+#### How issued keys authorize requests
+A key issued by `auth.register`/`auth.login` works in the same `X-API-Key` header as static role keys. Resolution order: **static manifest rules first, then the per-user store.** A per-user request resolves to an `AccessContext` with:
+- `role` = the account's role (default `customer`)
+- row filter `email = '<account email>'` injected into every table read — **each customer sees only their own rows**, replacing the shared demo-key pattern where every holder of a static role key saw the same scoped data.
+
+Because the filter is derived from the account email, per-user isolation works on any table that stores the customer's email (orders, cart_items, sessions…). Static rules always win over issued keys, so admin/staff tiers are unaffected. Gate admin-only events on the customer role's `events:` whitelist — per-user contexts do not broaden it.
+
 ### Custom actions (Go plugins)
 Any `action: my_namespace.my_action` that isn't built-in is resolved via `RegisterAction()` in Go.
 

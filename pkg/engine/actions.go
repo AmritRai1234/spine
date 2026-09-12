@@ -133,6 +133,12 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		return b.authHash(step, eventName, payload)
 	case "auth.verify":
 		return b.authVerify(step, eventName, payload)
+	case "auth.register":
+		return b.userRegister(step, eventName, payload)
+	case "auth.login":
+		return b.userLogin(step, eventName, payload)
+	case "auth.logout":
+		return b.userLogout(step, eventName, payload)
 	case "tracking.register":
 		return b.trackingRegister(step, eventName, payload)
 	default:

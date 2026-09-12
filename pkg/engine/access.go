@@ -64,15 +64,26 @@ func (ac *AccessContext) CanReceive(event string) bool {
 
 // AccessResolver maps API keys to access contexts using constant-time comparison.
 type AccessResolver struct {
-	rules []manifest.AccessRule
+	rules    []manifest.AccessRule
+	userKeys *UserKeyStore // optional per-user dynamic keys (auth.login/register)
 }
 
 // NewAccessResolver builds a resolver from manifest access rules.
+// userKeys (optional) provides dynamic per-user keys: after the static rules
+// miss, a matching issued key resolves to a per-user AccessContext whose row
+// filter isolates the caller's rows by email.
 func NewAccessResolver(rules []manifest.AccessRule) *AccessResolver {
 	if len(rules) == 0 {
 		return nil
 	}
 	return &AccessResolver{rules: rules}
+}
+
+// SetUserKeyStore attaches the per-user key store to the resolver.
+func (ar *AccessResolver) SetUserKeyStore(store *UserKeyStore) {
+	if ar != nil {
+		ar.userKeys = store
+	}
 }
 
 // HasRules returns true if access rules are configured.
@@ -99,7 +110,7 @@ func (ar *AccessResolver) Resolve(apiKey string) *AccessContext {
 	}
 
 	if matched == nil {
-		return nil
+		return ar.resolveUserKey(apiKey)
 	}
 
 	return &AccessContext{
@@ -108,6 +119,24 @@ func (ar *AccessResolver) Resolve(apiKey string) *AccessContext {
 		Filter:   matched.Filter,
 		Events:   matched.Events,
 		Tables:   matched.Tables,
+	}
+}
+
+// resolveUserKey builds a per-user AccessContext from an issued key record:
+// the caller's row filter is pinned to their account email so table reads
+// return only their own rows. Static role rules always win (they are the
+// admin/staff tier); this only fires on a full static miss.
+func (ar *AccessResolver) resolveUserKey(apiKey string) *AccessContext {
+	if ar == nil || ar.userKeys == nil {
+		return nil
+	}
+	rec := ar.userKeys.Lookup(apiKey)
+	if rec == nil {
+		return nil
+	}
+	return &AccessContext{
+		Role:   rec.role,
+		Filter: "email = '" + strings.ReplaceAll(rec.email, "'", "''") + "'",
 	}
 }
 

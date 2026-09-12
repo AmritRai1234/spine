@@ -719,6 +719,37 @@ routes:
 | `social.post` | Publish to a connected social account; payload gains `social_post_id` + `social_platform` | `platform`, `text` (required); `account_key` (optional, multi-account) — tier 3 |
 | `notify.push` | Push notification to mobile/web via FCM, APNs, Web Push, or a generic relay (auto-detected per token shape; silent no-op when no provider is configured). Stale tokens (404/410) land in `_push_stale_tokens` for route cleanup, delivery continues. Payload gains `push_delivered` + `push_total`. `data_`-prefixed payload fields become the provider data payload (deep links) | `title`, `body` (required); payload `token` or `tokens` — tier 3 |
 | `notify.push.register` | Register/upsert a device push token into a manifest-declared table (identity merge on the token — re-registrations update metadata) | `table` (required); `token_column`, `user_column`, `platform_column` (optional); payload `token` (required) — tier 3 |
+| `auth.register` | Create a customer account (bcrypt-hashed password in engine-managed `_spine_users`) and issue a 256-bit per-user API key (stored only as a SHA-256 digest, 14-day TTL). Payload gains `<set>` (raw key, shown once — return it in the route's emitted state) + `<set>_email`. Duplicate emails are rejected with a timing-equalized compare | `email`, `password` (required); `role` (default `customer`), `set` (default `auth_key`) (optional) |
+| `auth.login` | Verify the account password (timing-equalized against unknown accounts) and **rotate** the per-user key — all previously issued keys for the account are revoked. Sets `<set>` to the new raw key on success, or `false` on bad password / unknown account (soft failure — branch with `if:`); also sets `<set>_email` | `email`, `password` (required); `set` (default `auth_key`) (optional) |
+| `auth.logout` | Revoke a per-user key (idempotent) | `key` (required) |
+
+#### Customer Accounts & Per-User Data Isolation
+
+Beyond static role keys (one shared key per role), the engine can issue **per-user API keys**: each registered customer gets their own credential, and every table read is automatically filtered to that customer's rows (`email = '<their account email>'`). This replaces the shared-demo-key pattern where every holder of a role key saw the same scoped data.
+
+```yaml
+access:
+  - role: admin
+    key: "$ADMIN_SECRET"
+  - role: customer
+    key: "$CUSTOMER_SECRET"      # storefront bootstrap key (register/login only)
+    events:
+      - REGISTER_ACCOUNT
+      - LOGIN_ACCOUNT
+      - ADD_TO_CART
+    tables:
+      - cart_items: "email = 'pending-customer'"
+
+routes:
+  - on: REGISTER_ACCOUNT
+    steps:
+      - action: auth.register
+        email: $event.payload.email
+        password: $event.payload.password
+    emit: ACCOUNT_CREATED   # payload now carries auth_key + auth_key_email
+```
+
+The client stores the returned `auth_key` and sends it as `X-API-Key` thereafter. Resolution order is static rules first, then the per-user store — admin/staff tiers are unaffected, and a customer key resolves to their role with a row filter pinned to their own email. Passwords are bcrypt-hashed (timing-equalized verify), keys are never stored in plaintext (SHA-256 digest only), and every login rotates the key so a leaked credential dies at the next login. See the SKILL.md action reference for full semantics.
 
 #### Email Marketing
 

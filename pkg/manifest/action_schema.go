@@ -56,6 +56,9 @@ var actionSchemas = map[string]map[string]bool{
 	"notify.push.register": keys("platform_column", "table", "token_column", "user_column"),
 	"auth.hash":            keys("password", "set"),
 	"auth.verify":          keys("hash", "password", "set"),
+	"auth.register":        keys("email", "password", "role", "set"),
+	"auth.login":           keys("email", "password", "set"),
+	"auth.logout":          keys("key", "set"),
 	"tracking.register":    keys("as", "body", "from", "headers", "numbers", "optional", "url"),
 }
 
