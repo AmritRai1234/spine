@@ -300,6 +300,13 @@ tenant scoping, P3-3 residual — see notes) and future work in the roadmap.
 
 ---
 
+## Phase 8 — Access hardening (scoped specs, not started)
+
+- **P8-1 `tables:` mandatory per role (IDOR #2 closure)**: today a role can silently omit `access.roles[].tables:` and get full unscoped read — nothing at parse time distinguishes "admin by design" from "author forgot the scope." Spec: every access role MUST either (a) declare `tables:` — an empty `tables:` map is valid and means deny-all reads (natural extension of the existing deny-by-default map semantics), or (b) set an explicit `full_access: true` flag for the documented admin/back-compat path (pinned by `TestTableScopeUnscopedRoleFullRead`). Parser fails loudly on a role with neither, listing the offending role. Ship with: parser tests for all three shapes (scoped / empty / full_access), a migration note in the README access section, and an examples/ + apps/ecommerce manifest sweep adding `full_access: true` to every admin role (breaking change for manifests that relied on silent full read — bump to a new spine_version tier or gate behind a flag if back-compat is required).
+- **P8-2 `db.upsert` preserve mode**: `db.upsert` today is always overwrite-on-conflict (`DO UPDATE SET col = excluded.col` — db_ops.go:924). Feature: a `preserve:` option (list of columns, or `preserve: all`) meaning "insert if the conflict key is absent; on conflict, do NOT overwrite the preserved columns" — expressed as `ON CONFLICT DO UPDATE SET <non-preserved cols> = excluded...` (or `DO NOTHING` when all payload columns are preserved). Motivating case: §6.7 `cart_sessions.first_seen` currently needs a hand-written `db.lookup` + `if: "!... exists"` guard to stay insert-stable across re-adds (apps/ecommerce/app.spine ADD_TO_CART route); preserve mode would delete that guard pattern. Touch points: action_schema.go option keys, db_ops.go template builder + fingerprint cache (bump fingerprints), parser version gating if we want it version-gated, unit tests for preserve-vs-overwrite on both dialects, then refactor the ecommerce manifest route to use it.
+
+---
+
 ## Suggested execution order (batches)
 
 1. **Batch A (one PR):** P0-1, P0-2, P0-3 — guardrails land first; everything after is verified under `-race`.
