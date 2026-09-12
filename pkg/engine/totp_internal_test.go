@@ -152,9 +152,10 @@ func TestTOTPLoginGateAndReplay(t *testing.T) {
 	if enrolled, ok := bus.totpCheck(email, "000000", time.Now()); !enrolled || ok {
 		t.Errorf("wrong code accepted: enrolled=%v ok=%v", enrolled, ok)
 	}
-	// Right code → accepted, once. Use the NEXT step's code so the confirm
-	// code (consumed by the replay guard above) can't collide.
-	now := time.Now().Add(35 * time.Second)
+	// Right code → accepted, once. Anchor at the middle of a step (not the
+	// boundary) so all codes below come from deterministic, distinct steps.
+	stepStart := (time.Now().Unix() / 30) * 30 // current step start
+	now := time.Unix(stepStart+30*2+10, 0)     // two steps ahead of confirm, 10s into the step
 	good, err := totpAt(secret, now)
 	if err != nil {
 		t.Fatal(err)
@@ -166,15 +167,15 @@ func TestTOTPLoginGateAndReplay(t *testing.T) {
 	if enrolled, ok := bus.totpCheck(email, good, now.Add(5*time.Second)); !enrolled || ok {
 		t.Errorf("replayed code accepted: enrolled=%v ok=%v", enrolled, ok)
 	}
-	// A code from the OLDER drift step (t-1 relative to the accepted one)
-	// must also be refused after acceptance — the guard tracks the last two
-	// accepted steps, covering the full 3-wide window.
-	older, err := totpAt(secret, now.Add(-31*time.Second))
+	// The confirm code (one step older than `good`, consumed above) must be
+	// refused — its step sits inside the drift window of `now` and is in
+	// the guard's used set.
+	confirmCode, err := totpAt(secret, time.Unix(stepStart+10, 0))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if enrolled, ok := bus.totpCheck(email, older, now); !enrolled || ok {
-		t.Errorf("older drift-step code accepted after newer acceptance: enrolled=%v ok=%v", enrolled, ok)
+	if enrolled, ok := bus.totpCheck(email, confirmCode, now); !enrolled || ok {
+		t.Errorf("confirm-step code accepted after newer acceptance: enrolled=%v ok=%v", enrolled, ok)
 	}
 	// Next step's code works.
 	next, err := totpAt(secret, now.Add(31*time.Second))
@@ -205,6 +206,58 @@ func TestTOTPLoginGateAndReplay(t *testing.T) {
 	}
 	if bus.totpEnrolled(email) {
 		t.Error("disable did not unenroll")
+	}
+}
+
+// TestTOTPReplayGuardThreeSlots pins the hole a 2-slot guard had: accepting
+// C-1 then C+1 must make C (the middle step) a replay — two guard slots let
+// it slip through, three (the full ±1 window) close it.
+func TestTOTPReplayGuardThreeSlots(t *testing.T) {
+	bus := newTestBus(t)
+	email := "gale@example.com"
+	p := map[string]interface{}{"email": email}
+	step := testStep("auth.totp.setup", map[string]string{"email": "$event.payload.email"})
+	if err := bus.totpSetup(step, "TEST", p); err != nil {
+		t.Fatal(err)
+	}
+	secret := p["totp_secret"].(string)
+
+	stepStart := (time.Now().Unix() / 30) * 30
+	tC := time.Unix(stepStart+10, 0) // middle step, anchored 10s in (mid-step)
+	tMinus := tC.Add(-30 * time.Second)
+	tPlus := tC.Add(30 * time.Second)
+
+	// Confirm consumes C.
+	codeC, err := totpAt(secret, tC)
+	if err != nil {
+		t.Fatal(err)
+	}
+	p2 := map[string]interface{}{"email": email, "code": codeC}
+	stepC := testStep("auth.totp.confirm", map[string]string{
+		"email": "$event.payload.email", "code": "$event.payload.code"})
+	if err := bus.totpConfirm(stepC, "TEST", p2); err != nil || p2["totp_ok"] != true {
+		t.Fatalf("confirm failed: %v %v", err, p2)
+	}
+
+	// Accept C-1.
+	codeMinus, err := totpAt(secret, tMinus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := bus.totpCheck(email, codeMinus, tMinus); !ok {
+		t.Fatal("C-1 code refused")
+	}
+	// Accept C+1.
+	codePlus, err := totpAt(secret, tPlus)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := bus.totpCheck(email, codePlus, tPlus); !ok {
+		t.Fatal("C+1 code refused")
+	}
+	// Now C must be a replay — the 3-slot guard still holds it.
+	if enrolled, ok := bus.totpCheck(email, codeC, tC); !enrolled || ok {
+		t.Errorf("middle-step code accepted after C-1/C+1 acceptance (2-slot hole): enrolled=%v ok=%v", enrolled, ok)
 	}
 }
 

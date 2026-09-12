@@ -44,10 +44,9 @@ const (
 
 // totpRecord is the durable enrollment state for one account.
 type totpRecord struct {
-	secret   string // base32 (no padding)
-	pending  bool
-	lastStep int64 // most recent accepted time step (replay guard; 0 = none)
-	prevStep int64 // step accepted before that — the drift window is 3 wide, so one accepted code may be re-presented within the window until it leaves it; two slots cover the observable window
+	secret  string  // base32 (no padding)
+	pending bool
+	used    [3]int64 // most recent accepted time steps (replay guard). Three slots = the full ±1 drift window: any accepted step stays guarded until it leaves the window.
 }
 
 // totpStore is the in-memory mirror of _spine_totp (same load-on-demand
@@ -71,13 +70,14 @@ func (s *totpStore) ensure() error {
 		email      TEXT PRIMARY KEY,
 		secret     TEXT NOT NULL,
 		pending    INTEGER NOT NULL DEFAULT 1,
-		last_step  INTEGER NOT NULL DEFAULT 0,
-		prev_step  INTEGER NOT NULL DEFAULT 0
+		step1      INTEGER NOT NULL DEFAULT 0,
+		step2      INTEGER NOT NULL DEFAULT 0,
+		step3      INTEGER NOT NULL DEFAULT 0
 	)`, totpTable)); err != nil {
 		return fmt.Errorf("totp store init failed: %w", err)
 	}
 	rows, err := s.bus.DB().Query(
-		fmt.Sprintf(`SELECT email, secret, pending, last_step, prev_step FROM %s`, totpTable))
+		fmt.Sprintf(`SELECT email, secret, pending, step1, step2, step3 FROM %s`, totpTable))
 	if err != nil {
 		return fmt.Errorf("totp store load failed: %w", err)
 	}
@@ -86,7 +86,7 @@ func (s *totpStore) ensure() error {
 		var r totpRecord
 		var email string
 		var pending int
-		if err := rows.Scan(&email, &r.secret, &pending, &r.lastStep, &r.prevStep); err != nil {
+		if err := rows.Scan(&email, &r.secret, &pending, &r.used[0], &r.used[1], &r.used[2]); err != nil {
 			return err
 		}
 		r.pending = pending == 1
@@ -200,8 +200,8 @@ func (b *Bus) totpSetup(step *manifest.RouteStep, eventName string, payload map[
 	b.totp.records[email] = totpRecord{secret: secret, pending: true}
 	b.totp.mu.Unlock()
 	if _, err := b.DB().Exec(
-		fmt.Sprintf(`INSERT INTO %s (email, secret, pending, last_step, prev_step) VALUES (?, ?, 1, 0, 0)
-			ON CONFLICT(email) DO UPDATE SET secret = excluded.secret, pending = 1, last_step = 0, prev_step = 0`, totpTable),
+		fmt.Sprintf(`INSERT INTO %s (email, secret, pending, step1, step2, step3) VALUES (?, ?, 1, 0, 0, 0)
+			ON CONFLICT(email) DO UPDATE SET secret = excluded.secret, pending = 1, step1 = 0, step2 = 0, step3 = 0`, totpTable),
 		email, secret,
 	); err != nil {
 		return fmt.Errorf("auth.totp.setup: persist failed: %w", err)
@@ -241,13 +241,14 @@ func (b *Bus) totpConfirm(step *manifest.RouteStep, eventName string, payload ma
 		return nil
 	}
 	rec.pending = false
-	rec.prevStep = rec.lastStep
-	rec.lastStep = matched
+	rec.used[2] = rec.used[1]
+	rec.used[1] = rec.used[0]
+	rec.used[0] = matched
 	b.totp.records[email] = rec
 	b.totp.mu.Unlock()
 	if _, err := b.DB().Exec(
-		fmt.Sprintf(`UPDATE %s SET pending = 0, last_step = ?, prev_step = ? WHERE email = ?`, totpTable),
-		matched, rec.prevStep, email,
+		fmt.Sprintf(`UPDATE %s SET pending = 0, step1 = ?, step2 = ?, step3 = ? WHERE email = ?`, totpTable),
+		matched, rec.used[1], rec.used[2], email,
 	); err != nil {
 		return fmt.Errorf("auth.totp.confirm: persist failed: %w", err)
 	}
@@ -308,23 +309,29 @@ func (b *Bus) totpCheck(email, code string, t time.Time) (enrolled bool, ok bool
 		return true, false
 	}
 	matched, okCode := verifyTOTP(rec.secret, code, t)
-	if !okCode || matched == rec.lastStep || matched == rec.prevStep {
+	if !okCode {
 		return true, false
 	}
-	// Persist the replay guard advance: the accepted step becomes lastStep
-	// and the old lastStep moves to prevStep. Covers the full ±1 drift
-	// window — an accepted code can never be accepted twice, and a valid
-	// code from the older drift step still advances the guard.
+	for _, used := range rec.used {
+		if matched == used {
+			return true, false // replay within the drift window
+		}
+	}
+	// Persist the replay guard advance: the accepted step joins the ring
+	// (most-recent first). Three slots cover the full ±1 drift window, so a
+	// code from any step inside the window can never be accepted twice —
+	// including the C-1 / C+1 alternate-acceptance hole a 2-slot guard had.
 	b.totp.mu.Lock()
 	if cur, still := b.totp.records[email]; still && !cur.pending {
-		cur.prevStep = cur.lastStep
-		cur.lastStep = matched
+		cur.used[2] = cur.used[1]
+		cur.used[1] = cur.used[0]
+		cur.used[0] = matched
 		b.totp.records[email] = cur
 	}
 	b.totp.mu.Unlock()
 	if _, err := b.DB().Exec(
-		fmt.Sprintf(`UPDATE %s SET last_step = ?, prev_step = ? WHERE email = ?`, totpTable),
-		matched, rec.lastStep, email); err != nil {
+		fmt.Sprintf(`UPDATE %s SET step1 = ?, step2 = ?, step3 = ? WHERE email = ?`, totpTable),
+		matched, rec.used[1], rec.used[2], email); err != nil {
 		// Guard persists in memory regardless; DB failure is non-fatal here —
 		// the in-memory check above still blocks the immediate replay.
 		_ = err
