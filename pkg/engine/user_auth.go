@@ -373,6 +373,17 @@ func (b *Bus) userLogin(step *manifest.RouteStep, eventName string, payload map[
 		return nil
 	}
 	b.loginThrottle.RecordSuccess(email, loginIP)
+	// 2FA gate: enrolled accounts must present a valid, non-replayed TOTP
+	// code. The check runs after password verification (no oracle that the
+	// account is enrolled without knowing the password) and before key
+	// issuance. Wrong/missing code = soft failure (auth_key=false).
+	totpCode := resolveAuthString(step.Config["totp_code"], eventName, payload)
+	if enrolled, ok := b.totpCheck(email, totpCode, time.Now()); enrolled && !ok {
+		setKey := defaultSetKey(step.Config["set"])
+		payload[setKey] = false
+		payload[setKey+"_totp_required"] = true
+		return nil
+	}
 	// Rotate: revoke existing keys for this account, then issue.
 	if err := b.userKeys.ensureTables(); err != nil {
 		return err

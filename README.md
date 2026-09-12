@@ -720,8 +720,11 @@ routes:
 | `notify.push` | Push notification to mobile/web via FCM, APNs, Web Push, or a generic relay (auto-detected per token shape; silent no-op when no provider is configured). Stale tokens (404/410) land in `_push_stale_tokens` for route cleanup, delivery continues. Payload gains `push_delivered` + `push_total`. `data_`-prefixed payload fields become the provider data payload (deep links) | `title`, `body` (required); payload `token` or `tokens` — tier 3 |
 | `notify.push.register` | Register/upsert a device push token into a manifest-declared table (identity merge on the token — re-registrations update metadata) | `table` (required); `token_column`, `user_column`, `platform_column` (optional); payload `token` (required) — tier 3 |
 | `auth.register` | Create a customer account (bcrypt-hashed password in engine-managed `_spine_users`) and issue a 256-bit per-user API key (stored only as a SHA-256 digest, 14-day TTL). Payload gains `<set>` (raw key, shown once — return it in the route's emitted state) + `<set>_email`. Duplicate emails are rejected with a timing-equalized compare | `email`, `password` (required); `role` (default `customer`), `set` (default `auth_key`) (optional) |
-| `auth.login` | Verify the account password (timing-equalized against unknown accounts) and **rotate** the per-user key — all previously issued keys for the account are revoked. Sets `<set>` to the new raw key on success, or `false` on bad password / unknown account (soft failure — branch with `if:`); also sets `<set>_email` | `email`, `password` (required); `set` (default `auth_key`) (optional) |
+| `auth.login` | Verify the account password (timing-equalized against unknown accounts) and **rotate** the per-user key — all previously issued keys for the account are revoked. Sets `<set>` to the new raw key on success, or `false` on bad password / unknown account (soft failure — branch with `if:`); also sets `<set>_email`. For TOTP-enrolled accounts a valid `totp_code` is required; wrong/missing/replayed code sets `<set>` to `false` plus `<set>_totp_required` | `email`, `password` (required); `totp_code` (required for enrolled accounts), `set` (default `auth_key`) (optional) |
 | `auth.logout` | Revoke a per-user key (idempotent) | `key` (required) |
+| `auth.totp.setup` | Mint a **pending** TOTP enrollment secret for the account (RFC 6238). Payload gains `totp_secret` (base32) + `totp_secret_uri` (`otpauth://totp/…` for authenticator-app QR codes). Re-running before confirm rotates the pending secret; confirmed enrollments require `auth.totp.disable` first | `email` (required); `set` (default `totp_secret`) (optional) |
+| `auth.totp.confirm` | Verify one live code against the pending secret — success flips pending → **enrolled** (only then does login enforce 2FA). Sets `totp_ok` (soft `false` on a bad code) | `email`, `code` (required) |
+| `auth.totp.disable` | Unenroll, but **only with a valid current code** — a stolen session cannot silently strip the second factor. Sets `totp_disabled` | `email`, `code` (required) |
 
 #### Customer Accounts & Per-User Data Isolation
 
@@ -750,6 +753,29 @@ routes:
 ```
 
 The client stores the returned `auth_key` and sends it as `X-API-Key` thereafter. Resolution order is static rules first, then the per-user store — admin/staff tiers are unaffected, and a customer key resolves to their role with a row filter pinned to their own email, **inheriting the role's `events:` whitelist** (an account role without a whitelist stays unrestricted). Passwords are bcrypt-hashed (timing-equalized verify), keys are never stored in plaintext (SHA-256 digest only), every login rotates the key so a leaked credential dies at the next login, and failed logins are throttled per email+IP (5 failures → 15-minute progressive lockout; a locked-out login sets `auth_key=false` plus `auth_key_retry_after_s`). Keys expire after 14 days — re-login is the documented renewal path. See the SKILL.md action reference for full semantics.
+
+**TOTP two-factor (optional, per account):** add three routes around `auth.totp.setup` → `auth.totp.confirm` → `auth.totp.disable`. The user scans the `totp_secret_uri` QR with any authenticator app; `confirm` verifies one live code before the enrollment takes effect (two-phase — an aborted setup can never lock the user out), and from then on `auth.login` demands a valid, non-replayed `totp_code`. Codes are RFC 6238 (HMAC-SHA1, 30s step, 6 digits, ±1 step drift) with a replay guard over the full drift window — the same code can never be accepted twice. A wrong/missing code on login is a soft failure: `auth_key=false` plus `auth_key_totp_required=true`, so storefronts can prompt for the 6-digit code instead of showing "wrong password".
+
+```yaml
+  - on: TOTP_ENROLL          # user already logged in via a valid per-user key
+    steps:
+      - action: auth.totp.setup
+        email: $event.payload.email
+    emit: TOTP_SECRET_READY   # broadcast carries totp_secret + totp_secret_uri (QR)
+  - on: TOTP_VERIFY
+    steps:
+      - action: auth.totp.confirm
+        email: $event.payload.email
+        code: $event.payload.code
+    emit: TOTP_ACTIVE         # totp_ok=true — 2FA now enforced on login
+  - on: LOGIN_ACCOUNT
+    steps:
+      - action: auth.login
+        email: $event.payload.email
+        password: $event.payload.password
+        totp_code: $event.payload.totp_code
+    emit: ACCOUNT_LOGGED_IN
+```
 
 #### Email Marketing
 

@@ -57,8 +57,11 @@ var actionSchemas = map[string]map[string]bool{
 	"auth.hash":            keys("password", "set"),
 	"auth.verify":          keys("hash", "password", "set"),
 	"auth.register":        keys("email", "password", "role", "set"),
-	"auth.login":           keys("email", "password", "set"),
+	"auth.login":           keys("email", "password", "set", "totp_code"),
 	"auth.logout":          keys("key", "set"),
+	"auth.totp.setup":      keys("email", "set"),
+	"auth.totp.confirm":    keys("code", "email"),
+	"auth.totp.disable":    keys("code", "email"),
 	"tracking.register":    keys("as", "body", "from", "headers", "numbers", "optional", "url"),
 }
 

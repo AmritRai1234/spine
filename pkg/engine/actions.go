@@ -139,6 +139,12 @@ func (b *Bus) dispatchAction(step *manifest.RouteStep, eventName string, payload
 		return b.userLogin(step, eventName, payload)
 	case "auth.logout":
 		return b.userLogout(step, eventName, payload)
+	case "auth.totp.setup":
+		return b.totpSetup(step, eventName, payload)
+	case "auth.totp.confirm":
+		return b.totpConfirm(step, eventName, payload)
+	case "auth.totp.disable":
+		return b.totpDisable(step, eventName, payload)
 	case "tracking.register":
 		return b.trackingRegister(step, eventName, payload)
 	default:

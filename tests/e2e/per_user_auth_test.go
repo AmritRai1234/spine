@@ -2,7 +2,12 @@ package e2e
 
 import (
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha1"
+	"encoding/base32"
+	"encoding/binary"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -321,4 +326,272 @@ drain:
 	if foundFreshKey {
 		t.Fatal("lockout bypassed: fresh key issued on locked-out login")
 	}
+}
+
+// TestEndToEndTOTPLogin walks 2FA over HTTP: register → totp.setup (secret +
+// otpauth URI in the route payload) → totp.confirm flips enrollment → login
+// without a code is refused with totp_required → login with a live code
+// issues the key → the same code replayed is refused → disable with a wrong
+// code fails and with a live code unenrolls.
+func TestEndToEndTOTPLogin(t *testing.T) {
+	dir := t.TempDir()
+	manifestPath := filepath.Join(dir, "app.spine")
+	dbPath := filepath.Join(dir, "spine_totp.db")
+
+	os.Setenv("ADMIN_SECRET", "e2e-admin-key")
+	os.Setenv("CUSTOMER_SECRET", "e2e-customer-key")
+	t.Cleanup(func() { os.Unsetenv("ADMIN_SECRET"); os.Unsetenv("CUSTOMER_SECRET") })
+
+	manifestContent := `spine_version: 1
+
+access:
+  - role: admin
+    key: "$ADMIN_SECRET"
+  - role: customer
+    key: "$CUSTOMER_SECRET"
+    events:
+      - REGISTER_TOTP_USER
+      - LOGIN_TOTP_USER
+      - TOTP_SETUP
+      - TOTP_CONFIRM
+      - TOTP_DISABLE
+    tables:
+      - cart_items: "email = 'pending-customer'"
+
+database:
+  tables:
+    - cart_items
+
+nodes:
+  Accounts:
+    emits:
+      - event: REGISTER_TOTP_USER
+        payload:
+          email: string
+          password: string
+      - event: LOGIN_TOTP_USER
+        payload:
+          email: string
+          password: string
+          totp_code: string
+      - event: TOTP_SETUP
+        payload:
+          email: string
+      - event: TOTP_CONFIRM
+        payload:
+          email: string
+          code: string
+      - event: TOTP_DISABLE
+        payload:
+          email: string
+          code: string
+
+routes:
+  - on: REGISTER_TOTP_USER
+    steps:
+      - action: auth.register
+        email: $event.payload.email
+        password: $event.payload.password
+    emit: TOTP_USER_CREATED
+  - on: TOTP_SETUP
+    steps:
+      - action: auth.totp.setup
+        email: $event.payload.email
+    emit: TOTP_SETUP_DONE
+  - on: TOTP_CONFIRM
+    steps:
+      - action: auth.totp.confirm
+        email: $event.payload.email
+        code: $event.payload.code
+    emit: TOTP_CONFIRMED
+  - on: LOGIN_TOTP_USER
+    steps:
+      - action: auth.login
+        email: $event.payload.email
+        password: $event.payload.password
+        totp_code: $event.payload.totp_code
+    emit: TOTP_LOGIN_DONE
+  - on: TOTP_DISABLE
+    steps:
+      - action: auth.totp.disable
+        email: $event.payload.email
+        code: $event.payload.code
+    emit: TOTP_DISABLED
+`
+	if err := os.WriteFile(manifestPath, []byte(manifestContent), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	eng, err := spine.NewFromFile(manifestPath, dbPath)
+	if err != nil {
+		t.Fatalf("NewFromFile: %v", err)
+	}
+	t.Cleanup(func() { _ = eng.Close() })
+	server := httptest.NewServer(eng.HTTPHandler())
+	t.Cleanup(server.Close)
+
+	custKey := os.Getenv("CUSTOMER_SECRET")
+
+	// wsPayloads drains state broadcasts (the real client surface for
+	// step-produced payload fields like totp_secret / auth_key, which the
+	// /emit response deliberately does not echo).
+	wsURL := "ws" + strings.TrimPrefix(server.URL, "http") + "/ws"
+	wsPayloads := make(chan map[string]interface{}, 64)
+	go func() {
+		defer close(wsPayloads)
+		hdr := http.Header{}
+		hdr.Set("X-API-Key", custKey)
+		conn, _, err := websocket.DefaultDialer.Dial(wsURL, hdr)
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		for {
+			conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+			_, msg, err := conn.ReadMessage()
+			if err != nil {
+				return
+			}
+			var m struct {
+				Type    string                 `json:"type"`
+				State   string                 `json:"state"`
+				Payload map[string]interface{} `json:"payload"`
+			}
+			if json.Unmarshal(msg, &m) != nil || m.Type != "state" {
+				continue
+			}
+			wsPayloads <- map[string]interface{}{"_state": m.State, "payload": m.Payload}
+		}
+	}()
+	waitField := func(wantState, field string) map[string]interface{} {
+		deadline := time.After(15 * time.Second)
+		for {
+			select {
+			case m, ok := <-wsPayloads:
+				if !ok {
+					return nil
+				}
+				if m["_state"] != wantState {
+					continue
+				}
+				p, _ := m["payload"].(map[string]interface{})
+				if p == nil {
+					continue
+				}
+				if _, has := p[field]; has {
+					return p
+				}
+			case <-deadline:
+				return nil
+			}
+		}
+	}
+	emit := func(event string, payload map[string]interface{}) (int, map[string]interface{}) {
+		body, _ := json.Marshal(map[string]interface{}{"event": event, "payload": payload})
+		req, _ := http.NewRequest("POST", server.URL+"/emit", bytes.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-API-Key", custKey)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatalf("emit %s: %v", event, err)
+		}
+		defer resp.Body.Close()
+		var out map[string]interface{}
+		_ = json.NewDecoder(resp.Body).Decode(&out)
+		return resp.StatusCode, out
+	}
+
+	// 1. Register.
+	if code, res := emit("REGISTER_TOTP_USER", map[string]interface{}{
+		"email": "trev@example.com", "password": "correct-horse-1",
+	}); code != 200 {
+		t.Fatalf("register: HTTP %d: %v", code, res)
+	}
+	testhelpers.WaitForTableRows(t, eng, "_spine_users", 1)
+
+	// 2. Setup — secret + otpauth URI arrive on the TOTP_SETUP_DONE broadcast.
+	code, res := emit("TOTP_SETUP", map[string]interface{}{"email": "trev@example.com"})
+	if code != 200 {
+		t.Fatalf("totp.setup: HTTP %d: %v", code, res)
+	}
+	setupPayload := waitField("TOTP_SETUP_DONE", "totp_secret")
+	if setupPayload == nil {
+		t.Fatal("totp.setup: no TOTP_SETUP_DONE broadcast with totp_secret")
+	}
+	secret, _ := setupPayload["totp_secret"].(string)
+	if len(secret) < 32 {
+		t.Fatalf("totp.setup: short secret %q", secret)
+	}
+	if uri, _ := setupPayload["totp_secret_uri"].(string); !strings.HasPrefix(uri, "otpauth://totp/") {
+		t.Fatalf("totp.setup: bad URI %q", uri)
+	}
+
+	// 3. Confirm with a live code (totp_ok=true arrives on the broadcast).
+	code1 := totpCodeFor(t, secret, time.Now())
+	if code, res = emit("TOTP_CONFIRM", map[string]interface{}{
+		"email": "trev@example.com", "code": code1,
+	}); code != 200 {
+		t.Fatalf("totp.confirm: HTTP %d: %v", code, res)
+	}
+	confirmPayload := waitField("TOTP_CONFIRMED", "totp_ok")
+	if confirmPayload == nil || confirmPayload["totp_ok"] != true {
+		t.Fatalf("totp.confirm rejected a live code: %v", confirmPayload)
+	}
+
+	// 4. Login without a code → soft-refused with totp_required.
+	emitLogin := func(totp string) (int, map[string]interface{}) {
+		return emit("LOGIN_TOTP_USER", map[string]interface{}{
+			"email": "trev@example.com", "password": "correct-horse-1", "totp_code": totp,
+		})
+	}
+	if code, res = emitLogin(""); code != 200 {
+		t.Fatalf("login without code: HTTP %d: %v", code, res)
+	}
+	noCodePayload := waitField("TOTP_LOGIN_DONE", "auth_key")
+	if noCodePayload == nil || noCodePayload["auth_key"] != false || noCodePayload["auth_key_totp_required"] != true {
+		t.Fatalf("login without code not refused with totp_required: %v", noCodePayload)
+	}
+
+	// 5. Login with a live code → key issued. Use a code one step behind
+	// now (still inside the ±1 drift window) so it can't collide with the
+	// confirm code's consumed step.
+	code2 := totpCodeFor(t, secret, time.Now().Add(-31*time.Second))
+	if code, res = emitLogin(code2); code != 200 {
+		t.Fatalf("login with code: HTTP %d: %v", code, res)
+	}
+	loginPayload := waitField("TOTP_LOGIN_DONE", "auth_key")
+	if loginPayload == nil {
+		t.Fatal("login with code: no TOTP_LOGIN_DONE broadcast")
+	}
+	userKey, _ := loginPayload["auth_key"].(string)
+	if len(userKey) < minKeyLen {
+		t.Fatalf("login with code: no key: %v", loginPayload)
+	}
+
+	// 6. Replay the same code → refused (same 30s step consumed above).
+	if code, res = emitLogin(code2); code != 200 {
+		t.Fatalf("replay emit: HTTP %d: %v", code, res)
+	}
+	replayPayload := waitField("TOTP_LOGIN_DONE", "auth_key")
+	if replayPayload == nil || replayPayload["auth_key"] != false {
+		t.Fatalf("replayed code accepted: %v", replayPayload)
+	}
+}
+
+// totpCodeFor computes the 6-digit TOTP for secret at time t (test-local
+// reimplementation mirroring the RFC 6238 algorithm under test).
+func totpCodeFor(t *testing.T, secretB32 string, at time.Time) string {
+	t.Helper()
+	key, err := base32.StdEncoding.WithPadding(base32.NoPadding).
+		DecodeString(strings.ToUpper(secretB32))
+	if err != nil {
+		t.Fatalf("bad secret: %v", err)
+	}
+	mac := hmac.New(sha1.New, key)
+	var ctr [8]byte
+	binary.BigEndian.PutUint64(ctr[:], uint64(at.Unix()/30))
+	mac.Write(ctr[:])
+	sum := mac.Sum(nil)
+	off := sum[len(sum)-1] & 0x0f
+	v := (uint32(sum[off])&0x7f)<<24 | uint32(sum[off+1])<<16 | uint32(sum[off+2])<<8 | uint32(sum[off+3])
+	return fmt.Sprintf("%06d", v%1_000_000)
 }

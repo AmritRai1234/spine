@@ -229,9 +229,31 @@ Stores a bcrypt hash in the engine-managed `_spine_users` table (plaintext is ne
 - action: auth.login
   email: "$event.payload.email"       # REQUIRED.
   password: "$event.payload.password" # REQUIRED.
+  totp_code: "$event.payload.code"    # Optional. REQUIRED for TOTP-enrolled accounts
   set: auth_key                       # Optional. Default: auth_key
 ```
 Verifies the password (timing-equalized: unknown accounts burn a dummy bcrypt compare) and sets `<set>` to a **freshly rotated key on success, or `false` on bad password / unknown account** (soft failure — branch with `if:` or an `assert` step; no route error). Rotation revokes every previously issued key for the account, so a leaked key dies at the next login. Successful logins also set `<set>_email`.
+
+**TOTP 2FA:** if the account is TOTP-enrolled (see `auth.totp.setup`), a valid, non-replayed code must resolve from `totp_code` — a wrong/missing/replayed code sets `<set>` to `false` plus `<set>_totp_required = true`. The gate runs after password verification, so enrollment status is not leaked to callers without the correct password.
+
+### `auth.totp.setup` / `auth.totp.confirm` / `auth.totp.disable` — TOTP two-factor
+```yaml
+# Route 1: generate a pending secret (runs while the user still has a valid session)
+- action: auth.totp.setup
+  email: "$event.payload.email"
+# payload gains: totp_secret (base32) + totp_secret_uri (otpauth://totp/… for QR codes)
+# Route 2: verify one live code from the user's authenticator app
+- action: auth.totp.confirm
+  email: "$event.payload.email"
+  code: "$event.payload.code"
+# payload gains: totp_ok (true when enrollment completes)
+# Route 3: unenroll — requires a valid current code
+- action: auth.totp.disable
+  email: "$event.payload.email"
+  code: "$event.payload.code"
+# payload gains: totp_disabled (true when unenrolled)
+```
+RFC 6238 (HMAC-SHA1, 30s step, 6 digits, ±1 step drift). Enrollment is two-phase by design: `setup` mints a **pending** secret (re-running setup before confirm rotates it), and only `confirm` — which must verify one live code — makes the enrollment count for login, so a typo'd or intercepted setup can never lock the account holder out. `disable` refuses a wrong code, so a stolen session cannot silently strip the second factor. A replay guard tracks the last two accepted time steps, covering the full ±1 drift window: the same code can never be accepted twice, from any step.
 
 ### `auth.logout` — Revoke a per-user key
 ```yaml
