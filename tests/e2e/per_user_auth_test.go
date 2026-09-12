@@ -222,6 +222,9 @@ routes:
 	}
 
 	// 2. Per-user key works and is isolated: only carol's row.
+	// Wait for the batched cart insert to flush — the broadcast can arrive
+	// before the db.insert batch is persisted.
+	testhelpers.WaitForTableRows(t, eng, "cart_items", 1)
 	if code, rows := readCart(userKey); code != 200 || len(rows) != 1 {
 		t.Fatalf("per-user read: HTTP %d rows=%v", code, rows)
 	}
