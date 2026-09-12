@@ -323,6 +323,21 @@ func (b *Bus) setFields(step *manifest.RouteStep, eventName string, payload map[
 // unsetFields removes keys from the event payload. Config "fields" holds a
 // space-separated list of key names. Used after db.lookup to prune merged
 // helper columns (product_*, coupon_*) before a db.insert persists the payload.
+//
+// ⚠ SHARED-MUTABLE-PAYLOAD RULE (third strike, 2026-09-12): `payload` here is
+// the CALLER'S LIVE MAP — later steps in the SAME route (and any on_failure
+// handler, WS broadcast, audit write, or chained emit) still read it.
+// Deleting a key a downstream step resolves is a silent bug, found twice now:
+//   - logEventAudit masked secrets in place → corrupted _idempotency_key
+//     claims (query.go:463; TestIdempotencyKeys).
+//   - §6.7 conversion tracking unset `order_id` before the confirmation
+//     email resolved it → "Order  confirmed" (TestEcommerceEmailMarketing).
+// Manifest authors: put unset/masking steps AFTER every step that reads the
+// fields, and unset only helper columns — never event-declared required
+// fields. Engine authors: if a new action mutates payload (mask/strip/
+// normalize), document the contract on the action here and add a regression
+// test that resolves the field downstream. A deep-copy variant is the safe
+// default for anything that must redact broadly.
 func (b *Bus) unsetFields(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
 	for _, field := range strings.Fields(step.Config["fields"]) {
 		delete(payload, field)
