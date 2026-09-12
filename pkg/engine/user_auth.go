@@ -171,6 +171,107 @@ func (s *UserKeyStore) Lookup(raw string) *userKeyRecord {
 
 var userEmailRe = regexp.MustCompile(`^[^@'\s]+@[^@'\s]+\.[^@'\s]+$`)
 
+// ── Login attempt throttling ────────────────────────────────────────
+// Per-email+IP failed-attempt tracker with progressive lockout. Lives in
+// memory (resets on restart — acceptable: it is a brake, not a vault) and
+// is swept lazily so abandoned entries don't accumulate.
+
+const (
+	loginMaxFails     = 5               // failures before lockout
+	loginLockout      = 15 * time.Minute
+	loginFailWindow   = 15 * time.Minute // failures older than this stop counting
+)
+
+type loginAttempt struct {
+	fails    int
+	lastFail time.Time
+	until    time.Time // lockout expiry (zero = not locked)
+}
+
+// LoginThrottler tracks failed login attempts keyed by "email|ip".
+type LoginThrottler struct {
+	mu      sync.Mutex
+	entries map[string]*loginAttempt
+	now     func() time.Time // injectable for tests
+}
+
+func NewLoginThrottler() *LoginThrottler {
+	return &LoginThrottler{entries: map[string]*loginAttempt{}, now: time.Now}
+}
+
+// sweepLocked drops entries whose lockout expired and whose failures are
+// older than the window — called under lock.
+func (t *LoginThrottler) sweepLocked(now time.Time) {
+	for k, a := range t.entries {
+		if a.until.IsZero() || now.After(a.until) {
+			if now.Sub(a.lastFail) > loginLockout {
+				delete(t.entries, k)
+			}
+		}
+	}
+}
+
+// Check returns (allowed, retryAfter). A locked key is refused until the
+// lockout expires.
+func (t *LoginThrottler) Check(email, ip string) (bool, time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.now()
+	t.sweepLocked(now)
+	a, ok := t.entries[t.key(email, ip)]
+	if !ok {
+		return true, 0
+	}
+	if !a.until.IsZero() && now.Before(a.until) {
+		return false, a.until.Sub(now)
+	}
+	return true, 0
+}
+
+// RecordFailure increments the failure count and locks the key when the
+// threshold is crossed. Progressive: each lockout after the first is doubled.
+func (t *LoginThrottler) RecordFailure(email, ip string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	now := t.now()
+	k := t.key(email, ip)
+	a := t.entries[k]
+	if a == nil {
+		a = &loginAttempt{}
+		t.entries[k] = a
+	}
+	a.fails++
+	a.lastFail = now
+	if a.fails >= loginMaxFails {
+		if !a.until.IsZero() && now.Before(a.until) {
+			// already locked; extend on further failures (attacker retrying
+			// during lockout does not get a free reset)
+			a.until = a.until.Add(loginLockout)
+		} else {
+			mult := 1
+			if a.fails > loginMaxFails {
+				mult = 1 << (a.fails - loginMaxFails)
+				if mult > 8 {
+					mult = 8
+				}
+			}
+			a.until = now.Add(loginLockout * time.Duration(mult))
+		}
+	}
+}
+
+// RecordSuccess clears the failure count for the key.
+func (t *LoginThrottler) RecordSuccess(email, ip string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	delete(t.entries, t.key(email, ip))
+}
+
+func (t *LoginThrottler) key(email, ip string) string {
+	return email + "|" + ip
+}
+// ── Account actions ─────────────────────────────────────────────────
+
 // userRegister implements the `auth.register` action.
 // Config: email / password (payload refs), role (optional, default customer).
 // Sets payload[set] = the issued raw key (default key name: auth_key) and
@@ -230,22 +331,34 @@ func (b *Bus) userRegister(step *manifest.RouteStep, eventName string, payload m
 }
 
 // userLogin implements the `auth.login` action. Verifies the password with a
-// timing-equalized compare, rotates the key (old keys for the account are
-// revoked so a leaked key can't outlive a credential change), issues fresh.
+// timing-equalized compare, throttles per email+IP (progressive lockout after
+// 5 failures), rotates the key (old keys for the account are revoked so a
+// leaked key can't outlive a credential change), issues fresh.
 func (b *Bus) userLogin(step *manifest.RouteStep, eventName string, payload map[string]interface{}) error {
 	email := resolveAuthString(step.Config["email"], eventName, payload)
 	password := resolveAuthString(step.Config["password"], eventName, payload)
 	if email == "" || password == "" {
 		return fmt.Errorf("auth.login requires 'email' and 'password' config")
 	}
+	// Reserved engine-stamped caller IP (see /emit stamping). Strip it here so
+	// it never reaches db.insert columns or audit payloads.
+	loginIP, _ := payload["_login_ip"].(string)
+	delete(payload, "_login_ip")
 	if err := b.ensureUserTables(); err != nil {
 		return err
+	}
+	if allowed, retryAfter := b.loginThrottle.Check(email, loginIP); !allowed {
+		setKey := defaultSetKey(step.Config["set"])
+		payload[setKey] = false
+		payload[setKey+"_retry_after_s"] = int(retryAfter.Seconds()) + 1
+		return nil // locked out — soft failure, no error surface, no oracle
 	}
 	var storedHash, role string
 	row := b.DB().QueryRow(`SELECT password_hash, role FROM _spine_users WHERE email = ?`, email)
 	err := row.Scan(&storedHash, &role)
 	if err == sql.ErrNoRows {
 		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
+		b.loginThrottle.RecordFailure(email, loginIP)
 		setKey := defaultSetKey(step.Config["set"])
 		payload[setKey] = false
 		return nil // unknown account — verify-style soft failure, no error surface
@@ -254,10 +367,12 @@ func (b *Bus) userLogin(step *manifest.RouteStep, eventName string, payload map[
 		return fmt.Errorf("auth.login: lookup failed: %w", err)
 	}
 	if bcrypt.CompareHashAndPassword([]byte(storedHash), []byte(password)) != nil {
+		b.loginThrottle.RecordFailure(email, loginIP)
 		setKey := defaultSetKey(step.Config["set"])
 		payload[setKey] = false
 		return nil
 	}
+	b.loginThrottle.RecordSuccess(email, loginIP)
 	// Rotate: revoke existing keys for this account, then issue.
 	if err := b.userKeys.ensureTables(); err != nil {
 		return err

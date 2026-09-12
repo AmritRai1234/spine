@@ -38,6 +38,10 @@ type Bus struct {
 	userTablesOnce sync.Once
 	userTablesErr  error
 
+	// LoginThrottler: failed-login lockout per email+IP (brake, not vault —
+	// in-memory, resets on restart).
+	loginThrottle *LoginThrottler
+
 	// Performance: lock-free known tables + identifier cache + SQL template cache
 	knownTable     sync.Map
 	identCache     sync.Map // sanitizeIdent result cache
@@ -175,6 +179,7 @@ func NewBus(reg *manifest.Registry, dbPath string, hub *Hub) (*Bus, error) {
 		cronRunning:  make(map[string]bool),
 	}
 	bus.userKeys = NewUserKeyStore(bus)
+	bus.loginThrottle = NewLoginThrottler()
 	bus.auditSQL = `INSERT INTO "_spine_events" (event_name, payload, emitted_states, created_at) VALUES (` +
 		d.placeholder(1) + `, ` + d.placeholder(2) + `, ` + d.placeholder(3) + `, ` + d.placeholder(4) + `)`
 	bus.spillSQL = `INSERT INTO "_spine_write_spill" (query, params_json, status, created_at) VALUES (` +

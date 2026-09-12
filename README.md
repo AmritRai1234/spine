@@ -749,7 +749,7 @@ routes:
     emit: ACCOUNT_CREATED   # payload now carries auth_key + auth_key_email
 ```
 
-The client stores the returned `auth_key` and sends it as `X-API-Key` thereafter. Resolution order is static rules first, then the per-user store — admin/staff tiers are unaffected, and a customer key resolves to their role with a row filter pinned to their own email. Passwords are bcrypt-hashed (timing-equalized verify), keys are never stored in plaintext (SHA-256 digest only), and every login rotates the key so a leaked credential dies at the next login. See the SKILL.md action reference for full semantics.
+The client stores the returned `auth_key` and sends it as `X-API-Key` thereafter. Resolution order is static rules first, then the per-user store — admin/staff tiers are unaffected, and a customer key resolves to their role with a row filter pinned to their own email, **inheriting the role's `events:` whitelist** (an account role without a whitelist stays unrestricted). Passwords are bcrypt-hashed (timing-equalized verify), keys are never stored in plaintext (SHA-256 digest only), every login rotates the key so a leaked credential dies at the next login, and failed logins are throttled per email+IP (5 failures → 15-minute progressive lockout; a locked-out login sets `auth_key=false` plus `auth_key_retry_after_s`). Keys expire after 14 days — re-login is the documented renewal path. See the SKILL.md action reference for full semantics.
 
 #### Email Marketing
 

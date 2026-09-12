@@ -943,6 +943,13 @@ spine_dropped_broadcasts %d
 		if ac := getAccessContext(r); ac != nil && ac.Role != "" {
 			emitCaller = "role:" + ac.Role
 		}
+		// Login throttling: stamp the caller IP under a reserved engine key
+		// (same pattern as _provider/_idempotency_key) so auth.login can
+		// throttle per email+IP. Stripped by the login action before any
+		// db.insert sees the payload; harmless on every other event.
+		if ip := wsClientIP(e, r); ip != "" {
+			body.Payload["_login_ip"] = ip
+		}
 		result, emitErr := e.Bus.EmitAs(emitCaller, body.Event, body.Payload)
 
 		// Pool the response buffer
@@ -1587,7 +1594,9 @@ func (e *Engine) reloadManifest() {
 	e.Bus.UpdateRegistry(manifest.NewRegistry(s))
 	// Always rebuild the access resolver — an empty ruleset must clear a
 	// previously configured resolver, not leave stale rules in force.
-	e.accessPtr.Store(NewAccessResolver(s.Access))
+	resolver := NewAccessResolver(s.Access)
+	resolver.SetUserKeyStore(e.Bus.userKeys)
+	e.accessPtr.Store(resolver)
 	log.Printf("[spine] ✓ hot-reloaded: %d nodes, %d routes", len(s.Nodes), len(s.Routes))
 }
 

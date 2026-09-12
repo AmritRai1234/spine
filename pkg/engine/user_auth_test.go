@@ -127,6 +127,34 @@ func TestAccessResolverUserKeyFallthrough(t *testing.T) {
 		t.Fatalf("escape broken: %q", escaped)
 	}
 
+	// Event whitelist inheritance: a per-user context inherits the events:
+	// whitelist of its role. A role without a whitelist stays unrestricted.
+	resolver = NewAccessResolver(rules)
+	resolver.SetUserKeyStore(bus.userKeys)
+	custRule := manifest.AccessRule{Role: "customer", Key: "unused-static",
+		Events: []string{"ADD_TO_CART", "PLACE_ORDER"}}
+	resolver.rules = append(resolver.rules, custRule)
+	resolver.roleEvents = roleEventMap(resolver.rules)
+	k, _ := bus.userKeys.Issue("w@x.com", "customer")
+	ac = resolver.Resolve(k)
+	if ac == nil {
+		t.Fatal("user key failed to resolve")
+	}
+	if ac.CanEmit("ADD_TO_CART") {
+		// whitelisted — good
+	} else {
+		t.Fatal("whitelisted event denied")
+	}
+	if ac.CanEmit("DELETE_ALL_PRODUCTS") {
+		t.Fatal("unlisted event allowed under whitelist")
+	}
+	// Role with no whitelist → unrestricted.
+	am, _ := bus.userKeys.Issue("admin2@x.com", "staff")
+	ac = resolver.Resolve(am)
+	if ac == nil || !ac.CanEmit("ANY_EVENT") {
+		t.Fatal("role without whitelist should be unrestricted")
+	}
+
 	// Unknown key: nil either way.
 	if resolver.Resolve("no-such-key") != nil {
 		t.Fatal("bogus key resolved")

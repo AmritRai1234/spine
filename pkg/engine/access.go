@@ -64,8 +64,9 @@ func (ac *AccessContext) CanReceive(event string) bool {
 
 // AccessResolver maps API keys to access contexts using constant-time comparison.
 type AccessResolver struct {
-	rules    []manifest.AccessRule
-	userKeys *UserKeyStore // optional per-user dynamic keys (auth.login/register)
+	rules     []manifest.AccessRule
+	userKeys  *UserKeyStore      // optional per-user dynamic keys (auth.login/register)
+	roleEvents map[string][]string // role → event whitelist (for per-user inheritance)
 }
 
 // NewAccessResolver builds a resolver from manifest access rules.
@@ -76,7 +77,19 @@ func NewAccessResolver(rules []manifest.AccessRule) *AccessResolver {
 	if len(rules) == 0 {
 		return nil
 	}
-	return &AccessResolver{rules: rules}
+	return &AccessResolver{rules: rules, roleEvents: roleEventMap(rules)}
+}
+
+// roleEventMap indexes each role's event whitelist so per-user contexts can
+// inherit it. Roles with no whitelist (nil = unrestricted) are absent.
+func roleEventMap(rules []manifest.AccessRule) map[string][]string {
+	m := make(map[string][]string, len(rules))
+	for _, r := range rules {
+		if r.Events != nil {
+			m[r.Role] = r.Events
+		}
+	}
+	return m
 }
 
 // SetUserKeyStore attaches the per-user key store to the resolver.
@@ -137,6 +150,7 @@ func (ar *AccessResolver) resolveUserKey(apiKey string) *AccessContext {
 	return &AccessContext{
 		Role:   rec.role,
 		Filter: "email = '" + strings.ReplaceAll(rec.email, "'", "''") + "'",
+		Events: ar.roleEvents[rec.role],
 	}
 }
 

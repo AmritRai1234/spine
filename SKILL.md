@@ -247,6 +247,8 @@ A key issued by `auth.register`/`auth.login` works in the same `X-API-Key` heade
 
 Because the filter is derived from the account email, per-user isolation works on any table that stores the customer's email (orders, cart_items, sessions…). Static rules always win over issued keys, so admin/staff tiers are unaffected. Gate admin-only events on the customer role's `events:` whitelist — per-user contexts do not broaden it.
 
+**Key lifecycle:** issued keys expire after **14 days**. There is no separate refresh action — **logging in again is the renewal path**: `auth.login` verifies the password and rotates the key (revoking all prior keys), so a client that re-authenticates gets a fresh 14-day key. Handle the expired case in the client: an expired/revoked key resolves to 401 on every request; redirect the user to the login form and retry. Login itself is throttled per email+IP (5 failures → 15-minute progressive lockout; the lockout surfaces as `auth_key=false` with `auth_key_retry_after_s` in the payload — branch on it to show a "too many attempts" message instead of "wrong password").
+
 ### Custom actions (Go plugins)
 Any `action: my_namespace.my_action` that isn't built-in is resolved via `RegisterAction()` in Go.
 
