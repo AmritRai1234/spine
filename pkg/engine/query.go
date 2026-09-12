@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -277,6 +278,9 @@ func (b *Bus) queryRows(query string, args ...interface{}) ([]map[string]interfa
 	cols, err := rows.Columns()
 	if err != nil {
 		return nil, err
+	}
+	if os.Getenv("SPINE_DEBUG_QROWS") != "" {
+		log.Printf("[dbg-queryRows] query=%q cols=%v", query, cols)
 	}
 
 	nCols := len(cols)
