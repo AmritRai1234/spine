@@ -88,6 +88,7 @@ database:
     - password_resets
     - trackings
     - tracking_events
+    - cart_sessions
 
 # ── Nodes & Contracts ─────────────────────────────────────────────
 # owns_files = the AI-codability map: every frontend file belongs to
@@ -773,6 +774,23 @@ routes:
       - action: db.upsert
         table: cart_items
         key: line_key
+      # Conversion tracking (§6.7): record the cart session. first_seen is
+      # stamped only on the cart's FIRST add (lookup-gated), so later adds
+      # refresh last_seen without disturbing the funnel's anchor time.
+      - action: db.lookup
+        table: cart_sessions
+        key_column: cart_id
+        value_expr: $event.payload.cart_id
+        as: _cart_session
+        optional: true
+      - action: set
+        first_seen: $now
+        if: "!$event.payload._cart_session exists"
+      - action: db.upsert
+        table: cart_sessions
+        key: cart_id
+      - action: unset
+        fields: "_cart_session first_seen"
       - action: log.write
         message: "Cart $event.payload.cart_id: +$event.payload.qty × $event.payload.name"
     emit: CART_UPDATED
@@ -1184,6 +1202,21 @@ routes:
         fields: "coupon_active coupon_percent_off coupon_fixed_off coupon_created_at tax_rate"
       - action: db.insert
         table: orders
+      # Conversion tracking (§6.7): mark this cart converted. The upsert
+      # overwrites the pending session row (created by ADD_TO_CART) — the
+      # order always wins, and a cart that orders without ever registering
+      # a session row (edge: tables dropped / engine swap) still gets one.
+      # NOTE: this step reuses the payload's cart_id and stamps converted/
+      # converted_at/order_id directly on the event payload — no unset of
+      # order_id (later email steps still resolve it).
+      - action: set
+        converted: true
+        converted_at: $now
+      - action: db.upsert
+        table: cart_sessions
+        key: cart_id
+      - action: unset
+        fields: "converted converted_at"
       # Coupon redemption counter — incremented only after the order row is
       # durable, and gated on coupon_code so non-coupon orders skip it. The
       # used_count column is schema-evolved on the coupons table; db.adjust

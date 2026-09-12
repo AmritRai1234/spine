@@ -97,7 +97,7 @@ Priority: **P0** launch-tier (missing = lost sales) · **P1** first-90-days · *
 | 6.4 | Product schema (JSON-LD) | [ ] | P1 — AI/GEO visibility |
 | 6.5 | Canonical tags | [ ] | P2 |
 | 6.6 | Analytics (GA4 / event tracking) | [ ] | P2 — engine has /metrics |
-| 6.7 | Conversion tracking (add-to-cart, purchase) | [ ] | P2 |
+| 6.7 | Conversion tracking (add-to-cart, purchase) | [x] | First-party: `cart_sessions` table (manifest-only) tracks cart→order; funnel + rate in Admin analytics. External GA4 still open |
 
 ## 7. Security & compliance
 

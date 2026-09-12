@@ -38,6 +38,7 @@ database:
     - tax_rules
     - subscribers
     - payments
+    - cart_sessions
     - users
     - sessions
     - password_resets
@@ -228,6 +229,21 @@ routes:
       - action: db.upsert
         table: cart_items
         key: line_key
+      # Conversion tracking (§6.7) — mirrors apps/ecommerce/app.spine.
+      - action: db.lookup
+        table: cart_sessions
+        key_column: cart_id
+        value_expr: $event.payload.cart_id
+        as: _cart_session
+        optional: true
+      - action: set
+        first_seen: $now
+        if: "!$event.payload._cart_session exists"
+      - action: db.upsert
+        table: cart_sessions
+        key: cart_id
+      - action: unset
+        fields: "_cart_session first_seen"
     emit: CART_UPDATED
 
   - on: UPDATE_CART_ITEM
@@ -398,6 +414,18 @@ routes:
         fields: "coupon_active coupon_percent_off coupon_fixed_off coupon_created_at tax_rate"
       - action: db.insert
         table: orders
+      # Conversion tracking (§6.7) — mirrors apps/ecommerce/app.spine.
+      # NOTE: stamps converted/converted_at on the payload (order_id is
+      # already there); unset prunes only the helpers, never order_id —
+      # the email steps below still resolve it.
+      - action: set
+        converted: true
+        converted_at: $now
+      - action: db.upsert
+        table: cart_sessions
+        key: cart_id
+      - action: unset
+        fields: "converted converted_at"
       # Coupon redemption counter (mirrors apps/ecommerce/app.spine).
       - action: db.adjust
         table: coupons
@@ -1892,5 +1920,96 @@ func TestEcommerceStripeCheckoutErrorSurfaces(t *testing.T) {
 				t.Errorf("CHECKOUT_READY broadcast despite Stripe failure: %v", emitted)
 			}
 		}
+	}
+}
+
+// TestEcommerceConversionTracking pins the §6.7 cart-session funnel: every
+// cart that touches ADD_TO_CART gets a cart_sessions row (first_seen set once,
+// re-adds refresh last_seen but never rewrite it), and PLACE_ORDER flips
+// converted=true with the order id. The admin funnel derives from this table.
+func TestEcommerceConversionTracking(t *testing.T) {
+	eng, cleanup := setupEcommerceEngine(t)
+	defer cleanup()
+	bus := eng.Bus
+
+	productID := publishProduct(t, bus, "conv-sku", 5.0, 10)
+
+	add := func(cart string, qty int) {
+		t.Helper()
+		if _, err := bus.Emit("ADD_TO_CART", map[string]interface{}{
+			"cart_id": cart, "product_id": productID, "variant_id": "",
+			"name": "Conv Item", "price": 5.0, "qty": qty,
+		}); err != nil {
+			t.Fatalf("ADD_TO_CART failed: %v", err)
+		}
+	}
+	sessionFirstSeen := func(cart string) (string, bool) {
+		var fs string
+		err := bus.DB().QueryRow(`SELECT first_seen FROM cart_sessions WHERE cart_id = ?`, cart).Scan(&fs)
+		return fs, err == nil
+	}
+
+	// 1. Abandoned cart: two adds → one session row, first_seen anchored.
+	add("cart-abandon", 1)
+	waitUntil(t, "session row cart-abandon", func() bool {
+		_, ok := sessionFirstSeen("cart-abandon")
+		return ok
+	})
+	add("cart-abandon", 2) // re-add must NOT rewrite first_seen
+	waitUntil(t, "re-add visible", func() bool {
+		var n int
+		bus.DB().QueryRow(`SELECT COUNT(*) FROM cart_items WHERE cart_id = 'cart-abandon'`).Scan(&n)
+		return n == 1 // upserted, still one line
+	})
+	first1, _ := sessionFirstSeen("cart-abandon")
+	var convertedAbandon bool
+	bus.DB().QueryRow(`SELECT converted FROM cart_sessions WHERE cart_id = 'cart-abandon'`).Scan(&convertedAbandon)
+	if convertedAbandon {
+		t.Error("abandoned cart must not be converted")
+	}
+
+	// 2. Converted cart: add → order → session flips converted with order id.
+	add("cart-buy", 1)
+	waitUntil(t, "session row cart-buy", func() bool {
+		_, ok := sessionFirstSeen("cart-buy")
+		return ok
+	})
+	orderID := "ord-conv-1"
+	if _, err := bus.Emit("ADD_ORDER_ITEM", map[string]interface{}{
+		"order_id": orderID, "product_id": productID,
+		"name": "Conv Item", "price": 5.0, "qty": 1,
+	}); err != nil {
+		t.Fatalf("ADD_ORDER_ITEM failed: %v", err)
+	}
+	if _, err := bus.Emit("PLACE_ORDER", map[string]interface{}{
+		"cart_id": "cart-buy", "email": "buyer@test.dev",
+		"order_id": orderID, "country": "*",
+	}); err != nil {
+		t.Fatalf("PLACE_ORDER failed: %v", err)
+	}
+	var converted bool
+	var gotOrderID string
+	waitUntil(t, "converted session", func() bool {
+		return bus.DB().QueryRow(`SELECT converted, order_id FROM cart_sessions WHERE cart_id = 'cart-buy'`).
+			Scan(&converted, &gotOrderID) == nil && converted
+	})
+	if gotOrderID != orderID {
+		t.Errorf("session order_id = %q, want %q", gotOrderID, orderID)
+	}
+
+	// first_seen of the abandoned cart must be unchanged since its anchor
+	// (a re-add rewriting it would corrupt the funnel's timing).
+	first2, _ := sessionFirstSeen("cart-abandon")
+	if first1 != first2 {
+		t.Errorf("first_seen rewritten on re-add: %q → %q", first1, first2)
+	}
+
+	// Funnel math the admin page will do: 2 carts, 1 conversion = 50%.
+	// converted is schema-evolved TEXT ("true"/"1") — cast so the count is
+	// portable across the manifest's dynamic column typing.
+	var total, conv int
+	bus.DB().QueryRow(`SELECT COUNT(*), SUM(CASE WHEN converted IN ('true','1') THEN 1 ELSE 0 END) FROM cart_sessions`).Scan(&total, &conv)
+	if total != 2 || conv != 1 {
+		t.Errorf("funnel totals: %d carts, %d converted; want 2, 1", total, conv)
 	}
 }

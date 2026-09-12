@@ -28,25 +28,42 @@ const PIE_COLORS = ["#8b5cf6", "#06b6d4", "#f59e0b", "#10b981", "#ef4444"]
 
 type Metric = "revenue" | "units"
 
+interface CartSessionRow {
+  cart_id: string
+  first_seen: string
+  last_seen?: string
+  converted?: string | number | boolean
+  converted_at?: string
+  order_id?: string
+}
+
+// Schema-evolved columns arrive as TEXT ("true"/"1") regardless of manifest
+// intent — accept both forms.
+const isConverted = (v: CartSessionRow["converted"]) => v === true || v === 1 || v === "true" || v === "1"
+
 export default function AdminAnalytics() {
   const [orders, setOrders] = useState<OrderRow[] | null>(null)
   const [items, setItems] = useState<OrderItemRow[]>([])
+  const [sessions, setSessions] = useState<CartSessionRow[]>([])
   const [metric, setMetric] = useState<Metric>("revenue")
   const orderTick = useSpineStateTick("ORDER_CREATED")
+  const cartTick = useSpineStateTick("CART_UPDATED")
 
   const load = useCallback(async () => {
     const client = adminClient()
-    const [o, i] = await Promise.all([
+    const [o, i, s] = await Promise.all([
       client.queryTable("orders", { limit: 500 }),
       client.queryTable("order_items", { limit: 1000 }),
+      client.queryTable("cart_sessions", { limit: 5000 }).catch(() => ({ rows: [] })),
     ])
     setOrders((o.rows ?? []) as unknown as OrderRow[])
     setItems((i.rows ?? []) as unknown as OrderItemRow[])
+    setSessions((s.rows ?? []) as unknown as CartSessionRow[])
   }, [])
 
   useEffect(() => {
     load()
-  }, [load, orderTick])
+  }, [load, orderTick, cartTick])
 
   const topProducts = useMemo(() => {
     if (!items) return []
@@ -72,6 +89,15 @@ export default function AdminAnalytics() {
       .filter((d) => d.value > 0)
   }, [orders])
 
+  const funnel = useMemo(() => {
+    if (!orders) return null
+    const total = sessions.length
+    const converted = sessions.filter((s) => isConverted(s.converted)).length
+    const abandoned = total - converted
+    const rate = total > 0 ? Math.round((converted / total) * 100) : 0
+    return { total, converted, abandoned, rate }
+  }, [sessions, orders])
+
   if (!orders || !items) return <Skeleton className="h-96" />
 
   return (
@@ -85,6 +111,27 @@ export default function AdminAnalytics() {
           </TabsList>
         </Tabs>
       </div>
+
+      {funnel && (
+        <div className="grid gap-4 sm:grid-cols-4">
+          <Card>
+            <CardHeader className="pb-2"><CardTitle className="text-sm font-medium text-muted-foreground">Carts started</CardTitle></CardHeader>
+            <CardContent><div className="text-2xl font-semibold">{funnel.total}</div></CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2"><CardTitle className="text-sm font-medium text-muted-foreground">Converted</CardTitle></CardHeader>
+            <CardContent><div className="text-2xl font-semibold text-green-600">{funnel.converted}</div></CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2"><CardTitle className="text-sm font-medium text-muted-foreground">Abandoned</CardTitle></CardHeader>
+            <CardContent><div className="text-2xl font-semibold text-amber-600">{funnel.abandoned}</div></CardContent>
+          </Card>
+          <Card>
+            <CardHeader className="pb-2"><CardTitle className="text-sm font-medium text-muted-foreground">Conversion rate</CardTitle></CardHeader>
+            <CardContent><div className="text-2xl font-semibold">{funnel.rate}%</div></CardContent>
+          </Card>
+        </div>
+      )}
 
       <div className="grid gap-4 lg:grid-cols-3">
         <Card className="lg:col-span-2">
