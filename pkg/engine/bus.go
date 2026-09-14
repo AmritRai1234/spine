@@ -58,6 +58,14 @@ type Bus struct {
 	upsertSQLCache sync.Map // "table|conflictKey|col1,col2" → *sqlTemplate
 	uniqueIdx      sync.Map // "table|conflictCol" → ensured unique index marker
 
+	// Schema epoch: bumped by ensureTable/EnsureTables on every schema
+	// evolution. Key for the read-path column cache (table_columns.go) —
+	// a cached list is only ever served while the epoch is unchanged, so
+	// a list can never outlive the DDL that would invalidate it.
+	schemaEpochCtr uint64 // atomic; monotonic
+	colCache       sync.Map // table → *colCacheEntry (column list at some epoch)
+	colCacheEpoch  sync.Map // table → epoch the entry was captured at
+
 	// tableEnsureMu single-flights the DDL section of ensureTable per table
 	// fingerprint (contended only on first-insert cache misses).
 	tableEnsureMu sync.Mutex

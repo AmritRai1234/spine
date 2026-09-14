@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 
 	"github.com/AmritRai1234/spine/pkg/manifest"
 )
@@ -104,6 +105,10 @@ func (b *Bus) ensureTable(table string, colDefs []string) error {
 		}
 	}
 
+	// The epoch bump MUST precede knownTable.Store: the next reader to
+	// compose a column list must never observe the new schema while a
+	// stale cached list is still being served (see table_columns.go).
+	atomic.AddUint64(&b.schemaEpochCtr, 1)
 	b.knownTable.Store(colKey, true)
 	return nil
 }

@@ -67,18 +67,13 @@ func TestStalePlanProjectionRace(t *testing.T) {
 		t.Fatalf("warmup read: %d", code)
 	}
 
-	// Step 3: evolve the schema exactly as ensureTable does on first insert
-	// (autocommit statements, same order), and insert a row.
-	if _, err := eng.Bus.DB().Exec(`CREATE TABLE IF NOT EXISTS "orders" (_spine_id INTEGER PRIMARY KEY AUTOINCREMENT, created_at TEXT, "email" TEXT)`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := eng.Bus.DB().Exec(`ALTER TABLE "orders" ADD COLUMN "email" TEXT`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := eng.Bus.DB().Exec(`CREATE INDEX IF NOT EXISTS "idx_orders_email" ON "orders"("email")`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := eng.Bus.DB().Exec(`INSERT INTO "orders" (email) VALUES ('mine@example.com')`); err != nil {
+	// Step 3: evolve the schema through the ENGINE's own evolution path —
+	// a first-insert db.insert on the new column (same as any manifest
+	// route). This is the shape production evolution takes; the epoch
+	// cache is keyed on ensureTable, which this exercises. (Raw SQL DDL
+	// is out-of-band and consciously not tracked — see
+	// TestSchemaEpochOutOfBandDDLContract.)
+	if _, err := eng.Bus.Emit("NEW_ORDER", map[string]interface{}{"email": "mine@example.com"}); err != nil {
 		t.Fatal(err)
 	}
 
