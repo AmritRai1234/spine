@@ -92,6 +92,9 @@ func (b *Bus) GetTables() ([]TableInfo, error) {
 }
 
 // GetTableRows returns rows from a table with pagination limit and offset.
+//
+// Explicit column lists everywhere: SELECT * is banned on read paths —
+// see tableColumns for the stale-plan mechanism this avoids.
 func (b *Bus) GetTableRows(table string, limit, offset int) ([]map[string]interface{}, error) {
 	table = sanitizeIdent(table)
 	if limit <= 0 || limit > 500 {
@@ -101,7 +104,12 @@ func (b *Bus) GetTableRows(table string, limit, offset int) ([]map[string]interf
 		offset = 0
 	}
 
-	query := fmt.Sprintf(`SELECT * FROM "%s" ORDER BY _spine_id DESC LIMIT %d OFFSET %d`, table, limit, offset)
+	cols, err := b.tableColumns(table)
+	if err != nil {
+		return nil, err
+	}
+	query := fmt.Sprintf(`SELECT %s FROM "%s" ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
+		quotedColumnList(cols), table, limit, offset)
 	return b.queryRows(query)
 }
 
@@ -117,8 +125,12 @@ func (b *Bus) QueryWhere(table, column, value string, limit, offset int) ([]map[
 		offset = 0
 	}
 
-	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" = %s ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
-		table, column, b.ph(1), limit, offset)
+	cols, err := b.tableColumns(table)
+	if err != nil {
+		return nil, err
+	}
+	query := fmt.Sprintf(`SELECT %s FROM "%s" WHERE "%s" = %s ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
+		quotedColumnList(cols), table, column, b.ph(1), limit, offset)
 	return b.queryRows(query, value)
 }
 
@@ -139,8 +151,12 @@ func (b *Bus) GetTableRowsWithFilter(table string, limit, offset int, accessFilt
 	}
 	safeCol := b.sanitizeIdentCached(col)
 
-	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" %s %s ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
-		table, safeCol, op, b.ph(1), limit, offset)
+	cols, err := b.tableColumns(table)
+	if err != nil {
+		return nil, err
+	}
+	query := fmt.Sprintf(`SELECT %s FROM "%s" WHERE "%s" %s %s ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
+		quotedColumnList(cols), table, safeCol, op, b.ph(1), limit, offset)
 	return b.queryRows(query, val)
 }
 
@@ -166,8 +182,12 @@ func (b *Bus) QueryWhereWithAccess(table, column, value string, limit, offset in
 	}
 	safeFilterCol := b.sanitizeIdentCached(col)
 
-	query := fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" = %s AND "%s" %s %s ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
-		table, column, b.ph(1), safeFilterCol, op, b.ph(2), limit, offset)
+	cols, cerr := b.tableColumns(table)
+	if cerr != nil {
+		return nil, cerr
+	}
+	query := fmt.Sprintf(`SELECT %s FROM "%s" WHERE "%s" = %s AND "%s" %s %s ORDER BY _spine_id DESC LIMIT %d OFFSET %d`,
+		quotedColumnList(cols), table, column, b.ph(1), safeFilterCol, op, b.ph(2), limit, offset)
 	return b.queryRows(query, value, val)
 }
 
@@ -182,6 +202,12 @@ func (b *Bus) GetTableRowsCursor(table string, lastID int64, limit int, accessFi
 	var query string
 	var args []interface{}
 
+	cols, err := b.tableColumns(table)
+	if err != nil {
+		return nil, 0, err
+	}
+	proj := quotedColumnList(cols)
+
 	if accessFilter != "" {
 		col, op, val, err := parseWhereCondition(accessFilter, "", nil)
 		if err != nil {
@@ -189,18 +215,18 @@ func (b *Bus) GetTableRowsCursor(table string, lastID int64, limit int, accessFi
 		}
 		safeFilterCol := b.sanitizeIdentCached(col)
 		if lastID > 0 {
-			query = fmt.Sprintf(`SELECT * FROM "%s" WHERE _spine_id < %s AND "%s" %s %s ORDER BY _spine_id DESC LIMIT %d`, table, b.ph(1), safeFilterCol, op, b.ph(2), limit)
+			query = fmt.Sprintf(`SELECT %s FROM "%s" WHERE _spine_id < %s AND "%s" %s %s ORDER BY _spine_id DESC LIMIT %d`, proj, table, b.ph(1), safeFilterCol, op, b.ph(2), limit)
 			args = []interface{}{lastID, val}
 		} else {
-			query = fmt.Sprintf(`SELECT * FROM "%s" WHERE "%s" %s %s ORDER BY _spine_id DESC LIMIT %d`, table, safeFilterCol, op, b.ph(1), limit)
+			query = fmt.Sprintf(`SELECT %s FROM "%s" WHERE "%s" %s %s ORDER BY _spine_id DESC LIMIT %d`, proj, table, safeFilterCol, op, b.ph(1), limit)
 			args = []interface{}{val}
 		}
 	} else {
 		if lastID > 0 {
-			query = fmt.Sprintf(`SELECT * FROM "%s" WHERE _spine_id < %s ORDER BY _spine_id DESC LIMIT %d`, table, b.ph(1), limit)
+			query = fmt.Sprintf(`SELECT %s FROM "%s" WHERE _spine_id < %s ORDER BY _spine_id DESC LIMIT %d`, proj, table, b.ph(1), limit)
 			args = []interface{}{lastID}
 		} else {
-			query = fmt.Sprintf(`SELECT * FROM "%s" ORDER BY _spine_id DESC LIMIT %d`, table, limit)
+			query = fmt.Sprintf(`SELECT %s FROM "%s" ORDER BY _spine_id DESC LIMIT %d`, proj, table, limit)
 		}
 	}
 
@@ -257,12 +283,16 @@ func (b *Bus) QueryMultiWhere(table string, filters map[string]string, limit, of
 		args = append(args, val)
 	}
 
+	cols, err := b.tableColumns(table)
+	if err != nil {
+		return nil, err
+	}
 	whereStmt := ""
 	if len(whereClauses) > 0 {
 		whereStmt = "WHERE " + strings.Join(whereClauses, " AND ")
 	}
 
-	query := fmt.Sprintf(`SELECT * FROM "%s" %s ORDER BY _spine_id DESC LIMIT %d OFFSET %d`, table, whereStmt, limit, offset)
+	query := fmt.Sprintf(`SELECT %s FROM "%s" %s ORDER BY _spine_id DESC LIMIT %d OFFSET %d`, quotedColumnList(cols), table, whereStmt, limit, offset)
 	return b.queryRows(query, args...)
 }
 

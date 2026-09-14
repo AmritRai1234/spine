@@ -29,12 +29,45 @@ func WaitUntil(t *testing.T, label string, fn func() bool) {
 }
 
 // WaitForTableRows polls until the table row count equals expected.
+//
+// WaitForTableRowContent is the content-safe variant: count alone can race a
+// schema evolution (row visible while a pooled connection still holds a stale
+// projection — see .hermes/issues/flaky-table-scope-content-visibility.md).
+// Passing mustContain makes the wait deterministic on row CONTENT instead of
+// count: the poll also reads the table (through the same engine read path
+// the test exercises) and only succeeds when some row's JSON contains the
+// marker substring.
 func WaitForTableRows(t *testing.T, eng *spine.Engine, table string, expected int) {
 	t.Helper()
 	WaitUntil(t, "table row count: "+table, func() bool {
 		var count int
 		err := eng.Bus.DB().QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count)
 		return err == nil && count == expected
+	})
+}
+
+func WaitForTableRowContent(t *testing.T, eng *spine.Engine, table, mustContain string, expected int) {
+	t.Helper()
+	WaitUntil(t, "table row content: "+table, func() bool {
+		var count int
+		if err := eng.Bus.DB().QueryRow("SELECT COUNT(*) FROM " + table).Scan(&count); err != nil || count < expected {
+			return false
+		}
+		rows, err := eng.Bus.GetTableRows(table, expected, 0)
+		if err != nil {
+			return false
+		}
+		if len(rows) < expected {
+			return false
+		}
+		for _, row := range rows {
+			for _, v := range row {
+				if s, ok := v.(string); ok && strings.Contains(s, mustContain) {
+					return true
+				}
+			}
+		}
+		return false
 	})
 }
 
