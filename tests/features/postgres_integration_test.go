@@ -123,7 +123,11 @@ func TestPG_EmitPersistAndIdempotency(t *testing.T) {
 	// Unique per run: _spine_idem claims and rows persist in the shared test
 	// database between runs.
 	key := "pg-key-" + time.Now().Format("150405.000000000")
-	name := "alpha-" + time.Now().Format("150405")
+	// Nanosecond resolution on the ROW NAME too: the rows table is shared
+	// between runs (only the idempotency key is the claim), so a 1-second
+	// name collides when two runs land in the same wall-clock second —
+	// the "exactly 1 row" assertion then counts the other run's row.
+	name := "alpha-" + time.Now().Format("150405.000000000")
 
 	res1, err := eng.Bus.Emit("PG_INSERT", map[string]interface{}{
 		"name": name, "votes": 1, "_idempotency_key": key,
